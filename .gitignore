@@ -1,0 +1,18 @@
+### Zig ###
+.zig-cache
+.zig-global-cache
+.zig-local-cache
+zig-out
+
+### Docs build ###
+/procz.o
+/procz.obj
+/procz.lib
+
+### VS Code ###
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
