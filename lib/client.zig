@@ -303,6 +303,9 @@ pub const Client = struct {
 test "client option defaults" {
     const options = Client.Options.default();
 
+    var client = Client.init(std.testing.allocator, options);
+    defer client.deinit();
+
     try std.testing.expect(options.timeouts.connect != null);
     try std.testing.expect(options.timeouts.write != null);
     try std.testing.expect(options.timeouts.read != null);

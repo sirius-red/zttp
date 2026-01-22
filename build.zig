@@ -23,6 +23,19 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(cli);
 
+    const example_client_get = b.addExecutable(.{
+        .name = "zttp-client-get",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/client_get.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zttp", .module = lib },
+            },
+        }),
+    });
+    b.installArtifact(example_client_get);
+
     const run_cmd = b.addRunArtifact(cli);
     const run_step = b.step("run", "Run the zttp cli with args passed after --");
 
