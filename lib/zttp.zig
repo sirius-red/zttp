@@ -25,3 +25,7 @@ pub const Request = types.Request;
 pub const Response = types.Response;
 /// HTTP client type.
 pub const Client = client.Client;
+
+test {
+    _ = @import("http1/test_server.zig");
+}
