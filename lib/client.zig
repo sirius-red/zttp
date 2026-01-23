@@ -17,6 +17,8 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     /// Configuration options for the client.
     options: Options,
+    /// Connection pool keyed by origin.
+    pool: ConnectionPool,
 
     /// Typed client errors.
     pub const Error = error{
@@ -136,6 +138,22 @@ pub const Client = struct {
         }
     };
 
+    /// Connection count with an explicit unit.
+    pub const ConnectionCount = struct {
+        /// Number of connections.
+        count: usize,
+
+        /// Creates a connection count from the provided value.
+        pub fn init(count: usize) ConnectionCount {
+            return .{ .count = count };
+        }
+
+        /// Returns the connection count.
+        pub fn toInt(self: ConnectionCount) usize {
+            return self.count;
+        }
+    };
+
     /// Limits applied to protocol parsing and buffering.
     pub const Limits = struct {
         /// Maximum total header bytes allowed.
@@ -173,6 +191,22 @@ pub const Client = struct {
                 .write = Duration.fromSeconds(30),
                 .read = Duration.fromSeconds(30),
                 .request = Duration.fromSeconds(120),
+            };
+        }
+    };
+
+    /// Connection pooling configuration.
+    pub const PoolOptions = struct {
+        /// Maximum number of connections per origin.
+        max_connections: ConnectionCount,
+        /// Idle timeout before a connection is discarded.
+        idle_timeout: Duration,
+
+        /// Returns default pool options.
+        pub fn default() PoolOptions {
+            return .{
+                .max_connections = ConnectionCount.init(8),
+                .idle_timeout = Duration.fromSeconds(30),
             };
         }
     };
@@ -240,6 +274,22 @@ pub const Client = struct {
     /// Placeholder type for the cookie jar implementation.
     pub const CookieJar = struct {};
 
+    /// Identity token for TLS configuration matching.
+    pub const TlsConfigId = struct {
+        /// Opaque identifier value.
+        value: u64,
+
+        /// Creates a TLS config identity from the provided value.
+        pub fn init(value: u64) TlsConfigId {
+            return .{ .value = value };
+        }
+
+        /// Returns the identifier value.
+        pub fn toInt(self: TlsConfigId) u64 {
+            return self.value;
+        }
+    };
+
     /// TLS certificate verification mode.
     pub const TlsVerifyMode = enum {
         /// Verify certificates and hostnames.
@@ -252,6 +302,14 @@ pub const Client = struct {
     pub const TlsConfig = struct {
         /// Certificate verification mode.
         verify: TlsVerifyMode,
+
+        /// Returns a stable identity token for pooling decisions.
+        pub fn identity(self: TlsConfig) TlsConfigId {
+            var hasher = std.hash.Wyhash.init(0);
+            const verify_byte: u8 = @intFromEnum(self.verify);
+            hasher.update(&[_]u8{verify_byte});
+            return TlsConfigId.init(hasher.final());
+        }
 
         /// Returns the default TLS configuration.
         pub fn default() TlsConfig {
@@ -267,6 +325,8 @@ pub const Client = struct {
         timeouts: Timeouts,
         /// Limit configuration.
         limits: Limits,
+        /// Connection pool configuration.
+        pool: PoolOptions,
         /// Redirect policy configuration.
         redirect_policy: RedirectPolicy,
         /// Proxy configuration.
@@ -281,6 +341,7 @@ pub const Client = struct {
             return .{
                 .timeouts = Timeouts.default(),
                 .limits = Limits.default(),
+                .pool = PoolOptions.default(),
                 .redirect_policy = RedirectPolicy.default(),
                 .proxy = ProxyConfig.default(),
                 .cookie_jar = null,
@@ -319,67 +380,384 @@ pub const Client = struct {
         }
     };
 
+    /// Internal connection pool keyed by origin.
+    const ConnectionPool = struct {
+        /// Allocator used for pool bookkeeping.
+        allocator: std.mem.Allocator,
+        /// Pool configuration options.
+        options: PoolOptions,
+        /// Mutex guarding pool state.
+        mutex: std.Thread.Mutex,
+        /// Map of origin keys to pool entries.
+        origins: OriginMap,
+
+        /// Map type for origin entries.
+        const OriginMap = std.HashMapUnmanaged(
+            OriginKey,
+            OriginEntry,
+            OriginKeyContext,
+            std.hash_map.default_max_load_percentage,
+        );
+
+        /// Origin key used for pooling decisions.
+        const OriginKey = struct {
+            /// Scheme for the origin.
+            scheme: types.Scheme,
+            /// Hostname for the origin.
+            host: []const u8,
+            /// Port for the origin.
+            port: types.Port,
+            /// TLS configuration identity.
+            tls_id: TlsConfigId,
+        };
+
+        /// Hashing context for origin keys.
+        const OriginKeyContext = struct {
+            /// Hashes the origin key for the pool map.
+            pub fn hash(_: @This(), key: OriginKey) u64 {
+                var hasher = std.hash.Wyhash.init(0);
+                const scheme_byte: u8 = @intFromEnum(key.scheme);
+                hasher.update(&[_]u8{scheme_byte});
+
+                const port_bytes = std.mem.toBytes(key.port.toInt());
+                hasher.update(&port_bytes);
+
+                const tls_bytes = std.mem.toBytes(key.tls_id.toInt());
+                hasher.update(&tls_bytes);
+
+                for (key.host) |byte| {
+                    const lower = std.ascii.toLower(byte);
+                    hasher.update(&[_]u8{lower});
+                }
+
+                return hasher.final();
+            }
+
+            /// Returns true when origin keys are equivalent.
+            pub fn eql(_: @This(), a: OriginKey, b: OriginKey) bool {
+                return a.scheme == b.scheme and
+                    a.port.toInt() == b.port.toInt() and
+                    a.tls_id.toInt() == b.tls_id.toInt() and
+                    std.ascii.eqlIgnoreCase(a.host, b.host);
+            }
+        };
+
+        /// Idle connection tracked by the pool.
+        const IdleConnection = struct {
+            /// Connection pointer.
+            connection: *connection_h1.ConnectionH1,
+            /// Timestamp of when the connection became idle.
+            last_used_ns: i128,
+        };
+
+        /// Per-origin connection tracking state.
+        const OriginEntry = struct {
+            /// Idle connections ready for reuse.
+            idle: std.ArrayListUnmanaged(IdleConnection),
+            /// Total connections tracked for the origin.
+            total: usize,
+
+            /// Initializes an empty origin entry.
+            fn init() OriginEntry {
+                return .{
+                    .idle = .{},
+                    .total = 0,
+                };
+            }
+
+            /// Releases idle connections and storage.
+            fn deinit(self: *OriginEntry, allocator: std.mem.Allocator) void {
+                for (self.idle.items) |idle| {
+                    idle.connection.deinit();
+                    allocator.destroy(idle.connection);
+                }
+                self.idle.deinit(allocator);
+                self.total = 0;
+            }
+        };
+
+        /// Lease returned while a connection is checked out.
+        const Lease = struct {
+            /// Origin key for this lease.
+            origin: OriginKey,
+            /// Connection pointer.
+            connection: *connection_h1.ConnectionH1,
+        };
+
+        /// Creates a connection pool with the provided options.
+        fn init(allocator: std.mem.Allocator, options: PoolOptions) ConnectionPool {
+            return .{
+                .allocator = allocator,
+                .options = options,
+                .mutex = .{},
+                .origins = .{},
+            };
+        }
+
+        /// Releases idle connections and pool storage.
+        fn deinit(self: *ConnectionPool) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            var iter = self.origins.iterator();
+            while (iter.next()) |entry| {
+                entry.value_ptr.deinit(self.allocator);
+                self.allocator.free(@constCast(entry.key_ptr.host));
+            }
+            self.origins.deinit(self.allocator);
+        }
+
+        /// Checks out a connection for the origin.
+        fn checkout(
+            self: *ConnectionPool,
+            origin: OriginKey,
+            options: connection_h1.ConnectionH1.Options,
+        ) Error!Lease {
+            self.mutex.lock();
+
+            var entry = self.origins.getEntryContext(origin, OriginKeyContext{}) orelse blk: {
+                const owned_key = try self.allocateKey(origin);
+                try self.origins.putContext(
+                    self.allocator,
+                    owned_key,
+                    OriginEntry.init(),
+                    OriginKeyContext{},
+                );
+                break :blk self.origins.getEntryContext(owned_key, OriginKeyContext{}).?;
+            };
+
+            const now = std.time.nanoTimestamp();
+            self.pruneIdle(entry.value_ptr, now);
+
+            if (entry.value_ptr.idle.items.len > 0) {
+                const idle = entry.value_ptr.idle.pop();
+                const lease = Lease{
+                    .origin = entry.key_ptr.*,
+                    .connection = idle.connection,
+                };
+                self.mutex.unlock();
+                return lease;
+            }
+
+            if (entry.value_ptr.total >= self.options.max_connections.toInt()) {
+                self.mutex.unlock();
+                return error.LimitExceeded;
+            }
+
+            entry.value_ptr.total += 1;
+            const key = entry.key_ptr.*;
+            self.mutex.unlock();
+
+            const connection = self.createConnection(key, options) catch |err| {
+                self.rollbackReservation(key);
+                return err;
+            };
+
+            return .{
+                .origin = key,
+                .connection = connection,
+            };
+        }
+
+        /// Releases a checked-out connection back into the idle pool.
+        fn release(self: *ConnectionPool, lease: Lease) void {
+            var connection_to_destroy: ?*connection_h1.ConnectionH1 = null;
+
+            self.mutex.lock();
+            if (self.origins.getEntryContext(lease.origin, OriginKeyContext{})) |entry| {
+                const idle_entry = IdleConnection{
+                    .connection = lease.connection,
+                    .last_used_ns = std.time.nanoTimestamp(),
+                };
+                entry.value_ptr.idle.append(self.allocator, idle_entry) catch {
+                    if (entry.value_ptr.total > 0) {
+                        entry.value_ptr.total -= 1;
+                    }
+                    connection_to_destroy = lease.connection;
+                    self.pruneOriginIfEmpty(entry.key_ptr, entry.value_ptr);
+                };
+            } else {
+                connection_to_destroy = lease.connection;
+            }
+            self.mutex.unlock();
+
+            if (connection_to_destroy) |connection| {
+                connection.deinit();
+                self.allocator.destroy(connection);
+            }
+        }
+
+        /// Discards a checked-out connection and updates pool counts.
+        fn discard(self: *ConnectionPool, lease: Lease) void {
+            self.mutex.lock();
+            if (self.origins.getEntryContext(lease.origin, OriginKeyContext{})) |entry| {
+                if (entry.value_ptr.total > 0) {
+                    entry.value_ptr.total -= 1;
+                }
+                self.pruneOriginIfEmpty(entry.key_ptr, entry.value_ptr);
+            }
+            self.mutex.unlock();
+
+            lease.connection.deinit();
+            self.allocator.destroy(lease.connection);
+        }
+
+        /// Creates a new connection for the given origin.
+        fn createConnection(
+            self: *ConnectionPool,
+            origin: OriginKey,
+            options: connection_h1.ConnectionH1.Options,
+        ) Error!*connection_h1.ConnectionH1 {
+            const conn = self.allocator.create(connection_h1.ConnectionH1) catch {
+                return error.OutOfMemory;
+            };
+            conn.* = connection_h1.ConnectionH1.init(
+                self.allocator,
+                .{
+                    .scheme = origin.scheme,
+                    .host = origin.host,
+                    .port = origin.port,
+                },
+                options,
+            );
+
+            conn.start() catch {
+                conn.deinit();
+                self.allocator.destroy(conn);
+                return error.OutOfMemory;
+            };
+
+            return conn;
+        }
+
+        /// Removes idle connections that have exceeded the idle timeout.
+        fn pruneIdle(self: *ConnectionPool, entry: *OriginEntry, now: i128) void {
+            const timeout_ns = self.options.idle_timeout.toNanos();
+            if (timeout_ns == 0) {
+                return;
+            }
+
+            var index: usize = 0;
+            while (index < entry.idle.items.len) {
+                const idle = entry.idle.items[index];
+                const elapsed = now - idle.last_used_ns;
+                if (elapsed > @as(i128, @intCast(timeout_ns))) {
+                    _ = entry.idle.swapRemove(index);
+                    if (entry.total > 0) {
+                        entry.total -= 1;
+                    }
+                    idle.connection.deinit();
+                    self.allocator.destroy(idle.connection);
+                    continue;
+                }
+                index += 1;
+            }
+        }
+
+        /// Removes an origin entry when no connections remain.
+        fn pruneOriginIfEmpty(
+            self: *ConnectionPool,
+            key_ptr: *OriginKey,
+            entry: *OriginEntry,
+        ) void {
+            if (entry.total != 0 or entry.idle.items.len != 0) {
+                return;
+            }
+            const host = key_ptr.host;
+            entry.deinit(self.allocator);
+            self.origins.removeByPtr(key_ptr);
+            self.allocator.free(@constCast(host));
+        }
+
+        /// Allocates a stable host copy for a new origin key.
+        fn allocateKey(self: *ConnectionPool, key: OriginKey) Error!OriginKey {
+            const host_copy = self.allocator.dupe(u8, key.host) catch {
+                return error.OutOfMemory;
+            };
+            return .{
+                .scheme = key.scheme,
+                .host = host_copy,
+                .port = key.port,
+                .tls_id = key.tls_id,
+            };
+        }
+
+        /// Rolls back a reserved connection slot after failure.
+        fn rollbackReservation(self: *ConnectionPool, key: OriginKey) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            if (self.origins.getEntryContext(key, OriginKeyContext{})) |entry| {
+                if (entry.value_ptr.total > 0) {
+                    entry.value_ptr.total -= 1;
+                }
+                self.pruneOriginIfEmpty(entry.key_ptr, entry.value_ptr);
+            }
+        }
+    };
+
     /// Creates a client with the provided allocator and options.
     pub fn init(allocator: std.mem.Allocator, options: Options) Client {
         return .{
             .allocator = allocator,
             .options = options,
+            .pool = ConnectionPool.init(allocator, options.pool),
         };
     }
 
-    /// Submits a request using a dedicated HTTP/1.1 connection.
+    /// Submits a request using a pooled HTTP/1.1 connection.
     /// The request must remain valid until the returned handle completes.
     /// If the response includes a body, the caller must close it to release the connection.
     pub fn request(self: *Client, request_value: *const types.Request) Error!RequestHandle {
-        const origin = try self.buildOrigin(request_value);
-        const conn = try self.allocator.create(connection_h1.ConnectionH1);
-        conn.* = connection_h1.ConnectionH1.init(self.allocator, origin, self.buildConnectionOptions());
-
-        const state = self.allocator.create(RequestState) catch {
-            conn.deinit();
-            self.allocator.destroy(conn);
-            return error.OutOfMemory;
-        };
-        state.* = RequestState.init(self.allocator, conn);
+        const origin = try self.buildOriginKey(request_value);
+        const connection_options = self.buildConnectionOptions();
+        var lease = try self.pool.checkout(origin, connection_options);
 
         var cleanup = true;
-        errdefer if (cleanup) {
-            conn.deinit();
-            self.allocator.destroy(conn);
-            self.allocator.destroy(state);
+        errdefer if (cleanup) self.pool.discard(lease);
+
+        const state = self.allocator.create(RequestState) catch {
+            return error.OutOfMemory;
+        };
+        errdefer self.allocator.destroy(state);
+        state.* = RequestState.init(self.allocator, &self.pool, lease);
+
+        lease.connection.submit(request_value, state.future.completion()) catch |err| {
+            return mapSubmitError(err);
         };
 
-        conn.start() catch return error.OutOfMemory;
-        conn.submit(request_value, state.future.completion()) catch |err| return mapSubmitError(err);
         cleanup = false;
-
         return .{ .state = state };
     }
 
     /// Releases resources owned by the client.
     pub fn deinit(self: *Client) void {
-        _ = self;
+        self.pool.deinit();
     }
 
     /// Internal state for an in-flight request.
     const RequestState = struct {
         /// Allocator for request state and owned allocations.
         allocator: std.mem.Allocator,
-        /// Connection used for this request, or null after ownership transfer.
-        connection: ?*connection_h1.ConnectionH1,
+        /// Pool used to return or discard connections.
+        pool: *ConnectionPool,
+        /// Lease for the checked-out connection.
+        lease: ?ConnectionPool.Lease,
         /// Future holding the response result.
         future: ResponseFuture,
         /// Indicates the response has been finalized.
         completed: bool,
 
-        /// Initializes a request state with the provided connection.
+        /// Initializes a request state with the provided lease.
         fn init(
             allocator: std.mem.Allocator,
-            connection: *connection_h1.ConnectionH1,
+            pool: *ConnectionPool,
+            lease: ConnectionPool.Lease,
         ) RequestState {
             return .{
                 .allocator = allocator,
-                .connection = connection,
+                .pool = pool,
+                .lease = lease,
                 .future = ResponseFuture.init(),
                 .completed = false,
             };
@@ -388,7 +766,7 @@ pub const Client = struct {
         /// Waits for completion and attaches response cleanup hooks.
         fn wait(self: *RequestState) ResponseFuture.WaitError!types.Response {
             const response = self.future.wait() catch |err| {
-                self.shutdownConnection();
+                self.discardLease();
                 return err;
             };
             return self.finalizeResponse(response);
@@ -399,7 +777,7 @@ pub const Client = struct {
             const response = self.future.timedWait(timeout_ns) catch |err| switch (err) {
                 error.Timeout => return error.Timeout,
                 else => {
-                    self.shutdownConnection();
+                    self.discardLease();
                     return err;
                 },
             };
@@ -409,7 +787,7 @@ pub const Client = struct {
         /// Cancels the future and closes the connection.
         fn cancel(self: *RequestState) bool {
             const canceled = self.future.cancel();
-            self.shutdownConnection();
+            self.discardLease();
             return canceled;
         }
 
@@ -418,7 +796,7 @@ pub const Client = struct {
             if (!self.completed) {
                 _ = self.future.cancel();
             }
-            self.shutdownConnection();
+            self.discardLease();
             self.allocator.destroy(self);
         }
 
@@ -426,7 +804,7 @@ pub const Client = struct {
         fn finalizeResponse(self: *RequestState, response_value: types.Response) ResponseFuture.WaitError!types.Response {
             var response = response_value;
             if (response.body) |body_reader| {
-                const connection = self.connection orelse {
+                const lease = self.takeLease() orelse {
                     body_reader.close();
                     response.deinit();
                     return error.Canceled;
@@ -434,12 +812,13 @@ pub const Client = struct {
                 const ctx = self.allocator.create(ResponseBody) catch {
                     body_reader.close();
                     response.deinit();
-                    self.shutdownConnection();
+                    self.pool.discard(lease);
                     return error.OutOfMemory;
                 };
                 ctx.* = .{
                     .allocator = self.allocator,
-                    .connection = connection,
+                    .pool = self.pool,
+                    .lease = lease,
                     .inner = body_reader,
                     .closed = false,
                 };
@@ -449,31 +828,48 @@ pub const Client = struct {
                     .read_fn = ResponseBody.read,
                     .close_fn = ResponseBody.close,
                 };
-                self.connection = null;
             } else {
-                self.shutdownConnection();
+                self.releaseLease();
             }
 
             self.completed = true;
             return response;
         }
 
-        /// Closes and frees the underlying connection, if present.
-        fn shutdownConnection(self: *RequestState) void {
-            if (self.connection) |connection| {
-                connection.deinit();
-                self.allocator.destroy(connection);
-                self.connection = null;
+        /// Releases the lease back to the pool, if present.
+        fn releaseLease(self: *RequestState) void {
+            if (self.lease) |lease| {
+                self.pool.release(lease);
+                self.lease = null;
             }
+        }
+
+        /// Discards the lease and closes the connection, if present.
+        fn discardLease(self: *RequestState) void {
+            if (self.lease) |lease| {
+                self.pool.discard(lease);
+                self.lease = null;
+            }
+        }
+
+        /// Takes ownership of the lease, if present.
+        fn takeLease(self: *RequestState) ?ConnectionPool.Lease {
+            if (self.lease) |lease| {
+                self.lease = null;
+                return lease;
+            }
+            return null;
         }
     };
 
-    /// Response body wrapper that cleans up the connection on close.
+    /// Response body wrapper that returns the connection on close.
     const ResponseBody = struct {
         /// Allocator used for wrapper cleanup.
         allocator: std.mem.Allocator,
-        /// Connection to release when the body is closed.
-        connection: *connection_h1.ConnectionH1,
+        /// Pool used to return the connection.
+        pool: *ConnectionPool,
+        /// Lease to return when the body is closed.
+        lease: ConnectionPool.Lease,
         /// Inner body reader provided by the connection.
         inner: types.BodyReader,
         /// Indicates whether the wrapper has been closed.
@@ -493,15 +889,13 @@ pub const Client = struct {
             }
             self.closed = true;
             self.inner.close();
-            self.connection.deinit();
-            self.allocator.destroy(self.connection);
+            self.pool.release(self.lease);
             self.allocator.destroy(self);
         }
     };
 
-    /// Builds a connection origin from the request URI.
-    fn buildOrigin(self: *Client, request_value: *const types.Request) Error!connection_h1.ConnectionH1.Origin {
-        _ = self;
+    /// Builds a pool origin key from the request URI.
+    fn buildOriginKey(self: *Client, request_value: *const types.Request) Error!ConnectionPool.OriginKey {
         if (request_value.uri.scheme != .http) {
             return error.InvalidUri;
         }
@@ -513,6 +907,7 @@ pub const Client = struct {
             .scheme = request_value.uri.scheme,
             .host = request_value.uri.host,
             .port = port,
+            .tls_id = self.options.tls.identity(),
         };
     }
 
@@ -587,6 +982,12 @@ test "client option defaults" {
         options.limits.max_response_line_bytes.toInt(),
     );
 
+    try std.testing.expectEqual(@as(usize, 8), options.pool.max_connections.toInt());
+    try std.testing.expectEqual(
+        @as(u64, 30 * std.time.ns_per_s),
+        options.pool.idle_timeout.toNanos(),
+    );
+
     try std.testing.expectEqual(Client.RedirectMode.follow, options.redirect_policy.mode);
     try std.testing.expectEqual(@as(u8, 10), options.redirect_policy.max_hops);
 
@@ -643,4 +1044,83 @@ test "client request executes against local server" {
     try std.testing.expectEqualStrings("hello", buffer[0..read_len]);
     const eof = try response.body.?.read(&buffer);
     try std.testing.expectEqual(@as(usize, 0), eof);
+}
+
+test "client reuses keep-alive connection" {
+    const test_server = @import("http1/test_server.zig");
+
+    const scenarios = [_]test_server.Scenario{
+        .{
+            .steps = &.{
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .ok,
+                            .reason = "OK",
+                            .body = "one",
+                        },
+                    },
+                    .close_after = false,
+                },
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .ok,
+                            .reason = "OK",
+                            .body = "two",
+                        },
+                    },
+                    .close_after = true,
+                },
+            },
+        },
+    };
+
+    var server = try test_server.TestServer.init(&scenarios, test_server.Options.default());
+    defer server.deinit();
+    try server.start();
+
+    var options = Client.Options.default();
+    options.pool.max_connections = Client.ConnectionCount.init(1);
+    options.pool.idle_timeout = Client.Duration.fromSeconds(2);
+    options.timeouts.read = Client.Duration.fromMillis(500);
+    options.timeouts.request = Client.Duration.fromSeconds(2);
+
+    var client = Client.init(std.testing.allocator, options);
+    defer client.deinit();
+
+    const uri = types.Uri.init(.http, "127.0.0.1", types.Port.init(server.port()), "/", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "127.0.0.1");
+
+    {
+        var handle = try client.request(&request);
+        defer handle.deinit();
+
+        var response = try handle.wait();
+        defer response.deinit();
+        defer if (response.body) |body| body.close();
+
+        var buffer: [8]u8 = undefined;
+        const read_len = try response.body.?.read(&buffer);
+        try std.testing.expectEqualStrings("one", buffer[0..read_len]);
+        const eof = try response.body.?.read(&buffer);
+        try std.testing.expectEqual(@as(usize, 0), eof);
+    }
+
+    {
+        var handle = try client.request(&request);
+        defer handle.deinit();
+
+        var response = try handle.wait();
+        defer response.deinit();
+        defer if (response.body) |body| body.close();
+
+        var buffer: [8]u8 = undefined;
+        const read_len = try response.body.?.read(&buffer);
+        try std.testing.expectEqualStrings("two", buffer[0..read_len]);
+        const eof = try response.body.?.read(&buffer);
+        try std.testing.expectEqual(@as(usize, 0), eof);
+    }
 }

@@ -182,46 +182,131 @@ pub const ConnectionH1 = struct {
     fn handleRequest(self: *ConnectionH1, cmd: RequestCommand) void {
         var completion = cmd.completion;
         const request_start = std.time.nanoTimestamp();
-        const response_info = self.execute(cmd.request, request_start) catch |err| {
-            _ = completion.finish(err);
-            self.closeStream();
-            return;
-        };
-
-        var response = response_info.response;
-        if (response_info.body) |body_reader| {
-            const pipe = body_pipe.BodyPipe.init(self.allocator, self.options.body_buffer_bytes) catch |err| {
-                response.deinit();
-                _ = completion.finish(mapPipeInitError(err));
-                body_reader.close();
+        var attempts: u8 = 0;
+        while (true) {
+            const had_stream = self.stream != null;
+            const response_info = self.execute(cmd.request, request_start) catch |err| {
+                if (attempts == 0 and had_stream and isRetryableRequest(cmd.request) and err == error.Transport) {
+                    attempts += 1;
+                    self.closeStream();
+                    continue;
+                }
+                _ = completion.finish(err);
                 self.closeStream();
                 return;
             };
 
-            response.body = .{
-                .ctx = pipe,
-                .read_fn = body_pipe.BodyPipe.read,
-                .close_fn = body_pipe.BodyPipe.closeReader,
-            };
+            var response = response_info.response;
+            const keep_alive = shouldKeepAlive(cmd.request, response);
+            if (response_info.body) |body_reader| {
+                const pipe = body_pipe.BodyPipe.init(self.allocator, self.options.body_buffer_bytes) catch |err| {
+                    response.deinit();
+                    _ = completion.finish(mapPipeInitError(err));
+                    body_reader.close();
+                    self.closeStream();
+                    return;
+                };
+
+                response.body = .{
+                    .ctx = pipe,
+                    .read_fn = body_pipe.BodyPipe.read,
+                    .close_fn = body_pipe.BodyPipe.closeReader,
+                };
+
+                if (!completion.finish(response)) {
+                    response.deinit();
+                    body_reader.close();
+                    pipe.closeWriter(error.Canceled);
+                    pipe.closeReaderHandle();
+                    self.closeStream();
+                    return;
+                }
+
+                self.forwardBody(body_reader, pipe);
+                if (!keep_alive) {
+                    self.closeStream();
+                }
+                return;
+            }
 
             if (!completion.finish(response)) {
                 response.deinit();
-                body_reader.close();
-                pipe.closeWriter(error.Canceled);
-                pipe.closeReaderHandle();
                 self.closeStream();
                 return;
             }
 
-            self.forwardBody(body_reader, pipe);
-            self.closeStream();
+            if (!keep_alive) {
+                self.closeStream();
+            }
             return;
         }
+    }
 
-        if (!completion.finish(response)) {
-            response.deinit();
+    /// Returns true when the request can be retried safely.
+    fn isRetryableRequest(request: *const types.Request) bool {
+        if (request.body != null) {
+            return false;
         }
-        self.closeStream();
+        return isIdempotentMethod(request.method);
+    }
+
+    /// Returns true when the method is idempotent.
+    fn isIdempotentMethod(method: types.Method) bool {
+        return switch (method) {
+            .get,
+            .head,
+            .put,
+            .delete,
+            .options,
+            .trace,
+            => true,
+            else => false,
+        };
+    }
+
+    /// Returns true when the connection should be kept alive after the response.
+    fn shouldKeepAlive(request: *const types.Request, response: types.Response) bool {
+        if (response.version == .http_1_0) {
+            return false;
+        }
+        if (headerHasToken(&request.headers, "connection", "close")) {
+            return false;
+        }
+        if (headerHasToken(&response.headers, "connection", "close")) {
+            return false;
+        }
+        return true;
+    }
+
+    /// Returns true when the header contains the provided token.
+    fn headerHasToken(headers: *const types.Headers, name: []const u8, token: []const u8) bool {
+        if (headers.get(name)) |value| {
+            return hasToken(value, token);
+        }
+        return false;
+    }
+
+    /// Returns true when the value contains the provided comma-separated token.
+    fn hasToken(value: []const u8, token: []const u8) bool {
+        var index: usize = 0;
+        while (index < value.len) {
+            while (index < value.len and (value[index] == ' ' or value[index] == '\t' or value[index] == ',')) {
+                index += 1;
+            }
+            if (index >= value.len) {
+                return false;
+            }
+            var end = index;
+            while (end < value.len and value[end] != ',') {
+                end += 1;
+            }
+            const part = std.mem.trim(u8, value[index..end], " \t");
+            if (part.len != 0 and std.ascii.eqlIgnoreCase(part, token)) {
+                return true;
+            }
+            index = if (end < value.len) end + 1 else end;
+        }
+        return false;
     }
 
     /// Executes the request and returns the parsed response.
@@ -468,6 +553,9 @@ pub const ConnectionH1 = struct {
             error.ConnectionTimedOut,
             error.WouldBlock,
             => error.Timeout,
+            error.UnexpectedEof,
+            error.ConnectionResetByPeer,
+            => error.Transport,
             error.OutOfMemory => error.OutOfMemory,
             else => error.Protocol,
         };
