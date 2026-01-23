@@ -27,6 +27,9 @@ const request_help =
     \\  zttp request [options] <url>
     \\
     \\Options:
+    \\  -X, --method <token>  HTTP method (default: GET, or POST when -d is used)
+    \\  -H, --header <h:v>    Add a header (repeatable)
+    \\  -d, --data <bytes>    Request body (sets Content-Length if missing)
     \\  -h, --help  Show help
     \\
     \\Notes:
@@ -99,12 +102,13 @@ const Cli = struct {
             return;
         }
 
-        if (args.len != 1) {
-            try self.err.writeAll("zttp request: expected a single URL argument\n");
+        const request_args = self.parseRequestArgs(args) catch |err| {
+            try self.err.print("zttp request: {s}\n", .{@errorName(err)});
             return error.InvalidArguments;
-        }
+        };
+        defer request_args.deinit(self.allocator);
 
-        const parsed = parseUrl(args[0]) catch |err| {
+        const parsed = parseUrl(request_args.url) catch |err| {
             try self.err.print("zttp request: {s}\n", .{@errorName(err)});
             return error.InvalidArguments;
         };
@@ -121,9 +125,26 @@ const Cli = struct {
             null,
         );
 
-        var request = zttp.Request.init(self.allocator, zttp.Method.get, uri);
+        const method = self.selectMethod(request_args);
+        var request = zttp.Request.init(self.allocator, method, uri);
         defer request.deinit();
+        try self.applyHeaders(&request, request_args);
         try self.addHostHeader(&request, parsed);
+
+        var body = DataBody.init(request_args.data);
+        if (request_args.data) |data| {
+            if (request.headers.get("content-length") == null and request.headers.get("transfer-encoding") == null) {
+                var len_buffer: [32]u8 = undefined;
+                const len_value = try std.fmt.bufPrint(&len_buffer, "{d}", .{data.len});
+                try request.headers.append("Content-Length", len_value);
+            }
+
+            request.body = .{
+                .ctx = &body,
+                .read_fn = DataBody.read,
+                .close_fn = DataBody.close,
+            };
+        }
 
         var handle = try client.request(&request);
         defer handle.deinit();
@@ -287,6 +308,10 @@ const Cli = struct {
 
     /// Adds the required Host header to the request.
     fn addHostHeader(self: *Cli, request: *zttp.Request, parsed: ParsedUrl) !void {
+        if (request.headers.get("host") != null) {
+            return;
+        }
+
         const default_port = parsed.scheme.defaultPort().toInt();
         if (parsed.port) |port| {
             if (port.toInt() != default_port) {
@@ -302,6 +327,213 @@ const Cli = struct {
 
         try request.headers.append("Host", parsed.host);
     }
+
+    /// Header name/value pair parsed from CLI arguments.
+    const HeaderArg = struct {
+        /// Header name.
+        name: []const u8,
+        /// Header value.
+        value: []const u8,
+    };
+
+    /// Parsed arguments for the request command.
+    const RequestArgs = struct {
+        /// HTTP method override, if provided.
+        method: ?[]const u8,
+        /// Request body data, if provided.
+        data: ?[]const u8,
+        /// Target URL argument.
+        url: []const u8,
+        /// Header list parsed from flags.
+        headers: std.ArrayListUnmanaged(HeaderArg),
+
+        /// Releases any allocated header storage.
+        fn deinit(self: *RequestArgs, allocator: std.mem.Allocator) void {
+            self.headers.deinit(allocator);
+        }
+    };
+
+    /// Error set returned by argument parsing.
+    const RequestArgsError = error{
+        /// A required URL argument was missing.
+        MissingUrl,
+        /// A flag value was missing.
+        MissingFlagValue,
+        /// An unknown flag was provided.
+        UnknownFlag,
+        /// The URL argument was provided more than once.
+        DuplicateUrl,
+        /// The method flag was provided more than once.
+        DuplicateMethod,
+        /// The data flag was provided more than once.
+        DuplicateData,
+        /// A header argument was invalid.
+        InvalidHeader,
+    };
+
+    /// Parses request subcommand arguments into structured values.
+    fn parseRequestArgs(self: *Cli, args: []const []const u8) RequestArgsError!RequestArgs {
+        var headers = std.ArrayListUnmanaged(HeaderArg){};
+        errdefer headers.deinit(self.allocator);
+
+        var method: ?[]const u8 = null;
+        var data: ?[]const u8 = null;
+        var url: ?[]const u8 = null;
+
+        var index: usize = 0;
+        while (index < args.len) {
+            const arg = args[index];
+            if (std.mem.eql(u8, arg, "-X") or std.mem.eql(u8, arg, "--method")) {
+                if (method != null) {
+                    return error.DuplicateMethod;
+                }
+                const value = try requireValue(args, &index);
+                method = value;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "-H") or std.mem.eql(u8, arg, "--header")) {
+                const value = try requireValue(args, &index);
+                const header = parseHeaderArg(value) catch return error.InvalidHeader;
+                try headers.append(self.allocator, header);
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--data")) {
+                if (data != null) {
+                    return error.DuplicateData;
+                }
+                const value = try requireValue(args, &index);
+                data = value;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--")) {
+                index += 1;
+                if (index >= args.len) {
+                    return error.MissingUrl;
+                }
+                if (url != null) {
+                    return error.DuplicateUrl;
+                }
+                url = args[index];
+                index += 1;
+                continue;
+            }
+            if (arg.len > 0 and arg[0] == '-') {
+                return error.UnknownFlag;
+            }
+            if (url != null) {
+                return error.DuplicateUrl;
+            }
+            url = arg;
+            index += 1;
+        }
+
+        if (url == null) {
+            return error.MissingUrl;
+        }
+
+        return .{
+            .method = method,
+            .data = data,
+            .url = url.?,
+            .headers = headers,
+        };
+    }
+
+    /// Requires a value after a flag and advances the index.
+    fn requireValue(args: []const []const u8, index: *usize) RequestArgsError![]const u8 {
+        if (index.* + 1 >= args.len) {
+            return error.MissingFlagValue;
+        }
+        const value = args[index.* + 1];
+        index.* += 2;
+        return value;
+    }
+
+    /// Parses a header argument into name/value slices.
+    fn parseHeaderArg(arg: []const u8) !HeaderArg {
+        const colon = std.mem.indexOfScalar(u8, arg, ':') orelse return error.InvalidHeader;
+        if (colon == 0) {
+            return error.InvalidHeader;
+        }
+        const name = std.mem.trim(u8, arg[0..colon], " \t");
+        const value = std.mem.trimLeft(u8, arg[colon + 1 ..], " \t");
+        if (name.len == 0) {
+            return error.InvalidHeader;
+        }
+        return .{
+            .name = name,
+            .value = value,
+        };
+    }
+
+    /// Selects the HTTP method for the request.
+    fn selectMethod(self: *Cli, args: RequestArgs) zttp.Method {
+        _ = self;
+        if (args.method) |method| {
+            return parseMethod(method);
+        }
+        if (args.data != null) {
+            return .post;
+        }
+        return .get;
+    }
+
+    /// Parses a method token into a typed method.
+    fn parseMethod(value: []const u8) zttp.Method {
+        if (std.ascii.eqlIgnoreCase(value, "GET")) return .get;
+        if (std.ascii.eqlIgnoreCase(value, "HEAD")) return .head;
+        if (std.ascii.eqlIgnoreCase(value, "POST")) return .post;
+        if (std.ascii.eqlIgnoreCase(value, "PUT")) return .put;
+        if (std.ascii.eqlIgnoreCase(value, "DELETE")) return .delete;
+        if (std.ascii.eqlIgnoreCase(value, "CONNECT")) return .connect;
+        if (std.ascii.eqlIgnoreCase(value, "OPTIONS")) return .options;
+        if (std.ascii.eqlIgnoreCase(value, "TRACE")) return .trace;
+        if (std.ascii.eqlIgnoreCase(value, "PATCH")) return .patch;
+        return .{ .custom = value };
+    }
+
+    /// Applies CLI headers to the request.
+    fn applyHeaders(self: *Cli, request: *zttp.Request, args: RequestArgs) !void {
+        _ = self;
+        for (args.headers.items) |header| {
+            try request.headers.append(header.name, header.value);
+        }
+    }
+
+    /// Body reader backed by static CLI data.
+    const DataBody = struct {
+        /// Body bytes to stream.
+        data: ?[]const u8,
+        /// Current read offset.
+        offset: usize,
+
+        /// Initializes the body reader with optional data.
+        fn init(data: ?[]const u8) DataBody {
+            return .{
+                .data = data,
+                .offset = 0,
+            };
+        }
+
+        /// Reads bytes into `dest`.
+        fn read(ctx: ?*anyopaque, dest: []u8) anyerror!usize {
+            const self: *DataBody = @ptrCast(@alignCast(ctx.?));
+            const payload = self.data orelse return 0;
+            if (self.offset >= payload.len) {
+                return 0;
+            }
+            const remaining = payload.len - self.offset;
+            const to_copy = @min(dest.len, remaining);
+            std.mem.copyForwards(u8, dest[0..to_copy], payload[self.offset .. self.offset + to_copy]);
+            self.offset += to_copy;
+            return to_copy;
+        }
+
+        /// Releases any resources held by the body reader.
+        fn close(ctx: ?*anyopaque) void {
+            _ = ctx;
+        }
+    };
 
     /// Writes the response body to stdout.
     fn writeBody(self: *Cli, body_reader: zttp.BodyReader) !void {
