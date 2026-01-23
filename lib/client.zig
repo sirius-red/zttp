@@ -24,6 +24,8 @@ pub const Client = struct {
     pub const Error = error{
         /// Operation exceeded a timeout.
         Timeout,
+        /// Client configuration is invalid.
+        InvalidConfig,
         /// URI is invalid or unsupported.
         InvalidUri,
         /// Transport failure (DNS/TCP/TLS).
@@ -199,8 +201,9 @@ pub const Client = struct {
     pub const PoolOptions = struct {
         /// Maximum number of connections per origin.
         max_connections: ConnectionCount,
-        /// Idle timeout before a connection is discarded.
-        idle_timeout: Duration,
+        /// Idle timeout before a connection is discarded, or null to disable expiry.
+        /// A timeout of zero discards idle connections immediately.
+        idle_timeout: ?Duration,
 
         /// Returns default pool options.
         pub fn default() PoolOptions {
@@ -275,7 +278,7 @@ pub const Client = struct {
     pub const CookieJar = struct {};
 
     /// Identity token for TLS configuration matching.
-    pub const TlsConfigId = struct {
+    const TlsConfigId = struct {
         /// Opaque identifier value.
         value: u64,
 
@@ -304,7 +307,7 @@ pub const Client = struct {
         verify: TlsVerifyMode,
 
         /// Returns a stable identity token for pooling decisions.
-        pub fn identity(self: TlsConfig) TlsConfigId {
+        fn identity(self: TlsConfig) TlsConfigId {
             var hasher = std.hash.Wyhash.init(0);
             const verify_byte: u8 = @intFromEnum(self.verify);
             hasher.update(&[_]u8{verify_byte});
@@ -562,9 +565,26 @@ pub const Client = struct {
         /// Releases a checked-out connection back into the idle pool.
         fn release(self: *ConnectionPool, lease: Lease) void {
             var connection_to_destroy: ?*connection_h1.ConnectionH1 = null;
+            const idle_timeout = self.options.idle_timeout;
 
             self.mutex.lock();
             if (self.origins.getEntryContext(lease.origin, OriginKeyContext{})) |entry| {
+                if (idle_timeout) |timeout| {
+                    if (timeout.toNanos() == 0) {
+                        if (entry.value_ptr.total > 0) {
+                            entry.value_ptr.total -= 1;
+                        }
+                        connection_to_destroy = lease.connection;
+                        self.pruneOriginIfEmpty(entry.key_ptr, entry.value_ptr);
+                        self.mutex.unlock();
+                        if (connection_to_destroy) |connection| {
+                            connection.deinit();
+                            self.allocator.destroy(connection);
+                        }
+                        return;
+                    }
+                }
+
                 const idle_entry = IdleConnection{
                     .connection = lease.connection,
                     .last_used_ns = std.time.nanoTimestamp(),
@@ -632,16 +652,14 @@ pub const Client = struct {
 
         /// Removes idle connections that have exceeded the idle timeout.
         fn pruneIdle(self: *ConnectionPool, entry: *OriginEntry, now: i128) void {
-            const timeout_ns = self.options.idle_timeout.toNanos();
-            if (timeout_ns == 0) {
-                return;
-            }
+            const timeout = self.options.idle_timeout orelse return;
+            const timeout_ns = timeout.toNanos();
 
             var index: usize = 0;
             while (index < entry.idle.items.len) {
                 const idle = entry.idle.items[index];
                 const elapsed = now - idle.last_used_ns;
-                if (elapsed > @as(i128, @intCast(timeout_ns))) {
+                if (elapsed >= @as(i128, @intCast(timeout_ns))) {
                     _ = entry.idle.swapRemove(index);
                     if (entry.total > 0) {
                         entry.total -= 1;
@@ -709,6 +727,7 @@ pub const Client = struct {
     /// The request must remain valid until the returned handle completes.
     /// If the response includes a body, the caller must close it to release the connection.
     pub fn request(self: *Client, request_value: *const types.Request) Error!RequestHandle {
+        try self.validateOptions();
         const origin = try self.buildOriginKey(request_value);
         const connection_options = self.buildConnectionOptions();
         var lease = try self.pool.checkout(origin, connection_options);
@@ -936,6 +955,13 @@ pub const Client = struct {
         return options;
     }
 
+    /// Validates client options before issuing requests.
+    fn validateOptions(self: *const Client) Error!void {
+        if (self.options.pool.max_connections.toInt() == 0) {
+            return error.InvalidConfig;
+        }
+    }
+
     /// Maps connection submit errors into client errors.
     fn mapSubmitError(err: connection_h1.ConnectionH1.SubmitError) Error {
         return switch (err) {
@@ -983,9 +1009,10 @@ test "client option defaults" {
     );
 
     try std.testing.expectEqual(@as(usize, 8), options.pool.max_connections.toInt());
+    try std.testing.expect(options.pool.idle_timeout != null);
     try std.testing.expectEqual(
         @as(u64, 30 * std.time.ns_per_s),
-        options.pool.idle_timeout.toNanos(),
+        options.pool.idle_timeout.?.toNanos(),
     );
 
     try std.testing.expectEqual(Client.RedirectMode.follow, options.redirect_policy.mode);
@@ -996,6 +1023,21 @@ test "client option defaults" {
 
     try std.testing.expect(options.cookie_jar == null);
     try std.testing.expectEqual(Client.TlsVerifyMode.verify, options.tls.verify);
+}
+
+test "client rejects zero max connections" {
+    var options = Client.Options.default();
+    options.pool.max_connections = Client.ConnectionCount.init(0);
+
+    var client = Client.init(std.testing.allocator, options);
+    defer client.deinit();
+
+    const uri = types.Uri.init(.http, "127.0.0.1", types.Port.init(80), "/", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "127.0.0.1");
+
+    try std.testing.expectError(error.InvalidConfig, client.request(&request));
 }
 
 test "client request executes against local server" {
@@ -1108,6 +1150,101 @@ test "client reuses keep-alive connection" {
         const eof = try response.body.?.read(&buffer);
         try std.testing.expectEqual(@as(usize, 0), eof);
     }
+
+    {
+        var handle = try client.request(&request);
+        defer handle.deinit();
+
+        var response = try handle.wait();
+        defer response.deinit();
+        defer if (response.body) |body| body.close();
+
+        var buffer: [8]u8 = undefined;
+        const read_len = try response.body.?.read(&buffer);
+        try std.testing.expectEqualStrings("two", buffer[0..read_len]);
+        const eof = try response.body.?.read(&buffer);
+        try std.testing.expectEqual(@as(usize, 0), eof);
+    }
+}
+
+test "client expires idle connection after timeout" {
+    const test_server = @import("http1/test_server.zig");
+
+    const scenarios = [_]test_server.Scenario{
+        .{
+            .steps = &.{
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .ok,
+                            .reason = "OK",
+                            .body = "one",
+                        },
+                    },
+                    .close_after = false,
+                },
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .ok,
+                            .reason = "OK",
+                            .body = "reuse",
+                        },
+                    },
+                    .close_after = true,
+                },
+            },
+        },
+        .{
+            .steps = &.{
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .ok,
+                            .reason = "OK",
+                            .body = "two",
+                        },
+                    },
+                    .close_after = true,
+                },
+            },
+        },
+    };
+
+    var server = try test_server.TestServer.init(&scenarios, test_server.Options.default());
+    defer server.deinit();
+    try server.start();
+
+    var options = Client.Options.default();
+    options.pool.max_connections = Client.ConnectionCount.init(1);
+    options.pool.idle_timeout = Client.Duration.fromMillis(20);
+    options.timeouts.read = Client.Duration.fromMillis(500);
+    options.timeouts.request = Client.Duration.fromSeconds(2);
+
+    var client = Client.init(std.testing.allocator, options);
+    defer client.deinit();
+
+    const uri = types.Uri.init(.http, "127.0.0.1", types.Port.init(server.port()), "/", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "127.0.0.1");
+
+    {
+        var handle = try client.request(&request);
+        defer handle.deinit();
+
+        var response = try handle.wait();
+        defer response.deinit();
+        defer if (response.body) |body| body.close();
+
+        var buffer: [8]u8 = undefined;
+        const read_len = try response.body.?.read(&buffer);
+        try std.testing.expectEqualStrings("one", buffer[0..read_len]);
+        const eof = try response.body.?.read(&buffer);
+        try std.testing.expectEqual(@as(usize, 0), eof);
+    }
+
+    std.time.sleep(50 * std.time.ns_per_ms);
 
     {
         var handle = try client.request(&request);
