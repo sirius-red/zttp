@@ -39,6 +39,8 @@ pub const Step = struct {
     payload: ResponsePayload,
     /// Read and discard a request before sending the response.
     read_request: bool = true,
+    /// Delay before sending the response payload.
+    delay_before_ns: u64 = 0,
     /// Close the connection after sending the response.
     close_after: bool = true,
 };
@@ -144,6 +146,10 @@ pub const TestServer = struct {
         for (scenario.steps) |step| {
             if (step.read_request) {
                 _ = readRequestHeaders(connection.stream, self.options.max_request_bytes) catch {};
+            }
+
+            if (step.delay_before_ns > 0) {
+                std.Thread.sleep(step.delay_before_ns);
             }
 
             try sendPayload(connection.stream, step.payload, step.close_after);

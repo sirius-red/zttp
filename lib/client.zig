@@ -1244,7 +1244,7 @@ test "client expires idle connection after timeout" {
         try std.testing.expectEqual(@as(usize, 0), eof);
     }
 
-    std.time.sleep(50 * std.time.ns_per_ms);
+    std.Thread.sleep(50 * std.time.ns_per_ms);
 
     {
         var handle = try client.request(&request);
@@ -1260,4 +1260,234 @@ test "client expires idle connection after timeout" {
         const eof = try response.body.?.read(&buffer);
         try std.testing.expectEqual(@as(usize, 0), eof);
     }
+}
+
+test "client reads chunked response body" {
+    const test_server = @import("http1/test_server.zig");
+
+    const raw_response =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++
+        "4\r\nWiki\r\n" ++
+        "5\r\npedia\r\n" ++
+        "0\r\n\r\n";
+
+    const scenarios = [_]test_server.Scenario{
+        .{
+            .steps = &.{
+                .{
+                    .payload = .{ .raw = raw_response },
+                },
+            },
+        },
+    };
+
+    var server = try test_server.TestServer.init(&scenarios, test_server.Options.default());
+    defer server.deinit();
+    try server.start();
+
+    var client = Client.init(std.testing.allocator, Client.Options.default());
+    defer client.deinit();
+
+    const uri = types.Uri.init(.http, "127.0.0.1", types.Port.init(server.port()), "/", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "127.0.0.1");
+
+    var handle = try client.request(&request);
+    defer handle.deinit();
+
+    var response = try handle.wait();
+    defer response.deinit();
+    defer if (response.body) |body| body.close();
+
+    var collected = std.ArrayList(u8).init(std.testing.allocator);
+    defer collected.deinit();
+
+    var buffer: [16]u8 = undefined;
+    while (true) {
+        const read_len = try response.body.?.read(&buffer);
+        if (read_len == 0) {
+            break;
+        }
+        try collected.appendSlice(buffer[0..read_len]);
+    }
+
+    try std.testing.expectEqualStrings("Wikipedia", collected.items);
+}
+
+test "client streams large response body" {
+    const test_server = @import("http1/test_server.zig");
+
+    const body_len = 128 * 1024;
+    const expected = try std.testing.allocator.alloc(u8, body_len);
+    defer std.testing.allocator.free(expected);
+    for (expected, 0..) |*byte, index| {
+        byte.* = @intCast(index % 251);
+    }
+
+    const scenarios = [_]test_server.Scenario{
+        .{
+            .steps = &.{
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .ok,
+                            .reason = "OK",
+                            .body = expected,
+                        },
+                    },
+                },
+            },
+        },
+    };
+
+    var server = try test_server.TestServer.init(&scenarios, test_server.Options.default());
+    defer server.deinit();
+    try server.start();
+
+    var client = Client.init(std.testing.allocator, Client.Options.default());
+    defer client.deinit();
+
+    const uri = types.Uri.init(.http, "127.0.0.1", types.Port.init(server.port()), "/", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "127.0.0.1");
+
+    var handle = try client.request(&request);
+    defer handle.deinit();
+
+    var response = try handle.wait();
+    defer response.deinit();
+    defer if (response.body) |body| body.close();
+
+    var offset: usize = 0;
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const read_len = try response.body.?.read(&buffer);
+        if (read_len == 0) {
+            break;
+        }
+        try std.testing.expectEqualSlices(u8, expected[offset .. offset + read_len], buffer[0..read_len]);
+        offset += read_len;
+    }
+
+    try std.testing.expectEqual(body_len, offset);
+}
+
+test "client rejects malformed response" {
+    const test_server = @import("http1/test_server.zig");
+
+    const raw_response = "HTTP/1.1 200 OK\n\n";
+    const scenarios = [_]test_server.Scenario{
+        .{
+            .steps = &.{
+                .{
+                    .payload = .{ .raw = raw_response },
+                },
+            },
+        },
+    };
+
+    var server = try test_server.TestServer.init(&scenarios, test_server.Options.default());
+    defer server.deinit();
+    try server.start();
+
+    var client = Client.init(std.testing.allocator, Client.Options.default());
+    defer client.deinit();
+
+    const uri = types.Uri.init(.http, "127.0.0.1", types.Port.init(server.port()), "/", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "127.0.0.1");
+
+    var handle = try client.request(&request);
+    defer handle.deinit();
+
+    try std.testing.expectError(error.Protocol, handle.wait());
+}
+
+test "client times out waiting for response" {
+    const test_server = @import("http1/test_server.zig");
+
+    const scenarios = [_]test_server.Scenario{
+        .{
+            .steps = &.{
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .ok,
+                            .reason = "OK",
+                            .body = "late",
+                        },
+                    },
+                    .delay_before_ns = 100 * std.time.ns_per_ms,
+                },
+            },
+        },
+    };
+
+    var server = try test_server.TestServer.init(&scenarios, test_server.Options.default());
+    defer server.deinit();
+    try server.start();
+
+    var options = Client.Options.default();
+    options.timeouts.read = Client.Duration.fromMillis(20);
+    options.timeouts.request = Client.Duration.fromSeconds(1);
+
+    var client = Client.init(std.testing.allocator, options);
+    defer client.deinit();
+
+    const uri = types.Uri.init(.http, "127.0.0.1", types.Port.init(server.port()), "/", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "127.0.0.1");
+
+    var handle = try client.request(&request);
+    defer handle.deinit();
+
+    try std.testing.expectError(error.Timeout, handle.wait());
+}
+
+test "client can cancel in-flight request" {
+    const test_server = @import("http1/test_server.zig");
+
+    const scenarios = [_]test_server.Scenario{
+        .{
+            .steps = &.{
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .ok,
+                            .reason = "OK",
+                            .body = "later",
+                        },
+                    },
+                    .delay_before_ns = 200 * std.time.ns_per_ms,
+                },
+            },
+        },
+    };
+
+    var server = try test_server.TestServer.init(&scenarios, test_server.Options.default());
+    defer server.deinit();
+    try server.start();
+
+    var options = Client.Options.default();
+    options.timeouts.request = Client.Duration.fromSeconds(1);
+
+    var client = Client.init(std.testing.allocator, options);
+    defer client.deinit();
+
+    const uri = types.Uri.init(.http, "127.0.0.1", types.Port.init(server.port()), "/", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "127.0.0.1");
+
+    var handle = try client.request(&request);
+    defer handle.deinit();
+
+    try std.testing.expect(handle.cancel());
+    try std.testing.expectError(error.Canceled, handle.wait());
 }
