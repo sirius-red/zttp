@@ -29,4 +29,5 @@ pub const Client = client.Client;
 test {
     _ = @import("http1/test_server.zig");
     _ = @import("http1/request_encoder.zig");
+    _ = @import("http1/response_parser.zig");
 }
