@@ -5,6 +5,7 @@ const types = @import("types.zig");
 const mailbox = @import("util/mailbox.zig");
 const future = @import("util/future.zig");
 const connection_h1 = @import("http1/connection_h1.zig");
+const redirects = @import("redirects/redirects.zig");
 
 /// Mailbox type for internal command queues.
 pub const Mailbox = mailbox.Mailbox;
@@ -26,6 +27,18 @@ pub const Client = struct {
         Timeout,
         /// Client configuration is invalid.
         InvalidConfig,
+        /// Redirect limit was exceeded.
+        RedirectLimitExceeded,
+        /// Redirect loop was detected.
+        RedirectLoop,
+        /// Redirect response was missing a location header.
+        RedirectMissingLocation,
+        /// Redirect response contained an invalid location value.
+        RedirectInvalidLocation,
+        /// Redirect location used an unsupported scheme.
+        RedirectUnsupportedScheme,
+        /// Redirect requires a repeatable body that is not available.
+        RedirectBodyNotRepeatable,
         /// URI is invalid or unsupported.
         InvalidUri,
         /// Transport failure (DNS/TCP/TLS).
@@ -727,6 +740,16 @@ pub const Client = struct {
     /// The request must remain valid until the returned handle completes.
     /// If the response includes a body, the caller must close it to release the connection.
     pub fn request(self: *Client, request_value: *const types.Request) Error!RequestHandle {
+        const follow_redirects = self.options.redirect_policy.mode == .follow;
+        return self.requestInternal(request_value, follow_redirects);
+    }
+
+    /// Submits a request with explicit redirect handling behavior.
+    fn requestInternal(
+        self: *Client,
+        request_value: *const types.Request,
+        follow_redirects: bool,
+    ) Error!RequestHandle {
         try self.validateOptions();
         const origin = try self.buildOriginKey(request_value);
         const connection_options = self.buildConnectionOptions();
@@ -739,7 +762,7 @@ pub const Client = struct {
             return error.OutOfMemory;
         };
         errdefer self.allocator.destroy(state);
-        state.* = RequestState.init(self.allocator, &self.pool, lease);
+        state.* = RequestState.init(self.allocator, self, request_value, follow_redirects, lease);
 
         lease.connection.submit(request_value, state.future.completion()) catch |err| {
             return mapSubmitError(err);
@@ -758,6 +781,18 @@ pub const Client = struct {
     const RequestState = struct {
         /// Allocator for request state and owned allocations.
         allocator: std.mem.Allocator,
+        /// Mutex guarding mutable request state.
+        mutex: std.Thread.Mutex,
+        /// Client owning the request.
+        client: *Client,
+        /// Original request pointer.
+        request: *const types.Request,
+        /// Indicates whether redirects should be followed.
+        follow_redirects: bool,
+        /// Timestamp used for overall timeout tracking.
+        start_ns: i128,
+        /// Cancellation token for the request.
+        cancel_token: CancellationToken,
         /// Pool used to return or discard connections.
         pool: *ConnectionPool,
         /// Lease for the checked-out connection.
@@ -770,12 +805,20 @@ pub const Client = struct {
         /// Initializes a request state with the provided lease.
         fn init(
             allocator: std.mem.Allocator,
-            pool: *ConnectionPool,
+            client: *Client,
+            request_value: *const types.Request,
+            follow_redirects: bool,
             lease: ConnectionPool.Lease,
         ) RequestState {
             return .{
                 .allocator = allocator,
-                .pool = pool,
+                .mutex = .{},
+                .client = client,
+                .request = request_value,
+                .follow_redirects = follow_redirects,
+                .start_ns = std.time.nanoTimestamp(),
+                .cancel_token = CancellationToken.init(),
+                .pool = &client.pool,
                 .lease = lease,
                 .future = ResponseFuture.init(),
                 .completed = false,
@@ -784,28 +827,174 @@ pub const Client = struct {
 
         /// Waits for completion and attaches response cleanup hooks.
         fn wait(self: *RequestState) ResponseFuture.WaitError!types.Response {
-            const response = self.future.wait() catch |err| {
-                self.discardLease();
-                return err;
-            };
-            return self.finalizeResponse(response);
+            return self.waitInternal(null);
         }
 
         /// Waits up to the timeout and attaches response cleanup hooks.
         fn timedWait(self: *RequestState, timeout_ns: u64) ResponseFuture.WaitError!types.Response {
-            const response = self.future.timedWait(timeout_ns) catch |err| switch (err) {
-                error.Timeout => return error.Timeout,
-                else => {
+            const deadline = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ns));
+            return self.waitInternal(deadline);
+        }
+
+        /// Waits for completion, applying redirect logic when enabled.
+        fn waitInternal(self: *RequestState, deadline: ?i128) ResponseFuture.WaitError!types.Response {
+            var effective_deadline = deadline;
+            if (self.client.options.timeouts.request) |timeout| {
+                const request_deadline = self.start_ns + @as(i128, @intCast(timeout.toNanos()));
+                if (effective_deadline == null or request_deadline < effective_deadline.?) {
+                    effective_deadline = request_deadline;
+                }
+            }
+
+            if (!self.follow_redirects) {
+                const response = try self.waitForCurrentResponse(effective_deadline);
+                return self.finalizeResponse(response);
+            }
+
+            return self.waitWithRedirects(effective_deadline);
+        }
+
+        /// Executes redirect handling while waiting for a final response.
+        fn waitWithRedirects(self: *RequestState, deadline: ?i128) ResponseFuture.WaitError!types.Response {
+            const base_headers = &self.request.headers;
+            const version = self.request.version;
+            var current_method = self.request.method;
+            var current_uri = self.request.uri;
+            var body_present = self.request.body != null;
+            var current_owned: ?redirects.OwnedUri = null;
+            defer if (current_owned) |*owned| owned.deinit();
+
+            var visited = std.ArrayList([]u8).init(self.allocator);
+            defer {
+                for (visited.items) |key| {
+                    self.allocator.free(key);
+                }
+                visited.deinit();
+            }
+
+            self.appendRedirectKey(&visited, current_uri) catch |err| {
+                _ = self.cancel();
+                return err;
+            };
+
+            var hops: u8 = 0;
+            var owned_request: ?*types.Request = null;
+
+            while (true) {
+                if (self.cancel_token.isCanceled()) {
+                    self.discardLease();
+                    return error.Canceled;
+                }
+
+                var response = self.waitForCurrentResponse(deadline) catch |err| {
+                    self.cleanupOwnedRequest(owned_request);
+                    owned_request = null;
+                    return err;
+                };
+
+                self.cleanupOwnedRequest(owned_request);
+                owned_request = null;
+
+                if (!redirects.isRedirectStatus(response.status)) {
+                    return self.finalizeResponse(response);
+                }
+
+                const location = response.headers.get("Location") orelse {
+                    self.abandonRedirectResponse(&response);
+                    return error.RedirectMissingLocation;
+                };
+
+                if (hops >= self.client.options.redirect_policy.max_hops) {
+                    self.abandonRedirectResponse(&response);
+                    return error.RedirectLimitExceeded;
+                }
+
+                const rewrite = redirects.rewriteMethod(response.status, current_method);
+                if (rewrite.keep_body and body_present) {
+                    self.abandonRedirectResponse(&response);
+                    return error.RedirectBodyNotRepeatable;
+                }
+                if (!rewrite.keep_body) {
+                    body_present = false;
+                }
+
+                var resolved = redirects.resolveLocation(self.allocator, current_uri, location) catch |err| {
+                    self.abandonRedirectResponse(&response);
+                    return mapRedirectError(err);
+                };
+                var resolved_committed = false;
+                defer if (!resolved_committed) resolved.deinit();
+
+                const next_uri = resolved.asUri();
+                self.appendRedirectKey(&visited, next_uri) catch |err| {
+                    self.abandonRedirectResponse(&response);
+                    return err;
+                };
+
+                hops += 1;
+                self.abandonRedirectResponse(&response);
+
+                current_method = rewrite.method;
+                if (current_owned) |*owned| {
+                    owned.deinit();
+                }
+                current_owned = resolved;
+                current_uri = current_owned.?.asUri();
+                resolved_committed = true;
+
+                owned_request = try buildRedirectRequest(
+                    self.allocator,
+                    current_method,
+                    current_uri,
+                    version,
+                    base_headers,
+                );
+                self.submitRedirectRequest(owned_request.?) catch |err| {
+                    self.cleanupOwnedRequest(owned_request);
+                    owned_request = null;
+                    return err;
+                };
+            }
+        }
+
+        /// Waits for the current response future using the provided deadline.
+        fn waitForCurrentResponse(self: *RequestState, deadline: ?i128) ResponseFuture.WaitError!types.Response {
+            if (deadline) |limit| {
+                const remaining = remainingTimeout(limit) orelse {
+                    self.discardLease();
+                    return error.Timeout;
+                };
+                const response = self.future.timedWait(remaining) catch |err| {
                     self.discardLease();
                     return err;
-                },
+                };
+                return response;
+            }
+
+            const response = self.future.wait() catch |err| {
+                self.discardLease();
+                return err;
             };
-            return self.finalizeResponse(response);
+            return response;
+        }
+
+        /// Computes remaining nanoseconds until the deadline, or null if expired.
+        fn remainingTimeout(deadline: i128) ?u64 {
+            const now = std.time.nanoTimestamp();
+            if (now >= deadline) {
+                return null;
+            }
+            return @as(u64, @intCast(deadline - now));
         }
 
         /// Cancels the future and closes the connection.
         fn cancel(self: *RequestState) bool {
+            self.cancel_token.cancel();
+
+            self.mutex.lock();
             const canceled = self.future.cancel();
+            self.mutex.unlock();
+
             self.discardLease();
             return canceled;
         }
@@ -813,9 +1002,8 @@ pub const Client = struct {
         /// Releases request resources.
         fn deinit(self: *RequestState) void {
             if (!self.completed) {
-                _ = self.future.cancel();
+                _ = self.cancel();
             }
-            self.discardLease();
             self.allocator.destroy(self);
         }
 
@@ -855,29 +1043,126 @@ pub const Client = struct {
             return response;
         }
 
+        /// Cleans up a redirect response before following the next hop.
+        fn abandonRedirectResponse(self: *RequestState, response: *types.Response) void {
+            if (response.body) |body_reader| {
+                body_reader.close();
+                response.body = null;
+                response.deinit();
+                self.discardLease();
+                return;
+            }
+            response.deinit();
+            self.releaseLease();
+        }
+
+        /// Releases an owned redirect request.
+        fn cleanupOwnedRequest(self: *RequestState, owned: ?*types.Request) void {
+            if (owned) |request_value| {
+                request_value.deinit();
+                self.allocator.destroy(request_value);
+            }
+        }
+
+        /// Adds a redirect key to the visited list for loop detection.
+        fn appendRedirectKey(
+            self: *RequestState,
+            visited: *std.ArrayList([]u8),
+            uri: types.Uri,
+        ) Error!void {
+            const key = redirects.uriKey(self.allocator, uri) catch {
+                return error.OutOfMemory;
+            };
+
+            if (isRedirectVisited(visited, key)) {
+                self.allocator.free(key);
+                return error.RedirectLoop;
+            }
+
+            visited.append(key) catch |err| {
+                self.allocator.free(key);
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                };
+            };
+        }
+
+        /// Returns true when the redirect key has been seen already.
+        fn isRedirectVisited(visited: *const std.ArrayList([]u8), key: []const u8) bool {
+            for (visited.items) |entry| {
+                if (std.mem.eql(u8, entry, key)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// Submits a follow-up request for a redirect hop.
+        fn submitRedirectRequest(self: *RequestState, request_value: *const types.Request) Error!void {
+            const origin = try self.client.buildOriginKey(request_value);
+            const connection_options = self.client.buildConnectionOptions();
+            var lease = try self.pool.checkout(origin, connection_options);
+
+            self.mutex.lock();
+            if (self.cancel_token.isCanceled()) {
+                self.mutex.unlock();
+                self.pool.discard(lease);
+                return error.Canceled;
+            }
+
+            self.future = ResponseFuture.init();
+            self.lease = lease;
+
+            lease.connection.submit(request_value, self.future.completion()) catch |err| {
+                self.lease = null;
+                self.mutex.unlock();
+                self.pool.discard(lease);
+                return mapSubmitError(err);
+            };
+
+            self.mutex.unlock();
+        }
+
         /// Releases the lease back to the pool, if present.
         fn releaseLease(self: *RequestState) void {
-            if (self.lease) |lease| {
-                self.pool.release(lease);
+            var lease: ?ConnectionPool.Lease = null;
+            self.mutex.lock();
+            if (self.lease) |current| {
+                lease = current;
                 self.lease = null;
+            }
+            self.mutex.unlock();
+
+            if (lease) |current| {
+                self.pool.release(current);
             }
         }
 
         /// Discards the lease and closes the connection, if present.
         fn discardLease(self: *RequestState) void {
-            if (self.lease) |lease| {
-                self.pool.discard(lease);
+            var lease: ?ConnectionPool.Lease = null;
+            self.mutex.lock();
+            if (self.lease) |current| {
+                lease = current;
                 self.lease = null;
+            }
+            self.mutex.unlock();
+
+            if (lease) |current| {
+                self.pool.discard(current);
             }
         }
 
         /// Takes ownership of the lease, if present.
         fn takeLease(self: *RequestState) ?ConnectionPool.Lease {
-            if (self.lease) |lease| {
+            var lease: ?ConnectionPool.Lease = null;
+            self.mutex.lock();
+            if (self.lease) |current| {
+                lease = current;
                 self.lease = null;
-                return lease;
             }
-            return null;
+            self.mutex.unlock();
+            return lease;
         }
     };
 
@@ -912,6 +1197,64 @@ pub const Client = struct {
             self.allocator.destroy(self);
         }
     };
+
+    /// Returns true when a header should be omitted on redirect follow-ups.
+    fn shouldSkipRedirectHeader(name: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(name, "host") or
+            std.ascii.eqlIgnoreCase(name, "content-length") or
+            std.ascii.eqlIgnoreCase(name, "transfer-encoding");
+    }
+
+    /// Copies request headers for a redirect follow-up.
+    fn copyRedirectHeaders(source: *const types.Headers, dest: *types.Headers) Error!void {
+        var iter = source.iterator();
+        while (iter.next()) |header| {
+            if (shouldSkipRedirectHeader(header.name)) {
+                continue;
+            }
+            try dest.append(header.name, header.value);
+        }
+    }
+
+    /// Appends a Host header derived from the URI.
+    fn appendHostHeader(headers: *types.Headers, uri: types.Uri) Error!void {
+        if (uri.port) |port| {
+            const value = std.fmt.allocPrint(
+                headers.allocator,
+                "{s}:{d}",
+                .{ uri.host, port.toInt() },
+            ) catch return error.OutOfMemory;
+            defer headers.allocator.free(value);
+            try headers.append("Host", value);
+            return;
+        }
+        try headers.append("Host", uri.host);
+    }
+
+    /// Builds a new request for a redirect hop.
+    fn buildRedirectRequest(
+        allocator: std.mem.Allocator,
+        method: types.Method,
+        uri: types.Uri,
+        version: types.Version,
+        base_headers: *const types.Headers,
+    ) Error!*types.Request {
+        const request_value = allocator.create(types.Request) catch {
+            return error.OutOfMemory;
+        };
+        errdefer allocator.destroy(request_value);
+
+        request_value.* = types.Request.init(allocator, method, uri);
+        errdefer request_value.deinit();
+
+        request_value.version = version;
+        request_value.body = null;
+
+        try copyRedirectHeaders(base_headers, &request_value.headers);
+        try appendHostHeader(&request_value.headers, uri);
+
+        return request_value;
+    }
 
     /// Builds a pool origin key from the request URI.
     fn buildOriginKey(self: *Client, request_value: *const types.Request) Error!ConnectionPool.OriginKey {
@@ -955,6 +1298,16 @@ pub const Client = struct {
         return options;
     }
 
+    /// Maps redirect helper errors into client errors.
+    fn mapRedirectError(err: redirects.RedirectError) Error {
+        return switch (err) {
+            error.MissingLocation => error.RedirectMissingLocation,
+            error.InvalidLocation => error.RedirectInvalidLocation,
+            error.UnsupportedScheme => error.RedirectUnsupportedScheme,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    }
+
     /// Validates client options before issuing requests.
     fn validateOptions(self: *const Client) Error!void {
         if (self.options.pool.max_connections.toInt() == 0) {
@@ -970,6 +1323,32 @@ pub const Client = struct {
             error.NotStarted,
             => error.Transport,
         };
+    }
+};
+
+/// Body reader state for tests requiring a one-shot payload.
+const TestBodyState = struct {
+    /// Payload bytes.
+    data: []const u8,
+    /// Read offset into the payload.
+    offset: usize,
+
+    /// Reads from the payload buffer.
+    fn read(ctx: ?*anyopaque, dest: []u8) anyerror!usize {
+        const self: *TestBodyState = @ptrCast(@alignCast(ctx.?));
+        if (self.offset >= self.data.len) {
+            return 0;
+        }
+        const remaining = self.data.len - self.offset;
+        const to_copy = @min(dest.len, remaining);
+        std.mem.copyForwards(u8, dest[0..to_copy], self.data[self.offset .. self.offset + to_copy]);
+        self.offset += to_copy;
+        return to_copy;
+    }
+
+    /// Closes the body reader.
+    fn close(ctx: ?*anyopaque) void {
+        _ = ctx;
     }
 };
 
@@ -1490,4 +1869,208 @@ test "client can cancel in-flight request" {
 
     try std.testing.expect(handle.cancel());
     try std.testing.expectError(error.Canceled, handle.wait());
+}
+
+test "client follows redirect responses" {
+    const test_server = @import("http1/test_server.zig");
+
+    const scenarios = [_]test_server.Scenario{
+        .{
+            .steps = &.{
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .found,
+                            .reason = "Found",
+                            .headers = &.{
+                                .{ .name = "Location", .value = "/next" },
+                            },
+                        },
+                    },
+                    .close_after = false,
+                },
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .ok,
+                            .reason = "OK",
+                            .body = "final",
+                        },
+                    },
+                    .close_after = true,
+                },
+            },
+        },
+    };
+
+    var server = try test_server.TestServer.init(&scenarios, test_server.Options.default());
+    defer server.deinit();
+    try server.start();
+
+    var client = Client.init(std.testing.allocator, Client.Options.default());
+    defer client.deinit();
+
+    const uri = types.Uri.init(.http, "127.0.0.1", types.Port.init(server.port()), "/start", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "127.0.0.1");
+
+    var handle = try client.request(&request);
+    defer handle.deinit();
+
+    var response = try handle.wait();
+    defer response.deinit();
+    defer if (response.body) |body| body.close();
+
+    try std.testing.expectEqual(types.Status.ok, response.status);
+
+    var buffer: [8]u8 = undefined;
+    const read_len = try response.body.?.read(&buffer);
+    try std.testing.expectEqualStrings("final", buffer[0..read_len]);
+    const eof = try response.body.?.read(&buffer);
+    try std.testing.expectEqual(@as(usize, 0), eof);
+}
+
+test "client detects redirect loops" {
+    const test_server = @import("http1/test_server.zig");
+
+    const scenarios = [_]test_server.Scenario{
+        .{
+            .steps = &.{
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .found,
+                            .reason = "Found",
+                            .headers = &.{
+                                .{ .name = "Location", .value = "/loop" },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    };
+
+    var server = try test_server.TestServer.init(&scenarios, test_server.Options.default());
+    defer server.deinit();
+    try server.start();
+
+    var client = Client.init(std.testing.allocator, Client.Options.default());
+    defer client.deinit();
+
+    const uri = types.Uri.init(.http, "127.0.0.1", types.Port.init(server.port()), "/loop", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "127.0.0.1");
+
+    var handle = try client.request(&request);
+    defer handle.deinit();
+
+    try std.testing.expectError(error.RedirectLoop, handle.wait());
+}
+
+test "client enforces redirect hop limit" {
+    const test_server = @import("http1/test_server.zig");
+
+    const scenarios = [_]test_server.Scenario{
+        .{
+            .steps = &.{
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .found,
+                            .reason = "Found",
+                            .headers = &.{
+                                .{ .name = "Location", .value = "/first" },
+                            },
+                        },
+                    },
+                    .close_after = false,
+                },
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .found,
+                            .reason = "Found",
+                            .headers = &.{
+                                .{ .name = "Location", .value = "/second" },
+                            },
+                        },
+                    },
+                    .close_after = true,
+                },
+            },
+        },
+    };
+
+    var server = try test_server.TestServer.init(&scenarios, test_server.Options.default());
+    defer server.deinit();
+    try server.start();
+
+    var options = Client.Options.default();
+    options.redirect_policy.max_hops = 1;
+
+    var client = Client.init(std.testing.allocator, options);
+    defer client.deinit();
+
+    const uri = types.Uri.init(.http, "127.0.0.1", types.Port.init(server.port()), "/start", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "127.0.0.1");
+
+    var handle = try client.request(&request);
+    defer handle.deinit();
+
+    try std.testing.expectError(error.RedirectLimitExceeded, handle.wait());
+}
+
+test "client rejects redirect when body is not repeatable" {
+    const test_server = @import("http1/test_server.zig");
+
+    const scenarios = [_]test_server.Scenario{
+        .{
+            .steps = &.{
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .temporary_redirect,
+                            .reason = "Temporary Redirect",
+                            .headers = &.{
+                                .{ .name = "Location", .value = "/next" },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    };
+
+    var server = try test_server.TestServer.init(&scenarios, test_server.Options.default());
+    defer server.deinit();
+    try server.start();
+
+    var client = Client.init(std.testing.allocator, Client.Options.default());
+    defer client.deinit();
+
+    const uri = types.Uri.init(.http, "127.0.0.1", types.Port.init(server.port()), "/start", null, null);
+    var request = types.Request.init(std.testing.allocator, .post, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "127.0.0.1");
+    try request.headers.append("Content-Length", "7");
+
+    var body_state = TestBodyState{
+        .data = "payload",
+        .offset = 0,
+    };
+    request.body = .{
+        .ctx = &body_state,
+        .read_fn = TestBodyState.read,
+        .close_fn = TestBodyState.close,
+    };
+
+    var handle = try client.request(&request);
+    defer handle.deinit();
+
+    try std.testing.expectError(error.RedirectBodyNotRepeatable, handle.wait());
 }
