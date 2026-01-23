@@ -926,6 +926,7 @@ pub const Client = struct {
                 defer if (!resolved_committed) resolved.deinit();
 
                 const next_uri = resolved.asUri();
+                const same_origin = isSameOrigin(current_uri, next_uri);
                 self.appendRedirectKey(&visited, next_uri) catch |err| {
                     self.abandonRedirectResponse(&response);
                     return err;
@@ -948,6 +949,7 @@ pub const Client = struct {
                     current_uri,
                     version,
                     base_headers,
+                    same_origin,
                 );
                 self.submitRedirectRequest(owned_request.?) catch |err| {
                     self.cleanupOwnedRequest(owned_request);
@@ -1198,63 +1200,6 @@ pub const Client = struct {
         }
     };
 
-    /// Returns true when a header should be omitted on redirect follow-ups.
-    fn shouldSkipRedirectHeader(name: []const u8) bool {
-        return std.ascii.eqlIgnoreCase(name, "host") or
-            std.ascii.eqlIgnoreCase(name, "content-length") or
-            std.ascii.eqlIgnoreCase(name, "transfer-encoding");
-    }
-
-    /// Copies request headers for a redirect follow-up.
-    fn copyRedirectHeaders(source: *const types.Headers, dest: *types.Headers) Error!void {
-        var iter = source.iterator();
-        while (iter.next()) |header| {
-            if (shouldSkipRedirectHeader(header.name)) {
-                continue;
-            }
-            try dest.append(header.name, header.value);
-        }
-    }
-
-    /// Appends a Host header derived from the URI.
-    fn appendHostHeader(headers: *types.Headers, uri: types.Uri) Error!void {
-        if (uri.port) |port| {
-            const value = std.fmt.allocPrint(
-                headers.allocator,
-                "{s}:{d}",
-                .{ uri.host, port.toInt() },
-            ) catch return error.OutOfMemory;
-            defer headers.allocator.free(value);
-            try headers.append("Host", value);
-            return;
-        }
-        try headers.append("Host", uri.host);
-    }
-
-    /// Builds a new request for a redirect hop.
-    fn buildRedirectRequest(
-        allocator: std.mem.Allocator,
-        method: types.Method,
-        uri: types.Uri,
-        version: types.Version,
-        base_headers: *const types.Headers,
-    ) Error!*types.Request {
-        const request_value = allocator.create(types.Request) catch {
-            return error.OutOfMemory;
-        };
-        errdefer allocator.destroy(request_value);
-
-        request_value.* = types.Request.init(allocator, method, uri);
-        errdefer request_value.deinit();
-
-        request_value.version = version;
-        request_value.body = null;
-
-        try copyRedirectHeaders(base_headers, &request_value.headers);
-        try appendHostHeader(&request_value.headers, uri);
-
-        return request_value;
-    }
 
     /// Builds a pool origin key from the request URI.
     fn buildOriginKey(self: *Client, request_value: *const types.Request) Error!ConnectionPool.OriginKey {
@@ -1298,16 +1243,6 @@ pub const Client = struct {
         return options;
     }
 
-    /// Maps redirect helper errors into client errors.
-    fn mapRedirectError(err: redirects.RedirectError) Error {
-        return switch (err) {
-            error.MissingLocation => error.RedirectMissingLocation,
-            error.InvalidLocation => error.RedirectInvalidLocation,
-            error.UnsupportedScheme => error.RedirectUnsupportedScheme,
-            error.OutOfMemory => error.OutOfMemory,
-        };
-    }
-
     /// Validates client options before issuing requests.
     fn validateOptions(self: *const Client) Error!void {
         if (self.options.pool.max_connections.toInt() == 0) {
@@ -1325,6 +1260,96 @@ pub const Client = struct {
         };
     }
 };
+
+/// Returns true when a header should be omitted on redirect follow-ups.
+fn shouldSkipRedirectHeader(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "host") or
+        std.ascii.eqlIgnoreCase(name, "content-length") or
+        std.ascii.eqlIgnoreCase(name, "transfer-encoding");
+}
+
+/// Returns true when a header should be omitted for cross-origin redirects.
+fn shouldSkipCrossOriginHeader(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "authorization") or
+        std.ascii.eqlIgnoreCase(name, "proxy-authorization") or
+        std.ascii.eqlIgnoreCase(name, "cookie");
+}
+
+/// Copies request headers for a redirect follow-up.
+fn copyRedirectHeaders(
+    source: *const types.Headers,
+    dest: *types.Headers,
+    same_origin: bool,
+) Client.Error!void {
+    var iter = source.iterator();
+    while (iter.next()) |header| {
+        if (shouldSkipRedirectHeader(header.name)) {
+            continue;
+        }
+        if (!same_origin and shouldSkipCrossOriginHeader(header.name)) {
+            continue;
+        }
+        try dest.append(header.name, header.value);
+    }
+}
+
+/// Appends a Host header derived from the URI.
+fn appendHostHeader(headers: *types.Headers, uri: types.Uri) Client.Error!void {
+    if (uri.port) |port| {
+        const value = std.fmt.allocPrint(
+            headers.allocator,
+            "{s}:{d}",
+            .{ uri.host, port.toInt() },
+        ) catch return error.OutOfMemory;
+        defer headers.allocator.free(value);
+        try headers.append("Host", value);
+        return;
+    }
+    try headers.append("Host", uri.host);
+}
+
+/// Returns true when two URIs share the same origin.
+fn isSameOrigin(a: types.Uri, b: types.Uri) bool {
+    return a.scheme == b.scheme and
+        a.effectivePort().toInt() == b.effectivePort().toInt() and
+        std.ascii.eqlIgnoreCase(a.host, b.host);
+}
+
+/// Builds a new request for a redirect hop.
+fn buildRedirectRequest(
+    allocator: std.mem.Allocator,
+    method: types.Method,
+    uri: types.Uri,
+    version: types.Version,
+    base_headers: *const types.Headers,
+    same_origin: bool,
+) Client.Error!*types.Request {
+    const request_value = allocator.create(types.Request) catch {
+        return error.OutOfMemory;
+    };
+    errdefer allocator.destroy(request_value);
+
+    request_value.* = types.Request.init(allocator, method, uri);
+    errdefer request_value.deinit();
+
+    request_value.version = version;
+    request_value.body = null;
+
+    try copyRedirectHeaders(base_headers, &request_value.headers, same_origin);
+    try appendHostHeader(&request_value.headers, uri);
+
+    return request_value;
+}
+
+/// Maps redirect helper errors into client errors.
+fn mapRedirectError(err: redirects.RedirectError) Client.Error {
+    return switch (err) {
+        error.MissingLocation => error.RedirectMissingLocation,
+        error.InvalidLocation => error.RedirectInvalidLocation,
+        error.UnsupportedScheme => error.RedirectUnsupportedScheme,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
 
 /// Body reader state for tests requiring a one-shot payload.
 const TestBodyState = struct {
@@ -2023,6 +2048,29 @@ test "client enforces redirect hop limit" {
     defer handle.deinit();
 
     try std.testing.expectError(error.RedirectLimitExceeded, handle.wait());
+}
+
+test "redirect header carry-over drops sensitive headers on cross-origin" {
+    var base = types.Headers.init(std.testing.allocator);
+    defer base.deinit();
+    try base.append("Authorization", "secret");
+    try base.append("Proxy-Authorization", "proxy");
+    try base.append("Cookie", "a=b");
+    try base.append("Accept", "text/plain");
+    try base.append("Host", "example.com");
+    try base.append("Content-Length", "5");
+
+    var dest = types.Headers.init(std.testing.allocator);
+    defer dest.deinit();
+
+    try copyRedirectHeaders(&base, &dest, false);
+
+    try std.testing.expect(dest.get("Authorization") == null);
+    try std.testing.expect(dest.get("Proxy-Authorization") == null);
+    try std.testing.expect(dest.get("Cookie") == null);
+    try std.testing.expect(dest.get("Host") == null);
+    try std.testing.expect(dest.get("Content-Length") == null);
+    try std.testing.expectEqualStrings("text/plain", dest.get("Accept").?);
 }
 
 test "client rejects redirect when body is not repeatable" {
