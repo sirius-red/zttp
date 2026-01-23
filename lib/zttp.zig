@@ -31,5 +31,6 @@ test {
     _ = @import("http1/request_encoder.zig");
     _ = @import("http1/response_parser.zig");
     _ = @import("http1/connection_h1.zig");
+    _ = @import("cookies/cookie_jar.zig");
     _ = @import("redirects/redirects.zig");
 }

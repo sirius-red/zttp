@@ -6,6 +6,7 @@ const mailbox = @import("util/mailbox.zig");
 const future = @import("util/future.zig");
 const connection_h1 = @import("http1/connection_h1.zig");
 const redirects = @import("redirects/redirects.zig");
+const cookies = @import("cookies/cookie_jar.zig");
 
 /// Mailbox type for internal command queues.
 pub const Mailbox = mailbox.Mailbox;
@@ -287,8 +288,8 @@ pub const Client = struct {
         }
     };
 
-    /// Placeholder type for the cookie jar implementation.
-    pub const CookieJar = struct {};
+    /// Thread-safe cookie jar implementation.
+    pub const CookieJar = cookies.CookieJar;
 
     /// Identity token for TLS configuration matching.
     const TlsConfigId = struct {
@@ -394,6 +395,14 @@ pub const Client = struct {
             self.state.deinit();
             self.state = undefined;
         }
+    };
+
+    /// Prepared request pointer with optional owned storage.
+    const PreparedRequest = struct {
+        /// Request pointer to submit.
+        request: *const types.Request,
+        /// Owned request storage, if a copy was created.
+        owned: ?*types.Request,
     };
 
     /// Internal connection pool keyed by origin.
@@ -751,7 +760,11 @@ pub const Client = struct {
         follow_redirects: bool,
     ) Error!RequestHandle {
         try self.validateOptions();
-        const origin = try self.buildOriginKey(request_value);
+        const prepared = try self.prepareRequest(request_value);
+        var cleanup_prepared = true;
+        errdefer if (cleanup_prepared) self.cleanupPreparedRequest(prepared);
+
+        const origin = try self.buildOriginKey(prepared.request);
         const connection_options = self.buildConnectionOptions();
         var lease = try self.pool.checkout(origin, connection_options);
 
@@ -762,14 +775,47 @@ pub const Client = struct {
             return error.OutOfMemory;
         };
         errdefer self.allocator.destroy(state);
-        state.* = RequestState.init(self.allocator, self, request_value, follow_redirects, lease);
+        state.* = RequestState.init(
+            self.allocator,
+            self,
+            prepared.request,
+            prepared.owned,
+            follow_redirects,
+            lease,
+        );
 
-        lease.connection.submit(request_value, state.future.completion()) catch |err| {
+        lease.connection.submit(prepared.request, state.future.completion()) catch |err| {
             return mapSubmitError(err);
         };
 
         cleanup = false;
+        cleanup_prepared = false;
         return .{ .state = state };
+    }
+
+    /// Prepares a request for submission, applying cookie headers when needed.
+    fn prepareRequest(self: *Client, request_value: *const types.Request) Error!PreparedRequest {
+        const jar = self.options.cookie_jar orelse {
+            return .{ .request = request_value, .owned = null };
+        };
+
+        const now = cookies.CookieJar.Timestamp.now();
+        const header_value = try jar.buildCookieHeader(self.allocator, request_value.uri, now);
+        if (header_value == null) {
+            return .{ .request = request_value, .owned = null };
+        }
+        defer self.allocator.free(header_value.?);
+
+        const owned = try buildRequestWithCookies(self.allocator, request_value, header_value.?);
+        return .{ .request = owned, .owned = owned };
+    }
+
+    /// Releases any owned request created during preparation.
+    fn cleanupPreparedRequest(self: *Client, prepared: PreparedRequest) void {
+        if (prepared.owned) |owned| {
+            owned.deinit();
+            self.allocator.destroy(owned);
+        }
     }
 
     /// Releases resources owned by the client.
@@ -787,6 +833,8 @@ pub const Client = struct {
         client: *Client,
         /// Original request pointer.
         request: *const types.Request,
+        /// Owned request storage, if a copy was created.
+        owned_request: ?*types.Request,
         /// Indicates whether redirects should be followed.
         follow_redirects: bool,
         /// Timestamp used for overall timeout tracking.
@@ -807,6 +855,7 @@ pub const Client = struct {
             allocator: std.mem.Allocator,
             client: *Client,
             request_value: *const types.Request,
+            owned_request: ?*types.Request,
             follow_redirects: bool,
             lease: ConnectionPool.Lease,
         ) RequestState {
@@ -815,6 +864,7 @@ pub const Client = struct {
                 .mutex = .{},
                 .client = client,
                 .request = request_value,
+                .owned_request = owned_request,
                 .follow_redirects = follow_redirects,
                 .start_ns = std.time.nanoTimestamp(),
                 .cancel_token = CancellationToken.init(),
@@ -848,7 +898,7 @@ pub const Client = struct {
 
             if (!self.follow_redirects) {
                 const response = try self.waitForCurrentResponse(effective_deadline);
-                return self.finalizeResponse(response);
+                return self.finalizeResponse(self.request.uri, response);
             }
 
             return self.waitWithRedirects(effective_deadline);
@@ -896,7 +946,7 @@ pub const Client = struct {
                 owned_request = null;
 
                 if (!redirects.isRedirectStatus(response.status)) {
-                    return self.finalizeResponse(response);
+                    return self.finalizeResponse(current_uri, response);
                 }
 
                 const location = response.headers.get("Location") orelse {
@@ -1006,12 +1056,22 @@ pub const Client = struct {
             if (!self.completed) {
                 _ = self.cancel();
             }
+            if (self.owned_request) |owned| {
+                owned.deinit();
+                self.allocator.destroy(owned);
+                self.owned_request = null;
+            }
             self.allocator.destroy(self);
         }
 
         /// Finalizes the response and wires body cleanup if needed.
-        fn finalizeResponse(self: *RequestState, response_value: types.Response) ResponseFuture.WaitError!types.Response {
+        fn finalizeResponse(
+            self: *RequestState,
+            request_uri: types.Uri,
+            response_value: types.Response,
+        ) ResponseFuture.WaitError!types.Response {
             var response = response_value;
+            try self.storeCookies(request_uri, &response);
             if (response.body) |body_reader| {
                 const lease = self.takeLease() orelse {
                     body_reader.close();
@@ -1043,6 +1103,23 @@ pub const Client = struct {
 
             self.completed = true;
             return response;
+        }
+
+        /// Stores cookies from the response when a jar is configured.
+        fn storeCookies(self: *RequestState, uri: types.Uri, response: *types.Response) ResponseFuture.WaitError!void {
+            const jar = self.client.options.cookie_jar orelse return;
+            const now = cookies.CookieJar.Timestamp.now();
+            jar.storeFromResponse(uri, &response.headers, now) catch |err| {
+                if (response.body) |body_reader| {
+                    body_reader.close();
+                    response.body = null;
+                }
+                response.deinit();
+                self.discardLease();
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                };
+            };
         }
 
         /// Cleans up a redirect response before following the next hop.
@@ -1260,6 +1337,58 @@ pub const Client = struct {
         };
     }
 };
+
+/// Builds a request copy with an updated Cookie header.
+fn buildRequestWithCookies(
+    allocator: std.mem.Allocator,
+    request_value: *const types.Request,
+    cookie_value: []const u8,
+) Client.Error!*types.Request {
+    const request_copy = allocator.create(types.Request) catch {
+        return error.OutOfMemory;
+    };
+    errdefer allocator.destroy(request_copy);
+
+    request_copy.* = types.Request.init(allocator, request_value.method, request_value.uri);
+    errdefer request_copy.deinit();
+
+    request_copy.version = request_value.version;
+    request_copy.body = request_value.body;
+
+    var existing = std.ArrayListUnmanaged(u8){};
+    defer existing.deinit(allocator);
+
+    var iter = request_value.headers.iterator();
+    while (iter.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "cookie")) {
+            if (existing.items.len > 0) {
+                try existing.appendSlice(allocator, "; ");
+            }
+            try existing.appendSlice(allocator, header.value);
+            continue;
+        }
+        try request_copy.headers.append(header.name, header.value);
+    }
+
+    var combined = std.ArrayListUnmanaged(u8){};
+    defer combined.deinit(allocator);
+
+    if (existing.items.len > 0) {
+        try combined.appendSlice(allocator, existing.items);
+    }
+    if (existing.items.len > 0 and cookie_value.len > 0) {
+        try combined.appendSlice(allocator, "; ");
+    }
+    if (cookie_value.len > 0) {
+        try combined.appendSlice(allocator, cookie_value);
+    }
+
+    if (combined.items.len > 0) {
+        try request_copy.headers.append("Cookie", combined.items);
+    }
+
+    return request_copy;
+}
 
 /// Returns true when a header should be omitted on redirect follow-ups.
 fn shouldSkipRedirectHeader(name: []const u8) bool {
