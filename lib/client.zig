@@ -4,6 +4,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const mailbox = @import("util/mailbox.zig");
 const future = @import("util/future.zig");
+const connection_h1 = @import("http1/connection_h1.zig");
 
 /// Mailbox type for internal command queues.
 pub const Mailbox = mailbox.Mailbox;
@@ -31,6 +32,8 @@ pub const Client = struct {
         LimitExceeded,
         /// Operation was canceled.
         Canceled,
+        /// Allocation failed.
+        OutOfMemory,
     };
 
     /// Cancellation token shared across operations.
@@ -286,6 +289,36 @@ pub const Client = struct {
         }
     };
 
+    /// Future type for response completion.
+    pub const ResponseFuture = RequestFuture(types.Response, Error);
+
+    /// Handle for awaiting a client request response.
+    pub const RequestHandle = struct {
+        /// Internal request state backing the handle.
+        state: *RequestState,
+
+        /// Blocks until the request completes.
+        pub fn wait(self: *RequestHandle) ResponseFuture.WaitError!types.Response {
+            return self.state.wait();
+        }
+
+        /// Blocks until completion or the timeout elapses.
+        pub fn timedWait(self: *RequestHandle, timeout_ns: u64) ResponseFuture.WaitError!types.Response {
+            return self.state.timedWait(timeout_ns);
+        }
+
+        /// Cancels the request and releases owned resources.
+        pub fn cancel(self: *RequestHandle) bool {
+            return self.state.cancel();
+        }
+
+        /// Releases resources owned by the handle.
+        pub fn deinit(self: *RequestHandle) void {
+            self.state.deinit();
+            self.state = undefined;
+        }
+    };
+
     /// Creates a client with the provided allocator and options.
     pub fn init(allocator: std.mem.Allocator, options: Options) Client {
         return .{
@@ -294,9 +327,228 @@ pub const Client = struct {
         };
     }
 
+    /// Submits a request using a dedicated HTTP/1.1 connection.
+    /// The request must remain valid until the returned handle completes.
+    /// If the response includes a body, the caller must close it to release the connection.
+    pub fn request(self: *Client, request_value: *const types.Request) Error!RequestHandle {
+        const origin = try self.buildOrigin(request_value);
+        const conn = try self.allocator.create(connection_h1.ConnectionH1);
+        conn.* = connection_h1.ConnectionH1.init(self.allocator, origin, self.buildConnectionOptions());
+
+        const state = self.allocator.create(RequestState) catch {
+            conn.deinit();
+            self.allocator.destroy(conn);
+            return error.OutOfMemory;
+        };
+        state.* = RequestState.init(self.allocator, conn);
+
+        var cleanup = true;
+        errdefer if (cleanup) {
+            conn.deinit();
+            self.allocator.destroy(conn);
+            self.allocator.destroy(state);
+        };
+
+        conn.start() catch return error.OutOfMemory;
+        conn.submit(request_value, state.future.completion()) catch |err| return mapSubmitError(err);
+        cleanup = false;
+
+        return .{ .state = state };
+    }
+
     /// Releases resources owned by the client.
     pub fn deinit(self: *Client) void {
         _ = self;
+    }
+
+    /// Internal state for an in-flight request.
+    const RequestState = struct {
+        /// Allocator for request state and owned allocations.
+        allocator: std.mem.Allocator,
+        /// Connection used for this request, or null after ownership transfer.
+        connection: ?*connection_h1.ConnectionH1,
+        /// Future holding the response result.
+        future: ResponseFuture,
+        /// Indicates the response has been finalized.
+        completed: bool,
+
+        /// Initializes a request state with the provided connection.
+        fn init(
+            allocator: std.mem.Allocator,
+            connection: *connection_h1.ConnectionH1,
+        ) RequestState {
+            return .{
+                .allocator = allocator,
+                .connection = connection,
+                .future = ResponseFuture.init(),
+                .completed = false,
+            };
+        }
+
+        /// Waits for completion and attaches response cleanup hooks.
+        fn wait(self: *RequestState) ResponseFuture.WaitError!types.Response {
+            const response = self.future.wait() catch |err| {
+                self.shutdownConnection();
+                return err;
+            };
+            return self.finalizeResponse(response);
+        }
+
+        /// Waits up to the timeout and attaches response cleanup hooks.
+        fn timedWait(self: *RequestState, timeout_ns: u64) ResponseFuture.WaitError!types.Response {
+            const response = self.future.timedWait(timeout_ns) catch |err| switch (err) {
+                error.Timeout => return error.Timeout,
+                else => {
+                    self.shutdownConnection();
+                    return err;
+                },
+            };
+            return self.finalizeResponse(response);
+        }
+
+        /// Cancels the future and closes the connection.
+        fn cancel(self: *RequestState) bool {
+            const canceled = self.future.cancel();
+            self.shutdownConnection();
+            return canceled;
+        }
+
+        /// Releases request resources.
+        fn deinit(self: *RequestState) void {
+            if (!self.completed) {
+                _ = self.future.cancel();
+            }
+            self.shutdownConnection();
+            self.allocator.destroy(self);
+        }
+
+        /// Finalizes the response and wires body cleanup if needed.
+        fn finalizeResponse(self: *RequestState, response_value: types.Response) ResponseFuture.WaitError!types.Response {
+            var response = response_value;
+            if (response.body) |body_reader| {
+                const connection = self.connection orelse {
+                    body_reader.close();
+                    response.deinit();
+                    return error.Canceled;
+                };
+                const ctx = self.allocator.create(ResponseBody) catch {
+                    body_reader.close();
+                    response.deinit();
+                    self.shutdownConnection();
+                    return error.OutOfMemory;
+                };
+                ctx.* = .{
+                    .allocator = self.allocator,
+                    .connection = connection,
+                    .inner = body_reader,
+                    .closed = false,
+                };
+
+                response.body = .{
+                    .ctx = ctx,
+                    .read_fn = ResponseBody.read,
+                    .close_fn = ResponseBody.close,
+                };
+                self.connection = null;
+            } else {
+                self.shutdownConnection();
+            }
+
+            self.completed = true;
+            return response;
+        }
+
+        /// Closes and frees the underlying connection, if present.
+        fn shutdownConnection(self: *RequestState) void {
+            if (self.connection) |connection| {
+                connection.deinit();
+                self.allocator.destroy(connection);
+                self.connection = null;
+            }
+        }
+    };
+
+    /// Response body wrapper that cleans up the connection on close.
+    const ResponseBody = struct {
+        /// Allocator used for wrapper cleanup.
+        allocator: std.mem.Allocator,
+        /// Connection to release when the body is closed.
+        connection: *connection_h1.ConnectionH1,
+        /// Inner body reader provided by the connection.
+        inner: types.BodyReader,
+        /// Indicates whether the wrapper has been closed.
+        closed: bool,
+
+        /// Reads bytes from the inner body reader.
+        fn read(ctx: ?*anyopaque, dest: []u8) anyerror!usize {
+            const self: *ResponseBody = @ptrCast(@alignCast(ctx.?));
+            return self.inner.read(dest);
+        }
+
+        /// Closes the body reader and releases connection resources.
+        fn close(ctx: ?*anyopaque) void {
+            const self: *ResponseBody = @ptrCast(@alignCast(ctx.?));
+            if (self.closed) {
+                return;
+            }
+            self.closed = true;
+            self.inner.close();
+            self.connection.deinit();
+            self.allocator.destroy(self.connection);
+            self.allocator.destroy(self);
+        }
+    };
+
+    /// Builds a connection origin from the request URI.
+    fn buildOrigin(self: *Client, request_value: *const types.Request) Error!connection_h1.ConnectionH1.Origin {
+        _ = self;
+        if (request_value.uri.scheme != .http) {
+            return error.InvalidUri;
+        }
+        if (request_value.uri.host.len == 0) {
+            return error.InvalidUri;
+        }
+        const port = request_value.uri.effectivePort();
+        return .{
+            .scheme = request_value.uri.scheme,
+            .host = request_value.uri.host,
+            .port = port,
+        };
+    }
+
+    /// Maps client options into connection options.
+    fn buildConnectionOptions(self: *Client) connection_h1.ConnectionH1.Options {
+        var options = connection_h1.ConnectionH1.Options.default();
+        options.connect_timeout_ns = if (self.options.timeouts.connect) |timeout|
+            timeout.toNanos()
+        else
+            null;
+        options.write_timeout_ns = if (self.options.timeouts.write) |timeout|
+            timeout.toNanos()
+        else
+            null;
+        options.read_timeout_ns = if (self.options.timeouts.read) |timeout|
+            timeout.toNanos()
+        else
+            null;
+        options.request_timeout_ns = if (self.options.timeouts.request) |timeout|
+            timeout.toNanos()
+        else
+            null;
+        options.max_header_bytes = self.options.limits.max_header_bytes.toInt();
+        options.max_header_count = self.options.limits.max_header_count.toInt();
+        options.max_status_line_bytes = self.options.limits.max_response_line_bytes.toInt();
+        return options;
+    }
+
+    /// Maps connection submit errors into client errors.
+    fn mapSubmitError(err: connection_h1.ConnectionH1.SubmitError) Error {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Closed,
+            error.NotStarted,
+            => error.Transport,
+        };
     }
 };
 
@@ -343,4 +595,52 @@ test "client option defaults" {
 
     try std.testing.expect(options.cookie_jar == null);
     try std.testing.expectEqual(Client.TlsVerifyMode.verify, options.tls.verify);
+}
+
+test "client request executes against local server" {
+    const test_server = @import("http1/test_server.zig");
+
+    const scenarios = [_]test_server.Scenario{
+        .{
+            .steps = &.{
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .ok,
+                            .reason = "OK",
+                            .body = "hello",
+                        },
+                    },
+                },
+            },
+        },
+    };
+
+    var server = try test_server.TestServer.init(&scenarios, test_server.Options.default());
+    defer server.deinit();
+    try server.start();
+
+    var client = Client.init(std.testing.allocator, Client.Options.default());
+    defer client.deinit();
+
+    const uri = types.Uri.init(.http, "127.0.0.1", types.Port.init(server.port()), "/", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "127.0.0.1");
+
+    var handle = try client.request(&request);
+    defer handle.deinit();
+
+    var response = try handle.wait();
+    defer response.deinit();
+    defer if (response.body) |body| body.close();
+
+    try std.testing.expectEqual(types.Status.ok, response.status);
+
+    var buffer: [8]u8 = undefined;
+    const read_len = try response.body.?.read(&buffer);
+    try std.testing.expectEqual(@as(usize, 5), read_len);
+    try std.testing.expectEqualStrings("hello", buffer[0..read_len]);
+    const eof = try response.body.?.read(&buffer);
+    try std.testing.expectEqual(@as(usize, 0), eof);
 }
