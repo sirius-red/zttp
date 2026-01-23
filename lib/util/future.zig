@@ -156,7 +156,7 @@ test "request future completes" {
 test "request future cancellation" {
     const Future = RequestFuture(u8, error{Failure});
     var future = Future.init();
-    const completion = future.completion();
+    var completion = future.completion();
 
     _ = completion.cancel();
     try std.testing.expectError(error.Canceled, future.wait());
