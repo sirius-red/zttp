@@ -13,7 +13,7 @@ const response_parser = @import("response_parser.zig");
 pub const ConnectionH1 = struct {
     /// Allocator used for per-request allocations.
     allocator: std.mem.Allocator,
-    /// Origin this connection is bound to.
+    /// Connection target and request target mode.
     origin: Origin,
     /// Runtime configuration options.
     options: Options,
@@ -45,14 +45,16 @@ pub const ConnectionH1 = struct {
     /// Future type for HTTP/1.1 responses.
     pub const ResponseFuture = future.RequestFuture(types.Response, Error);
 
-    /// Connection origin information.
+    /// Connection target information.
     pub const Origin = struct {
-        /// Scheme associated with the origin.
+        /// Scheme used for the TCP connection.
         scheme: types.Scheme,
-        /// Hostname or IP literal for the origin.
+        /// Hostname or IP literal to connect to.
         host: []const u8,
-        /// Port for the origin.
+        /// Port to connect to.
         port: types.Port,
+        /// Request target mode used for this connection.
+        target_mode: request_encoder.RequestTargetMode,
     };
 
     /// Connection configuration options.
@@ -327,20 +329,32 @@ pub const ConnectionH1 = struct {
 
     /// Validates the request against the connection origin.
     fn validateRequest(self: *ConnectionH1, request: *const types.Request) Error!void {
-        if (request.uri.scheme != self.origin.scheme) {
-            return error.InvalidUri;
-        }
-        if (request.uri.scheme != .http) {
-            return error.InvalidUri;
-        }
-        if (request.uri.host.len == 0) {
-            return error.InvalidUri;
-        }
-        if (!std.ascii.eqlIgnoreCase(request.uri.host, self.origin.host)) {
-            return error.InvalidUri;
-        }
-        if (request.uri.effectivePort().toInt() != self.origin.port.toInt()) {
-            return error.InvalidUri;
+        switch (self.origin.target_mode) {
+            .origin_form => {
+                if (request.uri.scheme != self.origin.scheme) {
+                    return error.InvalidUri;
+                }
+                if (request.uri.scheme != .http) {
+                    return error.InvalidUri;
+                }
+                if (request.uri.host.len == 0) {
+                    return error.InvalidUri;
+                }
+                if (!std.ascii.eqlIgnoreCase(request.uri.host, self.origin.host)) {
+                    return error.InvalidUri;
+                }
+                if (request.uri.effectivePort().toInt() != self.origin.port.toInt()) {
+                    return error.InvalidUri;
+                }
+            },
+            .absolute_form => {
+                if (request.uri.scheme != .http) {
+                    return error.InvalidUri;
+                }
+                if (request.uri.host.len == 0) {
+                    return error.InvalidUri;
+                }
+            },
         }
     }
 
@@ -380,7 +394,7 @@ pub const ConnectionH1 = struct {
         var writer = StreamWriter.init(&stream);
         var encoder = request_encoder.RequestEncoder(StreamWriter).init(&writer);
 
-        var body_writer = encoder.writeRequest(request) catch |err| return mapEncoderError(err);
+        var body_writer = encoder.writeRequest(request, self.origin.target_mode) catch |err| return mapEncoderError(err);
 
         if (request.body) |body_reader| {
             defer body_reader.close();
@@ -652,6 +666,7 @@ test "connection executes a request and streams the response body" {
             .scheme = .http,
             .host = "127.0.0.1",
             .port = types.Port.init(server.port()),
+            .target_mode = .origin_form,
         },
         ConnectionH1.Options.default(),
     );

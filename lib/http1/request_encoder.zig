@@ -3,6 +3,14 @@
 const std = @import("std");
 const types = @import("../types.zig");
 
+/// Request target format used for the request line.
+pub const RequestTargetMode = enum {
+    /// Origin-form request target (path + optional query).
+    origin_form,
+    /// Absolute-form request target (scheme + authority + path).
+    absolute_form,
+};
+
 /// Creates an HTTP/1.1 request encoder for the provided writer type.
 pub fn RequestEncoder(comptime WriterType: type) type {
     return struct {
@@ -101,14 +109,18 @@ pub fn RequestEncoder(comptime WriterType: type) type {
         };
 
         /// Encodes the request line and headers, returning a body writer.
-        pub fn writeRequest(self: *Self, request: *const types.Request) Error!BodyWriter {
+        pub fn writeRequest(
+            self: *Self,
+            request: *const types.Request,
+            target_mode: RequestTargetMode,
+        ) Error!BodyWriter {
             try validateMethod(request.method);
             try validateVersion(request.version);
-            try validateRequestTarget(request.uri);
+            try validateRequestTarget(request.uri, target_mode);
 
             try self.writer.writeAll(request.method.asBytes());
             try self.writer.writeByte(' ');
-            try writeRequestTarget(self.writer, request.uri);
+            try writeRequestTarget(self.writer, request.uri, target_mode);
             try self.writer.writeByte(' ');
             try self.writer.writeAll(request.version.asBytes());
             try self.writer.writeAll("\r\n");
@@ -204,8 +216,37 @@ pub fn RequestEncoder(comptime WriterType: type) type {
             };
         }
 
-        /// Writes the request target using origin-form.
-        fn writeRequestTarget(writer: *WriterType, uri: types.Uri) Error!void {
+        /// Writes the request target using the selected mode.
+        fn writeRequestTarget(
+            writer: *WriterType,
+            uri: types.Uri,
+            target_mode: RequestTargetMode,
+        ) Error!void {
+            switch (target_mode) {
+                .origin_form => try writeOriginTarget(writer, uri),
+                .absolute_form => try writeAbsoluteTarget(writer, uri),
+            }
+        }
+
+        /// Writes an origin-form request target.
+        fn writeOriginTarget(writer: *WriterType, uri: types.Uri) Error!void {
+            try writer.writeAll(uri.path);
+            if (uri.query) |query| {
+                try writer.writeByte('?');
+                try writer.writeAll(query);
+            }
+        }
+
+        /// Writes an absolute-form request target.
+        fn writeAbsoluteTarget(writer: *WriterType, uri: types.Uri) Error!void {
+            try writer.writeAll(uri.scheme.asBytes());
+            try writer.writeAll("://");
+            try writer.writeAll(uri.host);
+            if (uri.port) |port| {
+                var port_buffer: [8]u8 = undefined;
+                const port_bytes = try std.fmt.bufPrint(&port_buffer, ":{d}", .{port.toInt()});
+                try writer.writeAll(port_bytes);
+            }
             try writer.writeAll(uri.path);
             if (uri.query) |query| {
                 try writer.writeByte('?');
@@ -285,10 +326,36 @@ pub fn RequestEncoder(comptime WriterType: type) type {
         }
 
         /// Validates the request target for invalid bytes.
-        fn validateRequestTarget(uri: types.Uri) Error!void {
+        fn validateRequestTarget(uri: types.Uri, target_mode: RequestTargetMode) Error!void {
+            switch (target_mode) {
+                .origin_form => try validateOriginTarget(uri),
+                .absolute_form => try validateAbsoluteTarget(uri),
+            }
+        }
+
+        /// Validates an origin-form request target.
+        fn validateOriginTarget(uri: types.Uri) Error!void {
             if (uri.path.len == 0 or uri.path[0] != '/') {
                 return error.InvalidRequestTarget;
             }
+            try validateTargetBytes(uri.path);
+            if (uri.query) |query| {
+                try validateTargetBytes(query);
+            }
+        }
+
+        /// Validates an absolute-form request target.
+        fn validateAbsoluteTarget(uri: types.Uri) Error!void {
+            if (uri.scheme != .http and uri.scheme != .https) {
+                return error.InvalidRequestTarget;
+            }
+            if (uri.host.len == 0) {
+                return error.InvalidRequestTarget;
+            }
+            if (uri.path.len == 0 or uri.path[0] != '/') {
+                return error.InvalidRequestTarget;
+            }
+            try validateAuthorityBytes(uri.host);
             try validateTargetBytes(uri.path);
             if (uri.query) |query| {
                 try validateTargetBytes(query);
@@ -326,6 +393,18 @@ pub fn RequestEncoder(comptime WriterType: type) type {
         fn validateTargetBytes(bytes: []const u8) Error!void {
             for (bytes) |byte| {
                 if (byte <= 0x20 or byte == 0x7f) {
+                    return error.InvalidRequestTarget;
+                }
+            }
+        }
+
+        /// Validates authority bytes for invalid delimiter characters.
+        fn validateAuthorityBytes(bytes: []const u8) Error!void {
+            for (bytes) |byte| {
+                if (byte <= 0x20 or byte == 0x7f) {
+                    return error.InvalidRequestTarget;
+                }
+                if (byte == '/' or byte == '?' or byte == '#' or byte == '@') {
                     return error.InvalidRequestTarget;
                 }
             }
@@ -372,7 +451,7 @@ test "request encoder writes content-length body" {
 
     var writer = list.writer(std.testing.allocator);
     var encoder = RequestEncoder(@TypeOf(writer)).init(&writer);
-    var body = try encoder.writeRequest(&request);
+    var body = try encoder.writeRequest(&request, .origin_form);
     try body.writeAll("hello");
     try body.flush();
 
@@ -382,6 +461,27 @@ test "request encoder writes content-length body" {
         "content-length: 5\r\n" ++
         "\r\n" ++
         "hello";
+    try std.testing.expectEqualStrings(expected, list.items);
+}
+
+test "request encoder writes absolute-form request target" {
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(std.testing.allocator);
+
+    const uri = types.Uri.init(.http, "example.com", types.Port.init(8080), "/proxy", "x=1", null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+
+    try request.headers.append("Host", "example.com");
+
+    var writer = list.writer(std.testing.allocator);
+    var encoder = RequestEncoder(@TypeOf(writer)).init(&writer);
+    _ = try encoder.writeRequest(&request, .absolute_form);
+
+    const expected =
+        "GET http://example.com:8080/proxy?x=1 HTTP/1.1\r\n" ++
+        "host: example.com\r\n" ++
+        "\r\n";
     try std.testing.expectEqualStrings(expected, list.items);
 }
 
@@ -398,7 +498,7 @@ test "request encoder writes chunked body" {
 
     var writer = list.writer(std.testing.allocator);
     var encoder = RequestEncoder(@TypeOf(writer)).init(&writer);
-    var body = try encoder.writeRequest(&request);
+    var body = try encoder.writeRequest(&request, .origin_form);
     try body.writeAll("hi");
     try body.flush();
 
@@ -423,7 +523,7 @@ test "request encoder rejects invalid header name" {
 
     var writer = list.writer(std.testing.allocator);
     var encoder = RequestEncoder(@TypeOf(writer)).init(&writer);
-    try std.testing.expectError(error.InvalidHeaderName, encoder.writeRequest(&request));
+    try std.testing.expectError(error.InvalidHeaderName, encoder.writeRequest(&request, .origin_form));
 }
 
 test "request encoder rejects invalid header value" {
@@ -439,7 +539,7 @@ test "request encoder rejects invalid header value" {
 
     var writer = list.writer(std.testing.allocator);
     var encoder = RequestEncoder(@TypeOf(writer)).init(&writer);
-    try std.testing.expectError(error.InvalidHeaderValue, encoder.writeRequest(&request));
+    try std.testing.expectError(error.InvalidHeaderValue, encoder.writeRequest(&request, .origin_form));
 }
 
 test "request encoder rejects unsupported transfer encoding" {
@@ -454,7 +554,7 @@ test "request encoder rejects unsupported transfer encoding" {
 
     var writer = list.writer(std.testing.allocator);
     var encoder = RequestEncoder(@TypeOf(writer)).init(&writer);
-    try std.testing.expectError(error.UnsupportedTransferEncoding, encoder.writeRequest(&request));
+    try std.testing.expectError(error.UnsupportedTransferEncoding, encoder.writeRequest(&request, .origin_form));
 }
 
 test "request encoder enforces content length" {
@@ -469,7 +569,7 @@ test "request encoder enforces content length" {
 
     var writer = list.writer(std.testing.allocator);
     var encoder = RequestEncoder(@TypeOf(writer)).init(&writer);
-    var body = try encoder.writeRequest(&request);
+    var body = try encoder.writeRequest(&request, .origin_form);
     try std.testing.expectError(error.BodyTooLarge, body.writeAll("abc"));
 }
 
@@ -490,7 +590,7 @@ test "request encoder rejects missing content length for body" {
 
     var writer = list.writer(std.testing.allocator);
     var encoder = RequestEncoder(@TypeOf(writer)).init(&writer);
-    try std.testing.expectError(error.MissingContentLength, encoder.writeRequest(&request));
+    try std.testing.expectError(error.MissingContentLength, encoder.writeRequest(&request, .origin_form));
 }
 
 /// Returns end-of-stream without producing data.

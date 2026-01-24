@@ -5,6 +5,7 @@ const types = @import("types.zig");
 const mailbox = @import("util/mailbox.zig");
 const future = @import("util/future.zig");
 const connection_h1 = @import("http1/connection_h1.zig");
+const request_encoder = @import("http1/request_encoder.zig");
 const redirects = @import("redirects/redirects.zig");
 const cookies = @import("cookies/cookie_jar.zig");
 const proxy_env = @import("proxy/proxy_env.zig");
@@ -263,6 +264,20 @@ pub const Client = struct {
         manual,
     };
 
+    /// Basic proxy authentication credentials.
+    pub const ProxyBasicAuth = struct {
+        /// Username for proxy authentication.
+        username: []const u8,
+        /// Password for proxy authentication.
+        password: []const u8,
+    };
+
+    /// Proxy authentication configuration.
+    pub const ProxyAuth = union(enum) {
+        /// Basic authentication credentials.
+        basic: ProxyBasicAuth,
+    };
+
     /// Manual proxy endpoint configuration.
     pub const Proxy = struct {
         /// Proxy scheme.
@@ -271,6 +286,8 @@ pub const Client = struct {
         host: []const u8,
         /// Proxy port.
         port: types.Port,
+        /// Optional proxy authentication settings.
+        auth: ?ProxyAuth,
     };
 
     /// Proxy configuration.
@@ -438,16 +455,18 @@ pub const Client = struct {
             std.hash_map.default_max_load_percentage,
         );
 
-        /// Origin key used for pooling decisions.
+        /// Connection target key used for pooling decisions.
         const OriginKey = struct {
-            /// Scheme for the origin.
+            /// Scheme used for the TCP connection.
             scheme: types.Scheme,
-            /// Hostname for the origin.
+            /// Hostname or IP literal to connect to.
             host: []const u8,
-            /// Port for the origin.
+            /// Port to connect to.
             port: types.Port,
             /// TLS configuration identity.
             tls_id: TlsConfigId,
+            /// Request target mode for the connection.
+            target_mode: request_encoder.RequestTargetMode,
         };
 
         /// Hashing context for origin keys.
@@ -464,6 +483,9 @@ pub const Client = struct {
                 const tls_bytes = std.mem.toBytes(key.tls_id.toInt());
                 hasher.update(&tls_bytes);
 
+                const mode_byte: u8 = @intFromEnum(key.target_mode);
+                hasher.update(&[_]u8{mode_byte});
+
                 for (key.host) |byte| {
                     const lower = std.ascii.toLower(byte);
                     hasher.update(&[_]u8{lower});
@@ -477,6 +499,7 @@ pub const Client = struct {
                 return a.scheme == b.scheme and
                     a.port.toInt() == b.port.toInt() and
                     a.tls_id.toInt() == b.tls_id.toInt() and
+                    a.target_mode == b.target_mode and
                     std.ascii.eqlIgnoreCase(a.host, b.host);
             }
         };
@@ -673,6 +696,7 @@ pub const Client = struct {
                     .scheme = origin.scheme,
                     .host = origin.host,
                     .port = origin.port,
+                    .target_mode = origin.target_mode,
                 },
                 options,
             );
@@ -733,6 +757,7 @@ pub const Client = struct {
                 .host = host_copy,
                 .port = key.port,
                 .tls_id = key.tls_id,
+                .target_mode = key.target_mode,
             };
         }
 
@@ -784,16 +809,24 @@ pub const Client = struct {
         request_options: RequestOptions,
     ) Error!RequestHandle {
         try self.validateOptions();
-        if (request_options.proxy) |config| {
-            try self.validateProxyConfig(config);
-        }
-        const prepared = try self.prepareRequest(request_value);
+        const proxy_config = request_options.proxy orelse self.options.proxy;
+        try self.validateProxyConfig(proxy_config);
+
+        var proxy_endpoint = try self.resolveProxyConfig(request_value.uri, proxy_config);
+        errdefer if (proxy_endpoint) |*proxy_value| proxy_value.deinit();
+        const proxy_enabled = proxy_endpoint != null;
+
+        const prepared = try self.prepareRequest(request_value, proxy_config, proxy_enabled);
         var cleanup_prepared = true;
         errdefer if (cleanup_prepared) self.cleanupPreparedRequest(prepared);
 
-        const origin = try self.buildOriginKey(prepared.request);
+        const origin = try self.buildOriginKey(prepared.request, proxy_endpoint);
         const connection_options = self.buildConnectionOptions();
         var lease = try self.pool.checkout(origin, connection_options);
+        if (proxy_endpoint) |*proxy_value| {
+            proxy_value.deinit();
+        }
+        proxy_endpoint = null;
 
         var cleanup = true;
         errdefer if (cleanup) self.pool.discard(lease);
@@ -821,20 +854,42 @@ pub const Client = struct {
         return .{ .state = state };
     }
 
-    /// Prepares a request for submission, applying cookie headers when needed.
-    fn prepareRequest(self: *Client, request_value: *const types.Request) Error!PreparedRequest {
-        const jar = self.options.cookie_jar orelse {
-            return .{ .request = request_value, .owned = null };
-        };
+    /// Prepares a request for submission, applying cookies and proxy auth when needed.
+    fn prepareRequest(
+        self: *Client,
+        request_value: *const types.Request,
+        proxy_config: ProxyConfig,
+        proxy_enabled: bool,
+    ) Error!PreparedRequest {
+        var cookie_header: ?[]u8 = null;
+        if (self.options.cookie_jar) |jar| {
+            const now = cookies.CookieJar.Timestamp.now();
+            cookie_header = try jar.buildCookieHeader(self.allocator, request_value.uri, now);
+        }
+        defer if (cookie_header) |value| self.allocator.free(value);
 
-        const now = cookies.CookieJar.Timestamp.now();
-        const header_value = try jar.buildCookieHeader(self.allocator, request_value.uri, now);
-        if (header_value == null) {
+        const needs_proxy_header = proxy_enabled and
+            proxy_config.mode == .manual and
+            proxy_config.manual != null and
+            proxy_config.manual.?.auth != null and
+            request_value.headers.get("Proxy-Authorization") == null;
+
+        var proxy_header: ?[]u8 = null;
+        if (needs_proxy_header) {
+            proxy_header = try buildProxyAuthorizationHeader(self.allocator, proxy_config.manual.?.auth.?);
+        }
+        defer if (proxy_header) |value| self.allocator.free(value);
+
+        if (cookie_header == null and proxy_header == null) {
             return .{ .request = request_value, .owned = null };
         }
-        defer self.allocator.free(header_value.?);
 
-        const owned = try buildRequestWithCookies(self.allocator, request_value, header_value.?);
+        const owned = try buildRequestWithExtras(
+            self.allocator,
+            request_value,
+            if (cookie_header) |value| value else null,
+            if (proxy_header) |value| value else null,
+        );
         return .{ .request = owned, .owned = owned };
     }
 
@@ -1036,11 +1091,22 @@ pub const Client = struct {
                     same_origin,
                 );
                 owned_request = try self.applyCookiesToOwnedRequest(owned_request.?);
-                self.submitRedirectRequest(owned_request.?) catch |err| {
+                const proxy_config = self.request_options.proxy orelse self.client.options.proxy;
+                var proxy_endpoint = try self.client.resolveProxyConfig(current_uri, proxy_config);
+                errdefer if (proxy_endpoint) |*proxy_value| proxy_value.deinit();
+
+                owned_request = try self.applyProxyAuthToOwnedRequest(
+                    owned_request.?,
+                    proxy_config,
+                    proxy_endpoint != null,
+                );
+
+                self.submitRedirectRequest(owned_request.?, proxy_endpoint) catch |err| {
                     self.cleanupOwnedRequest(owned_request);
                     owned_request = null;
                     return err;
                 };
+                proxy_endpoint = null;
             }
         }
 
@@ -1179,6 +1245,37 @@ pub const Client = struct {
             return updated;
         }
 
+        /// Applies proxy authorization to an owned request when configured.
+        fn applyProxyAuthToOwnedRequest(
+            self: *RequestState,
+            request_value: *types.Request,
+            proxy_config: ProxyConfig,
+            proxy_enabled: bool,
+        ) ResponseFuture.WaitError!*types.Request {
+            if (!proxy_enabled) {
+                return request_value;
+            }
+            if (proxy_config.mode != .manual) {
+                return request_value;
+            }
+            const manual = proxy_config.manual orelse return error.InvalidConfig;
+            const auth = manual.auth orelse return request_value;
+            if (request_value.headers.get("Proxy-Authorization") != null) {
+                return request_value;
+            }
+
+            const header_value = self.client.buildProxyAuthorizationHeader(self.allocator, auth) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidConfig,
+            };
+            defer self.allocator.free(header_value);
+
+            request_value.headers.append("Proxy-Authorization", header_value) catch {
+                return error.OutOfMemory;
+            };
+            return request_value;
+        }
+
         /// Cleans up a redirect response before following the next hop.
         fn abandonRedirectResponse(self: *RequestState, response: *types.Response) void {
             if (response.body) |body_reader| {
@@ -1234,8 +1331,15 @@ pub const Client = struct {
         }
 
         /// Submits a follow-up request for a redirect hop.
-        fn submitRedirectRequest(self: *RequestState, request_value: *const types.Request) Error!void {
-            const origin = try self.client.buildOriginKey(request_value);
+        fn submitRedirectRequest(
+            self: *RequestState,
+            request_value: *const types.Request,
+            proxy_endpoint: ?proxy_env.ProxyEndpoint,
+        ) Error!void {
+            var proxy_value = proxy_endpoint;
+            defer if (proxy_value) |*value| value.deinit();
+
+            const origin = try self.client.buildOriginKey(request_value, proxy_value);
             const connection_options = self.client.buildConnectionOptions();
             var lease = try self.pool.checkout(origin, connection_options);
 
@@ -1335,20 +1439,39 @@ pub const Client = struct {
     };
 
 
-    /// Builds a pool origin key from the request URI.
-    fn buildOriginKey(self: *Client, request_value: *const types.Request) Error!ConnectionPool.OriginKey {
+    /// Builds a pool origin key from the request URI and optional proxy endpoint.
+    fn buildOriginKey(
+        self: *Client,
+        request_value: *const types.Request,
+        proxy_endpoint: ?proxy_env.ProxyEndpoint,
+    ) Error!ConnectionPool.OriginKey {
         if (request_value.uri.scheme != .http) {
             return error.InvalidUri;
         }
         if (request_value.uri.host.len == 0) {
             return error.InvalidUri;
         }
+
+        if (proxy_endpoint) |proxy_value| {
+            if (proxy_value.scheme != .http) {
+                return error.InvalidConfig;
+            }
+            return .{
+                .scheme = proxy_value.scheme,
+                .host = proxy_value.host,
+                .port = proxy_value.port,
+                .tls_id = self.options.tls.identity(),
+                .target_mode = .absolute_form,
+            };
+        }
+
         const port = request_value.uri.effectivePort();
         return .{
             .scheme = request_value.uri.scheme,
             .host = request_value.uri.host,
             .port = port,
             .tls_id = self.options.tls.identity(),
+            .target_mode = .origin_form,
         };
     }
 
@@ -1368,7 +1491,7 @@ pub const Client = struct {
         uri: types.Uri,
         config: ProxyConfig,
     ) Error!?proxy_env.ProxyEndpoint {
-        return switch (config.mode) {
+        const resolved = switch (config.mode) {
             .direct => null,
             .manual => blk: {
                 const manual = config.manual orelse return error.InvalidConfig;
@@ -1391,6 +1514,13 @@ pub const Client = struct {
                 break :blk resolved;
             },
         };
+        if (resolved) |*proxy_value| {
+            if (proxy_value.scheme != .http) {
+                proxy_value.deinit();
+                return error.InvalidConfig;
+            }
+        }
+        return resolved;
     }
 
     /// Builds an owned proxy endpoint from manual configuration.
@@ -1401,6 +1531,9 @@ pub const Client = struct {
         if (manual.host.len == 0) {
             return error.InvalidConfig;
         }
+        if (manual.scheme != .http) {
+            return error.InvalidConfig;
+        }
         const host_copy = lowerCaseCopy(allocator, manual.host) catch {
             return error.OutOfMemory;
         };
@@ -1409,6 +1542,40 @@ pub const Client = struct {
             .scheme = manual.scheme,
             .host = host_copy,
             .port = manual.port,
+        };
+    }
+
+    /// Builds a Proxy-Authorization header value for the provided auth config.
+    fn buildProxyAuthorizationHeader(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        auth: ProxyAuth,
+    ) Error![]u8 {
+        _ = self;
+        return switch (auth) {
+            .basic => |basic| buildBasicProxyHeader(allocator, basic),
+        };
+    }
+
+    /// Builds a Basic proxy authentication header value.
+    fn buildBasicProxyHeader(
+        allocator: std.mem.Allocator,
+        basic: ProxyBasicAuth,
+    ) Error![]u8 {
+        const raw = std.fmt.allocPrint(allocator, "{s}:{s}", .{ basic.username, basic.password }) catch {
+            return error.OutOfMemory;
+        };
+        defer allocator.free(raw);
+
+        const encoded_len = std.base64.standard.Encoder.calcSize(raw.len);
+        const encoded = allocator.alloc(u8, encoded_len) catch {
+            return error.OutOfMemory;
+        };
+        defer allocator.free(encoded);
+
+        _ = std.base64.standard.Encoder.encode(encoded, raw);
+        return std.fmt.allocPrint(allocator, "Basic {s}", .{encoded}) catch {
+            return error.OutOfMemory;
         };
     }
 
@@ -1482,6 +1649,9 @@ pub const Client = struct {
         if (manual.host.len == 0) {
             return error.InvalidConfig;
         }
+        if (manual.scheme != .http) {
+            return error.InvalidConfig;
+        }
     }
 
     /// Maps connection submit errors into client errors.
@@ -1495,11 +1665,12 @@ pub const Client = struct {
     }
 };
 
-/// Builds a request copy with an updated Cookie header.
-fn buildRequestWithCookies(
+/// Builds a request copy with optional Cookie and Proxy-Authorization headers.
+fn buildRequestWithExtras(
     allocator: std.mem.Allocator,
     request_value: *const types.Request,
-    cookie_value: []const u8,
+    cookie_value: ?[]const u8,
+    proxy_auth_value: ?[]const u8,
 ) Client.Error!*types.Request {
     const request_copy = allocator.create(types.Request) catch {
         return error.OutOfMemory;
@@ -1514,6 +1685,7 @@ fn buildRequestWithCookies(
 
     var existing = std.ArrayListUnmanaged(u8){};
     defer existing.deinit(allocator);
+    var add_proxy_auth = proxy_auth_value != null;
 
     var iter = request_value.headers.iterator();
     while (iter.next()) |header| {
@@ -1524,27 +1696,48 @@ fn buildRequestWithCookies(
             try existing.appendSlice(allocator, header.value);
             continue;
         }
+        if (std.ascii.eqlIgnoreCase(header.name, "proxy-authorization")) {
+            add_proxy_auth = false;
+        }
         try request_copy.headers.append(header.name, header.value);
     }
 
-    var combined = std.ArrayListUnmanaged(u8){};
-    defer combined.deinit(allocator);
+    if (cookie_value) |value| {
+        var combined = std.ArrayListUnmanaged(u8){};
+        defer combined.deinit(allocator);
 
-    if (existing.items.len > 0) {
-        try combined.appendSlice(allocator, existing.items);
-    }
-    if (existing.items.len > 0 and cookie_value.len > 0) {
-        try combined.appendSlice(allocator, "; ");
-    }
-    if (cookie_value.len > 0) {
-        try combined.appendSlice(allocator, cookie_value);
+        if (existing.items.len > 0) {
+            try combined.appendSlice(allocator, existing.items);
+        }
+        if (existing.items.len > 0 and value.len > 0) {
+            try combined.appendSlice(allocator, "; ");
+        }
+        if (value.len > 0) {
+            try combined.appendSlice(allocator, value);
+        }
+
+        if (combined.items.len > 0) {
+            try request_copy.headers.append("Cookie", combined.items);
+        }
+    } else if (existing.items.len > 0) {
+        try request_copy.headers.append("Cookie", existing.items);
     }
 
-    if (combined.items.len > 0) {
-        try request_copy.headers.append("Cookie", combined.items);
+    if (add_proxy_auth) {
+        const auth_value = proxy_auth_value.?;
+        try request_copy.headers.append("Proxy-Authorization", auth_value);
     }
 
     return request_copy;
+}
+
+/// Builds a request copy with an updated Cookie header.
+fn buildRequestWithCookies(
+    allocator: std.mem.Allocator,
+    request_value: *const types.Request,
+    cookie_value: []const u8,
+) Client.Error!*types.Request {
+    return buildRequestWithExtras(allocator, request_value, cookie_value, null);
 }
 
 /// Returns true when a header should be omitted on redirect follow-ups.
@@ -1733,6 +1926,7 @@ test "request options override proxy selection" {
                 .scheme = .http,
                 .host = "proxy.local",
                 .port = types.Port.init(8080),
+                .auth = null,
             },
         },
     };
@@ -1754,6 +1948,7 @@ test "request options can disable manual proxy" {
             .scheme = .http,
             .host = "proxy.local",
             .port = types.Port.init(8080),
+            .auth = null,
         },
     };
 
@@ -1837,6 +2032,71 @@ test "client request executes against local server" {
     try std.testing.expectEqualStrings("hello", buffer[0..read_len]);
     const eof = try response.body.?.read(&buffer);
     try std.testing.expectEqual(@as(usize, 0), eof);
+}
+
+test "client sends absolute-form request through proxy" {
+    const test_server = @import("http1/test_server.zig");
+
+    const expected_request =
+        "GET http://example.com/resource HTTP/1.1\r\n" ++
+        "host: example.com\r\n" ++
+        "proxy-authorization: Basic dXNlcjpwYXNz";
+
+    const scenarios = [_]test_server.Scenario{
+        .{
+            .steps = &.{
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .ok,
+                            .reason = "OK",
+                            .body = "via-proxy",
+                        },
+                    },
+                    .expect_request_contains = expected_request,
+                },
+            },
+        },
+    };
+
+    var server = try test_server.TestServer.init(&scenarios, test_server.Options.default());
+    defer server.deinit();
+    try server.start();
+
+    var options = Client.Options.default();
+    options.proxy = .{
+        .mode = .manual,
+        .manual = .{
+            .scheme = .http,
+            .host = "127.0.0.1",
+            .port = types.Port.init(server.port()),
+            .auth = .{
+                .basic = .{
+                    .username = "user",
+                    .password = "pass",
+                },
+            },
+        },
+    };
+
+    var client = Client.init(std.testing.allocator, options);
+    defer client.deinit();
+
+    const uri = types.Uri.init(.http, "example.com", null, "/resource", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "example.com");
+
+    var handle = try client.request(&request);
+    defer handle.deinit();
+
+    var response = try handle.wait();
+    defer response.deinit();
+    defer if (response.body) |body| body.close();
+
+    var buffer: [16]u8 = undefined;
+    const read_len = try response.body.?.read(&buffer);
+    try std.testing.expectEqualStrings("via-proxy", buffer[0..read_len]);
 }
 
 test "client reuses keep-alive connection" {
