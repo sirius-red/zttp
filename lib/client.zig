@@ -7,6 +7,7 @@ const future = @import("util/future.zig");
 const connection_h1 = @import("http1/connection_h1.zig");
 const redirects = @import("redirects/redirects.zig");
 const cookies = @import("cookies/cookie_jar.zig");
+const proxy_env = @import("proxy/proxy_env.zig");
 
 /// Mailbox type for internal command queues.
 pub const Mailbox = mailbox.Mailbox;
@@ -363,6 +364,19 @@ pub const Client = struct {
                 .proxy = ProxyConfig.default(),
                 .cookie_jar = null,
                 .tls = TlsConfig.default(),
+            };
+        }
+    };
+
+    /// Per-request configuration overrides.
+    pub const RequestOptions = struct {
+        /// Proxy configuration override, or null to use client defaults.
+        proxy: ?ProxyConfig,
+
+        /// Returns default request options.
+        pub fn default() RequestOptions {
+            return .{
+                .proxy = null,
             };
         }
     };
@@ -749,8 +763,17 @@ pub const Client = struct {
     /// The request must remain valid until the returned handle completes.
     /// If the response includes a body, the caller must close it to release the connection.
     pub fn request(self: *Client, request_value: *const types.Request) Error!RequestHandle {
+        return self.requestWithOptions(request_value, RequestOptions.default());
+    }
+
+    /// Submits a request with per-request overrides.
+    pub fn requestWithOptions(
+        self: *Client,
+        request_value: *const types.Request,
+        request_options: RequestOptions,
+    ) Error!RequestHandle {
         const follow_redirects = self.options.redirect_policy.mode == .follow;
-        return self.requestInternal(request_value, follow_redirects);
+        return self.requestInternal(request_value, follow_redirects, request_options);
     }
 
     /// Submits a request with explicit redirect handling behavior.
@@ -758,8 +781,12 @@ pub const Client = struct {
         self: *Client,
         request_value: *const types.Request,
         follow_redirects: bool,
+        request_options: RequestOptions,
     ) Error!RequestHandle {
         try self.validateOptions();
+        if (request_options.proxy) |config| {
+            try self.validateProxyConfig(config);
+        }
         const prepared = try self.prepareRequest(request_value);
         var cleanup_prepared = true;
         errdefer if (cleanup_prepared) self.cleanupPreparedRequest(prepared);
@@ -781,6 +808,7 @@ pub const Client = struct {
             prepared.request,
             prepared.owned,
             follow_redirects,
+            request_options,
             lease,
         );
 
@@ -837,6 +865,8 @@ pub const Client = struct {
         owned_request: ?*types.Request,
         /// Indicates whether redirects should be followed.
         follow_redirects: bool,
+        /// Per-request override options.
+        request_options: RequestOptions,
         /// Timestamp used for overall timeout tracking.
         start_ns: i128,
         /// Cancellation token for the request.
@@ -857,6 +887,7 @@ pub const Client = struct {
             request_value: *const types.Request,
             owned_request: ?*types.Request,
             follow_redirects: bool,
+            request_options: RequestOptions,
             lease: ConnectionPool.Lease,
         ) RequestState {
             return .{
@@ -866,6 +897,7 @@ pub const Client = struct {
                 .request = request_value,
                 .owned_request = owned_request,
                 .follow_redirects = follow_redirects,
+                .request_options = request_options,
                 .start_ns = std.time.nanoTimestamp(),
                 .cancel_token = CancellationToken.init(),
                 .pool = &client.pool,
@@ -1320,6 +1352,94 @@ pub const Client = struct {
         };
     }
 
+    /// Resolves the proxy endpoint for a request URI.
+    fn resolveProxy(
+        self: *Client,
+        uri: types.Uri,
+        request_options: RequestOptions,
+    ) Error!?proxy_env.ProxyEndpoint {
+        const config = request_options.proxy orelse self.options.proxy;
+        return self.resolveProxyConfig(uri, config);
+    }
+
+    /// Resolves the proxy endpoint for a URI and proxy config.
+    fn resolveProxyConfig(
+        self: *Client,
+        uri: types.Uri,
+        config: ProxyConfig,
+    ) Error!?proxy_env.ProxyEndpoint {
+        return switch (config.mode) {
+            .direct => null,
+            .manual => blk: {
+                const manual = config.manual orelse return error.InvalidConfig;
+                break :blk try buildManualProxyEndpoint(self.allocator, manual);
+            },
+            .system => blk: {
+                var env = proxy_env.loadEnv(self.allocator) catch |err| {
+                    return mapEnvError(err);
+                };
+                defer env.deinit();
+                const resolved = proxy_env.selectProxyFromEnv(
+                    self.allocator,
+                    uri,
+                    env.http_proxy,
+                    env.https_proxy,
+                    env.no_proxy,
+                ) catch |err| {
+                    return mapResolveError(err);
+                };
+                break :blk resolved;
+            },
+        };
+    }
+
+    /// Builds an owned proxy endpoint from manual configuration.
+    fn buildManualProxyEndpoint(
+        allocator: std.mem.Allocator,
+        manual: Proxy,
+    ) Error!proxy_env.ProxyEndpoint {
+        if (manual.host.len == 0) {
+            return error.InvalidConfig;
+        }
+        const host_copy = lowerCaseCopy(allocator, manual.host) catch {
+            return error.OutOfMemory;
+        };
+        return .{
+            .allocator = allocator,
+            .scheme = manual.scheme,
+            .host = host_copy,
+            .port = manual.port,
+        };
+    }
+
+    /// Returns a lowercased copy of the provided host value.
+    fn lowerCaseCopy(allocator: std.mem.Allocator, value: []const u8) std.mem.Allocator.Error![]u8 {
+        const copy = try allocator.dupe(u8, value);
+        for (copy) |*byte| {
+            byte.* = std.ascii.toLower(byte.*);
+        }
+        return copy;
+    }
+
+    /// Maps environment resolution errors into client errors.
+    fn mapEnvError(err: proxy_env.EnvError) Error {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvalidConfig,
+        };
+    }
+
+    /// Maps proxy parsing errors into client errors.
+    fn mapResolveError(err: proxy_env.ResolveError) Error {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidProxy,
+            error.UnsupportedScheme,
+            error.InvalidNoProxyEntry,
+            => error.InvalidConfig,
+        };
+    }
+
     /// Maps client options into connection options.
     fn buildConnectionOptions(self: *Client) connection_h1.ConnectionH1.Options {
         var options = connection_h1.ConnectionH1.Options.default();
@@ -1348,6 +1468,18 @@ pub const Client = struct {
     /// Validates client options before issuing requests.
     fn validateOptions(self: *const Client) Error!void {
         if (self.options.pool.max_connections.toInt() == 0) {
+            return error.InvalidConfig;
+        }
+        try self.validateProxyConfig(self.options.proxy);
+    }
+
+    /// Validates proxy configuration values.
+    fn validateProxyConfig(_: *const Client, config: ProxyConfig) Error!void {
+        if (config.mode != .manual) {
+            return;
+        }
+        const manual = config.manual orelse return error.InvalidConfig;
+        if (manual.host.len == 0) {
             return error.InvalidConfig;
         }
     }
@@ -1581,6 +1713,67 @@ test "client option defaults" {
 
     try std.testing.expect(options.cookie_jar == null);
     try std.testing.expectEqual(Client.TlsVerifyMode.verify, options.tls.verify);
+}
+
+test "request options override proxy selection" {
+    var options = Client.Options.default();
+    options.proxy = .{
+        .mode = .direct,
+        .manual = null,
+    };
+
+    var client = Client.init(std.testing.allocator, options);
+    defer client.deinit();
+
+    const uri = types.Uri.init(.http, "example.com", types.Port.init(80), "/", null, null);
+    const request_options = Client.RequestOptions{
+        .proxy = .{
+            .mode = .manual,
+            .manual = .{
+                .scheme = .http,
+                .host = "proxy.local",
+                .port = types.Port.init(8080),
+            },
+        },
+    };
+
+    var resolved = try client.resolveProxy(uri, request_options);
+    defer if (resolved) |*value| value.deinit();
+
+    try std.testing.expect(resolved != null);
+    try std.testing.expectEqual(types.Scheme.http, resolved.?.scheme);
+    try std.testing.expectEqualStrings("proxy.local", resolved.?.host);
+    try std.testing.expectEqual(@as(u16, 8080), resolved.?.port.toInt());
+}
+
+test "request options can disable manual proxy" {
+    var options = Client.Options.default();
+    options.proxy = .{
+        .mode = .manual,
+        .manual = .{
+            .scheme = .http,
+            .host = "proxy.local",
+            .port = types.Port.init(8080),
+        },
+    };
+
+    var client = Client.init(std.testing.allocator, options);
+    defer client.deinit();
+
+    const uri = types.Uri.init(.http, "example.com", types.Port.init(80), "/", null, null);
+    const request_options = Client.RequestOptions{
+        .proxy = .{
+            .mode = .direct,
+            .manual = null,
+        },
+    };
+
+    const resolved = try client.resolveProxy(uri, request_options);
+    if (resolved) |*value| {
+        value.deinit();
+    }
+
+    try std.testing.expect(resolved == null);
 }
 
 test "client rejects zero max connections" {

@@ -33,4 +33,5 @@ test {
     _ = @import("http1/connection_h1.zig");
     _ = @import("cookies/cookie_jar.zig");
     _ = @import("redirects/redirects.zig");
+    _ = @import("proxy/proxy_env.zig");
 }
