@@ -23,6 +23,8 @@ pub const ConnectionH1 = struct {
     thread: ?std.Thread,
     /// Active TCP stream or null when disconnected.
     stream: ?std.net.Stream,
+    /// Indicates whether a CONNECT tunnel is established.
+    tunnel_established: bool,
 
     /// Error set returned by connection operations.
     pub const Error = error{
@@ -32,6 +34,8 @@ pub const ConnectionH1 = struct {
         InvalidUri,
         /// Transport failure (DNS/TCP).
         Transport,
+        /// Proxy CONNECT request failed.
+        ProxyConnectFailed,
         /// Protocol violation or malformed data.
         Protocol,
         /// Configured limit was exceeded.
@@ -55,6 +59,18 @@ pub const ConnectionH1 = struct {
         port: types.Port,
         /// Request target mode used for this connection.
         target_mode: request_encoder.RequestTargetMode,
+        /// Tunnel target to CONNECT through a proxy, if any.
+        tunnel: ?TunnelTarget,
+        /// Proxy-Authorization header value for CONNECT, if any.
+        proxy_authorization: ?[]const u8,
+    };
+
+    /// Target host and port for CONNECT tunnels.
+    pub const TunnelTarget = struct {
+        /// Hostname or IP literal for the tunnel target.
+        host: []const u8,
+        /// Port for the tunnel target.
+        port: types.Port,
     };
 
     /// Connection configuration options.
@@ -115,6 +131,7 @@ pub const ConnectionH1 = struct {
             .mailbox = Mailbox.init(allocator),
             .thread = null,
             .stream = null,
+            .tunnel_established = false,
         };
     }
 
@@ -329,6 +346,22 @@ pub const ConnectionH1 = struct {
 
     /// Validates the request against the connection origin.
     fn validateRequest(self: *ConnectionH1, request: *const types.Request) Error!void {
+        if (self.origin.tunnel) |tunnel| {
+            if (request.uri.scheme != .https) {
+                return error.InvalidUri;
+            }
+            if (request.uri.host.len == 0) {
+                return error.InvalidUri;
+            }
+            if (!std.ascii.eqlIgnoreCase(request.uri.host, tunnel.host)) {
+                return error.InvalidUri;
+            }
+            if (request.uri.effectivePort().toInt() != tunnel.port.toInt()) {
+                return error.InvalidUri;
+            }
+            return;
+        }
+
         switch (self.origin.target_mode) {
             .origin_form => {
                 if (request.uri.scheme != self.origin.scheme) {
@@ -361,6 +394,12 @@ pub const ConnectionH1 = struct {
     /// Ensures a TCP connection is established.
     fn ensureConnected(self: *ConnectionH1, request_start: i128) Error!void {
         if (self.stream != null) {
+            if (self.origin.tunnel != null and !self.tunnel_established) {
+                self.establishTunnel(request_start) catch |err| {
+                    self.closeStream();
+                    return err;
+                };
+            }
             return;
         }
 
@@ -384,6 +423,187 @@ pub const ConnectionH1 = struct {
         }
 
         self.stream = stream;
+        if (self.origin.tunnel != null) {
+            self.establishTunnel(request_start) catch |err| {
+                self.closeStream();
+                return err;
+            };
+        }
+    }
+
+    /// Establishes a CONNECT tunnel for HTTPS proxy requests.
+    fn establishTunnel(self: *ConnectionH1, request_start: i128) Error!void {
+        if (self.tunnel_established) {
+            return;
+        }
+
+        const target = self.origin.tunnel orelse return;
+        try self.checkRequestTimeout(request_start);
+        self.writeConnectRequest(target) catch |err| return mapConnectWriteError(err);
+        try self.checkRequestTimeout(request_start);
+
+        const status_code = self.readConnectResponse() catch |err| return mapConnectReadError(err);
+        if (status_code < 200 or status_code >= 300) {
+            return error.ProxyConnectFailed;
+        }
+
+        self.tunnel_established = true;
+    }
+
+    /// Writes the CONNECT request to the proxy stream.
+    fn writeConnectRequest(self: *ConnectionH1, target: TunnelTarget) StreamWriter.Error!void {
+        var stream = self.stream.?;
+        var writer = StreamWriter.init(&stream);
+
+        try writer.writeAll("CONNECT ");
+        try writer.writeAll(target.host);
+        try writer.writeAll(":");
+
+        var port_buffer: [8]u8 = undefined;
+        const port_bytes = std.fmt.bufPrint(&port_buffer, "{d}", .{target.port.toInt()}) catch unreachable;
+        try writer.writeAll(port_bytes);
+        try writer.writeAll(" HTTP/1.1\r\n");
+
+        try writer.writeAll("Host: ");
+        try writer.writeAll(target.host);
+        try writer.writeAll(":");
+        try writer.writeAll(port_bytes);
+        try writer.writeAll("\r\n");
+
+        if (self.origin.proxy_authorization) |value| {
+            try writer.writeAll("Proxy-Authorization: ");
+            try writer.writeAll(value);
+            try writer.writeAll("\r\n");
+        }
+
+        try writer.writeAll("\r\n");
+    }
+
+    /// Parses the CONNECT response status line and headers.
+    fn readConnectResponse(self: *ConnectionH1) ConnectResponseError!u16 {
+        var line_buffer = std.ArrayListUnmanaged(u8){};
+        defer line_buffer.deinit(self.allocator);
+
+        var stream = self.stream.?;
+        const limits = self.buildParserLimits();
+        const max_header_line = response_parser.Limits.default().max_header_line_bytes;
+
+        const status_line = try readConnectLine(self.allocator, &stream, &line_buffer, limits.max_status_line_bytes);
+        const status_code = try parseConnectStatusLine(status_line);
+
+        var header_bytes: usize = 0;
+        var header_count: usize = 0;
+        while (true) {
+            const header_line = try readConnectLine(self.allocator, &stream, &line_buffer, max_header_line);
+            if (header_line.len == 0) {
+                break;
+            }
+            header_bytes += header_line.len + 2;
+            if (header_bytes > limits.max_header_bytes) {
+                return error.HeaderTooLarge;
+            }
+            header_count += 1;
+            if (header_count > limits.max_header_count) {
+                return error.HeaderCountExceeded;
+            }
+        }
+
+        return status_code;
+    }
+
+    /// Error set returned while parsing CONNECT responses.
+    const ConnectResponseError = StreamReader.Error || std.mem.Allocator.Error || error{
+        UnexpectedEof,
+        InvalidLineEnding,
+        LineTooLong,
+        InvalidStatusLine,
+        InvalidStatusCode,
+        InvalidVersion,
+        HeaderTooLarge,
+        HeaderCountExceeded,
+    };
+
+    /// Reads a CRLF-terminated line from the stream.
+    fn readConnectLine(
+        allocator: std.mem.Allocator,
+        stream: *std.net.Stream,
+        buffer: *std.ArrayListUnmanaged(u8),
+        max_len: usize,
+    ) ConnectResponseError![]const u8 {
+        buffer.clearRetainingCapacity();
+        while (true) {
+            var byte_buf: [1]u8 = undefined;
+            const read_len = try stream.read(&byte_buf);
+            if (read_len == 0) {
+                return error.UnexpectedEof;
+            }
+            const byte = byte_buf[0];
+            if (byte == '\r') {
+                const lf_len = try stream.read(&byte_buf);
+                if (lf_len == 0) {
+                    return error.UnexpectedEof;
+                }
+                if (byte_buf[0] != '\n') {
+                    return error.InvalidLineEnding;
+                }
+                return buffer.items;
+            }
+            if (byte == '\n') {
+                return error.InvalidLineEnding;
+            }
+            if (buffer.items.len >= max_len) {
+                return error.LineTooLong;
+            }
+            try buffer.append(allocator, byte);
+        }
+    }
+
+    /// Parses the status line for a CONNECT response.
+    fn parseConnectStatusLine(line: []const u8) ConnectResponseError!u16 {
+        const first_space = std.mem.indexOfScalar(u8, line, ' ') orelse return error.InvalidStatusLine;
+        const version_bytes = line[0..first_space];
+        if (!std.mem.eql(u8, version_bytes, "HTTP/1.1") and !std.mem.eql(u8, version_bytes, "HTTP/1.0")) {
+            return error.InvalidVersion;
+        }
+
+        const rest = line[first_space + 1 ..];
+        if (rest.len < 3) {
+            return error.InvalidStatusCode;
+        }
+        const code_bytes = rest[0..3];
+        var value: u16 = 0;
+        for (code_bytes) |byte| {
+            if (byte < '0' or byte > '9') {
+                return error.InvalidStatusCode;
+            }
+            value = value * 10 + @as(u16, byte - '0');
+        }
+        return value;
+    }
+
+    /// Maps CONNECT read errors into connection errors.
+    fn mapConnectReadError(err: ConnectResponseError) Error {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.HeaderTooLarge,
+            error.HeaderCountExceeded,
+            error.LineTooLong,
+            => error.LimitExceeded,
+            error.ConnectionTimedOut,
+            error.WouldBlock,
+            => error.Timeout,
+            error.UnexpectedEof,
+            error.ConnectionResetByPeer,
+            => error.Transport,
+            else => error.Protocol,
+        };
+    }
+
+    /// Maps CONNECT write errors into connection errors.
+    fn mapConnectWriteError(err: StreamWriter.Error) Error {
+        return switch (err) {
+            else => error.Transport,
+        };
     }
 
     /// Writes the request to the socket.
@@ -518,6 +738,7 @@ pub const ConnectionH1 = struct {
             stream.close();
             self.stream = null;
         }
+        self.tunnel_established = false;
     }
 
     /// Maps allocator errors into connection errors.
@@ -667,6 +888,8 @@ test "connection executes a request and streams the response body" {
             .host = "127.0.0.1",
             .port = types.Port.init(server.port()),
             .target_mode = .origin_form,
+            .tunnel = null,
+            .proxy_authorization = null,
         },
         ConnectionH1.Options.default(),
     );

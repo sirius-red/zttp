@@ -30,6 +30,8 @@ pub const Client = struct {
         Timeout,
         /// Client configuration is invalid.
         InvalidConfig,
+        /// Proxy CONNECT request failed.
+        ProxyConnectFailed,
         /// Redirect limit was exceeded.
         RedirectLimitExceeded,
         /// Redirect loop was detected.
@@ -467,6 +469,10 @@ pub const Client = struct {
             tls_id: TlsConfigId,
             /// Request target mode for the connection.
             target_mode: request_encoder.RequestTargetMode,
+            /// Optional tunnel target for CONNECT proxies.
+            tunnel: ?connection_h1.TunnelTarget,
+            /// Optional Proxy-Authorization header value for CONNECT.
+            proxy_authorization: ?[]const u8,
         };
 
         /// Hashing context for origin keys.
@@ -486,6 +492,23 @@ pub const Client = struct {
                 const mode_byte: u8 = @intFromEnum(key.target_mode);
                 hasher.update(&[_]u8{mode_byte});
 
+                const tunnel_flag: u8 = if (key.tunnel != null) 1 else 0;
+                hasher.update(&[_]u8{tunnel_flag});
+                if (key.tunnel) |tunnel| {
+                    const tunnel_port = std.mem.toBytes(tunnel.port.toInt());
+                    hasher.update(&tunnel_port);
+                    for (tunnel.host) |byte| {
+                        const lower = std.ascii.toLower(byte);
+                        hasher.update(&[_]u8{lower});
+                    }
+                }
+
+                const auth_flag: u8 = if (key.proxy_authorization != null) 1 else 0;
+                hasher.update(&[_]u8{auth_flag});
+                if (key.proxy_authorization) |auth| {
+                    hasher.update(auth);
+                }
+
                 for (key.host) |byte| {
                     const lower = std.ascii.toLower(byte);
                     hasher.update(&[_]u8{lower});
@@ -496,11 +519,38 @@ pub const Client = struct {
 
             /// Returns true when origin keys are equivalent.
             pub fn eql(_: @This(), a: OriginKey, b: OriginKey) bool {
-                return a.scheme == b.scheme and
-                    a.port.toInt() == b.port.toInt() and
-                    a.tls_id.toInt() == b.tls_id.toInt() and
-                    a.target_mode == b.target_mode and
-                    std.ascii.eqlIgnoreCase(a.host, b.host);
+                if (a.scheme != b.scheme or
+                    a.port.toInt() != b.port.toInt() or
+                    a.tls_id.toInt() != b.tls_id.toInt() or
+                    a.target_mode != b.target_mode)
+                {
+                    return false;
+                }
+                if (!std.ascii.eqlIgnoreCase(a.host, b.host)) {
+                    return false;
+                }
+                if ((a.tunnel == null) != (b.tunnel == null)) {
+                    return false;
+                }
+                if (a.tunnel) |a_tunnel| {
+                    const b_tunnel = b.tunnel.?;
+                    if (a_tunnel.port.toInt() != b_tunnel.port.toInt()) {
+                        return false;
+                    }
+                    if (!std.ascii.eqlIgnoreCase(a_tunnel.host, b_tunnel.host)) {
+                        return false;
+                    }
+                }
+                if ((a.proxy_authorization == null) != (b.proxy_authorization == null)) {
+                    return false;
+                }
+                if (a.proxy_authorization) |auth_a| {
+                    const auth_b = b.proxy_authorization.?;
+                    if (!std.mem.eql(u8, auth_a, auth_b)) {
+                        return false;
+                    }
+                }
+                return true;
             }
         };
 
@@ -564,7 +614,16 @@ pub const Client = struct {
             var iter = self.origins.iterator();
             while (iter.next()) |entry| {
                 entry.value_ptr.deinit(self.allocator);
-                self.allocator.free(@constCast(entry.key_ptr.host));
+                const host = entry.key_ptr.host;
+                const tunnel_host = if (entry.key_ptr.tunnel) |tunnel| tunnel.host else null;
+                const proxy_auth = entry.key_ptr.proxy_authorization;
+                self.allocator.free(@constCast(host));
+                if (tunnel_host) |value| {
+                    self.allocator.free(@constCast(value));
+                }
+                if (proxy_auth) |value| {
+                    self.allocator.free(@constCast(value));
+                }
             }
             self.origins.deinit(self.allocator);
         }
@@ -697,6 +756,8 @@ pub const Client = struct {
                     .host = origin.host,
                     .port = origin.port,
                     .target_mode = origin.target_mode,
+                    .tunnel = origin.tunnel,
+                    .proxy_authorization = origin.proxy_authorization,
                 },
                 options,
             );
@@ -742,9 +803,17 @@ pub const Client = struct {
                 return;
             }
             const host = key_ptr.host;
+            const tunnel_host = if (key_ptr.tunnel) |tunnel| tunnel.host else null;
+            const proxy_auth = key_ptr.proxy_authorization;
             entry.deinit(self.allocator);
             self.origins.removeByPtr(key_ptr);
             self.allocator.free(@constCast(host));
+            if (tunnel_host) |value| {
+                self.allocator.free(@constCast(value));
+            }
+            if (proxy_auth) |value| {
+                self.allocator.free(@constCast(value));
+            }
         }
 
         /// Allocates a stable host copy for a new origin key.
@@ -752,12 +821,37 @@ pub const Client = struct {
             const host_copy = self.allocator.dupe(u8, key.host) catch {
                 return error.OutOfMemory;
             };
+            errdefer self.allocator.free(host_copy);
+
+            var tunnel_copy: ?connection_h1.TunnelTarget = null;
+            if (key.tunnel) |tunnel| {
+                const tunnel_host = self.allocator.dupe(u8, tunnel.host) catch {
+                    return error.OutOfMemory;
+                };
+                tunnel_copy = .{
+                    .host = tunnel_host,
+                    .port = tunnel.port,
+                };
+            }
+            errdefer if (tunnel_copy) |tunnel| self.allocator.free(@constCast(tunnel.host));
+
+            var proxy_auth_copy: ?[]const u8 = null;
+            if (key.proxy_authorization) |value| {
+                const auth = self.allocator.dupe(u8, value) catch {
+                    return error.OutOfMemory;
+                };
+                proxy_auth_copy = auth;
+            }
+            errdefer if (proxy_auth_copy) |value| self.allocator.free(@constCast(value));
+
             return .{
                 .scheme = key.scheme,
                 .host = host_copy,
                 .port = key.port,
                 .tls_id = key.tls_id,
                 .target_mode = key.target_mode,
+                .tunnel = tunnel_copy,
+                .proxy_authorization = proxy_auth_copy,
             };
         }
 
@@ -816,11 +910,14 @@ pub const Client = struct {
         errdefer if (proxy_endpoint) |*proxy_value| proxy_value.deinit();
         const proxy_enabled = proxy_endpoint != null;
 
+        const proxy_auth_header = try self.prepareProxyAuthHeader(request_value, proxy_config, proxy_enabled);
+        defer if (proxy_auth_header) |value| self.allocator.free(value);
+
         const prepared = try self.prepareRequest(request_value, proxy_config, proxy_enabled);
         var cleanup_prepared = true;
         errdefer if (cleanup_prepared) self.cleanupPreparedRequest(prepared);
 
-        const origin = try self.buildOriginKey(prepared.request, proxy_endpoint);
+        const origin = try self.buildOriginKey(prepared.request, proxy_endpoint, proxy_auth_header);
         const connection_options = self.buildConnectionOptions();
         var lease = try self.pool.checkout(origin, connection_options);
         if (proxy_endpoint) |*proxy_value| {
@@ -868,7 +965,8 @@ pub const Client = struct {
         }
         defer if (cookie_header) |value| self.allocator.free(value);
 
-        const needs_proxy_header = proxy_enabled and
+        const wants_proxy_header = proxy_enabled and request_value.uri.scheme == .http;
+        const needs_proxy_header = wants_proxy_header and
             proxy_config.mode == .manual and
             proxy_config.manual != null and
             proxy_config.manual.?.auth != null and
@@ -876,11 +974,15 @@ pub const Client = struct {
 
         var proxy_header: ?[]u8 = null;
         if (needs_proxy_header) {
-            proxy_header = try buildProxyAuthorizationHeader(self.allocator, proxy_config.manual.?.auth.?);
+            proxy_header = try self.buildProxyAuthorizationHeader(self.allocator, proxy_config.manual.?.auth.?);
         }
         defer if (proxy_header) |value| self.allocator.free(value);
 
-        if (cookie_header == null and proxy_header == null) {
+        const strip_proxy_authorization = proxy_enabled and
+            request_value.uri.scheme == .https and
+            request_value.headers.get("Proxy-Authorization") != null;
+
+        if (cookie_header == null and proxy_header == null and !strip_proxy_authorization) {
             return .{ .request = request_value, .owned = null };
         }
 
@@ -889,6 +991,7 @@ pub const Client = struct {
             request_value,
             if (cookie_header) |value| value else null,
             if (proxy_header) |value| value else null,
+            strip_proxy_authorization,
         );
         return .{ .request = owned, .owned = owned };
     }
@@ -1095,13 +1198,20 @@ pub const Client = struct {
                 var proxy_endpoint = try self.client.resolveProxyConfig(current_uri, proxy_config);
                 errdefer if (proxy_endpoint) |*proxy_value| proxy_value.deinit();
 
+                const proxy_auth_header = try self.client.prepareProxyAuthHeader(
+                    owned_request.?,
+                    proxy_config,
+                    proxy_endpoint != null,
+                );
+                defer if (proxy_auth_header) |value| self.allocator.free(value);
+
                 owned_request = try self.applyProxyAuthToOwnedRequest(
                     owned_request.?,
                     proxy_config,
                     proxy_endpoint != null,
                 );
 
-                self.submitRedirectRequest(owned_request.?, proxy_endpoint) catch |err| {
+                self.submitRedirectRequest(owned_request.?, proxy_endpoint, proxy_auth_header) catch |err| {
                     self.cleanupOwnedRequest(owned_request);
                     owned_request = null;
                     return err;
@@ -1255,6 +1365,23 @@ pub const Client = struct {
             if (!proxy_enabled) {
                 return request_value;
             }
+
+            if (request_value.uri.scheme == .https) {
+                if (request_value.headers.get("Proxy-Authorization") == null) {
+                    return request_value;
+                }
+                const updated = try buildRequestWithExtras(
+                    self.allocator,
+                    request_value,
+                    null,
+                    null,
+                    true,
+                );
+                request_value.deinit();
+                self.allocator.destroy(request_value);
+                return updated;
+            }
+
             if (proxy_config.mode != .manual) {
                 return request_value;
             }
@@ -1335,11 +1462,12 @@ pub const Client = struct {
             self: *RequestState,
             request_value: *const types.Request,
             proxy_endpoint: ?proxy_env.ProxyEndpoint,
+            proxy_auth_header: ?[]const u8,
         ) Error!void {
             var proxy_value = proxy_endpoint;
             defer if (proxy_value) |*value| value.deinit();
 
-            const origin = try self.client.buildOriginKey(request_value, proxy_value);
+            const origin = try self.client.buildOriginKey(request_value, proxy_value, proxy_auth_header);
             const connection_options = self.client.buildConnectionOptions();
             var lease = try self.pool.checkout(origin, connection_options);
 
@@ -1444,10 +1572,8 @@ pub const Client = struct {
         self: *Client,
         request_value: *const types.Request,
         proxy_endpoint: ?proxy_env.ProxyEndpoint,
+        proxy_auth_header: ?[]const u8,
     ) Error!ConnectionPool.OriginKey {
-        if (request_value.uri.scheme != .http) {
-            return error.InvalidUri;
-        }
         if (request_value.uri.host.len == 0) {
             return error.InvalidUri;
         }
@@ -1456,15 +1582,42 @@ pub const Client = struct {
             if (proxy_value.scheme != .http) {
                 return error.InvalidConfig;
             }
+            if (request_value.uri.scheme == .http) {
+                return .{
+                    .scheme = proxy_value.scheme,
+                    .host = proxy_value.host,
+                    .port = proxy_value.port,
+                    .tls_id = self.options.tls.identity(),
+                    .target_mode = .absolute_form,
+                    .tunnel = null,
+                    .proxy_authorization = null,
+                };
+            }
+
+            if (request_value.uri.scheme != .https) {
+                return error.InvalidUri;
+            }
+            const tunnel_host = request_value.uri.host;
+            if (tunnel_host.len == 0) {
+                return error.InvalidUri;
+            }
             return .{
                 .scheme = proxy_value.scheme,
                 .host = proxy_value.host,
                 .port = proxy_value.port,
                 .tls_id = self.options.tls.identity(),
-                .target_mode = .absolute_form,
+                .target_mode = .origin_form,
+                .tunnel = .{
+                    .host = tunnel_host,
+                    .port = request_value.uri.effectivePort(),
+                },
+                .proxy_authorization = proxy_auth_header,
             };
         }
 
+        if (request_value.uri.scheme != .http) {
+            return error.InvalidUri;
+        }
         const port = request_value.uri.effectivePort();
         return .{
             .scheme = request_value.uri.scheme,
@@ -1472,6 +1625,8 @@ pub const Client = struct {
             .port = port,
             .tls_id = self.options.tls.identity(),
             .target_mode = .origin_form,
+            .tunnel = null,
+            .proxy_authorization = null,
         };
     }
 
@@ -1543,6 +1698,32 @@ pub const Client = struct {
             .host = host_copy,
             .port = manual.port,
         };
+    }
+
+    /// Prepares a Proxy-Authorization header value for CONNECT if needed.
+    fn prepareProxyAuthHeader(
+        self: *Client,
+        request_value: *const types.Request,
+        proxy_config: ProxyConfig,
+        proxy_enabled: bool,
+    ) Error!?[]u8 {
+        if (!proxy_enabled) {
+            return null;
+        }
+        if (request_value.uri.scheme != .https) {
+            return null;
+        }
+        if (request_value.headers.get("Proxy-Authorization")) |value| {
+            return self.allocator.dupe(u8, value) catch {
+                return error.OutOfMemory;
+            };
+        }
+        if (proxy_config.mode != .manual) {
+            return null;
+        }
+        const manual = proxy_config.manual orelse return error.InvalidConfig;
+        const auth = manual.auth orelse return null;
+        return try self.buildProxyAuthorizationHeader(self.allocator, auth);
     }
 
     /// Builds a Proxy-Authorization header value for the provided auth config.
@@ -1671,6 +1852,7 @@ fn buildRequestWithExtras(
     request_value: *const types.Request,
     cookie_value: ?[]const u8,
     proxy_auth_value: ?[]const u8,
+    strip_proxy_authorization: bool,
 ) Client.Error!*types.Request {
     const request_copy = allocator.create(types.Request) catch {
         return error.OutOfMemory;
@@ -1685,7 +1867,7 @@ fn buildRequestWithExtras(
 
     var existing = std.ArrayListUnmanaged(u8){};
     defer existing.deinit(allocator);
-    var add_proxy_auth = proxy_auth_value != null;
+    var add_proxy_auth = proxy_auth_value != null and !strip_proxy_authorization;
 
     var iter = request_value.headers.iterator();
     while (iter.next()) |header| {
@@ -1698,6 +1880,9 @@ fn buildRequestWithExtras(
         }
         if (std.ascii.eqlIgnoreCase(header.name, "proxy-authorization")) {
             add_proxy_auth = false;
+            if (strip_proxy_authorization) {
+                continue;
+            }
         }
         try request_copy.headers.append(header.name, header.value);
     }
@@ -1737,7 +1922,7 @@ fn buildRequestWithCookies(
     request_value: *const types.Request,
     cookie_value: []const u8,
 ) Client.Error!*types.Request {
-    return buildRequestWithExtras(allocator, request_value, cookie_value, null);
+    return buildRequestWithExtras(allocator, request_value, cookie_value, null, false);
 }
 
 /// Returns true when a header should be omitted on redirect follow-ups.
@@ -2097,6 +2282,116 @@ test "client sends absolute-form request through proxy" {
     var buffer: [16]u8 = undefined;
     const read_len = try response.body.?.read(&buffer);
     try std.testing.expectEqualStrings("via-proxy", buffer[0..read_len]);
+}
+
+test "client establishes CONNECT tunnel through proxy" {
+    const test_server = @import("http1/test_server.zig");
+    const test_proxy = @import("proxy/test_proxy.zig");
+
+    const scenarios = [_]test_server.Scenario{
+        .{
+            .steps = &.{
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .ok,
+                            .reason = "OK",
+                            .body = "tunnel",
+                        },
+                    },
+                },
+            },
+        },
+    };
+
+    var server = try test_server.TestServer.init(&scenarios, test_server.Options.default());
+    defer server.deinit();
+    try server.start();
+
+    var proxy_options = test_proxy.Options.default();
+    proxy_options.expect_connect_contains = "Proxy-Authorization: Basic dXNlcjpwYXNz";
+
+    var proxy = try test_proxy.TestProxy.init(
+        std.testing.allocator,
+        .{ .tunnel = {} },
+        proxy_options,
+    );
+    defer proxy.deinit();
+    try proxy.start();
+
+    var options = Client.Options.default();
+    options.proxy = .{
+        .mode = .manual,
+        .manual = .{
+            .scheme = .http,
+            .host = "127.0.0.1",
+            .port = types.Port.init(proxy.port()),
+            .auth = .{
+                .basic = .{
+                    .username = "user",
+                    .password = "pass",
+                },
+            },
+        },
+    };
+
+    var client = Client.init(std.testing.allocator, options);
+    defer client.deinit();
+
+    const uri = types.Uri.init(.https, "127.0.0.1", types.Port.init(server.port()), "/", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+
+    var host_buffer: [32]u8 = undefined;
+    const host_value = try std.fmt.bufPrint(&host_buffer, "127.0.0.1:{d}", .{server.port()});
+    try request.headers.append("Host", host_value);
+
+    var handle = try client.request(&request);
+    defer handle.deinit();
+
+    var response = try handle.wait();
+    defer response.deinit();
+    defer if (response.body) |body| body.close();
+
+    var buffer: [8]u8 = undefined;
+    const read_len = try response.body.?.read(&buffer);
+    try std.testing.expectEqualStrings("tunnel", buffer[0..read_len]);
+}
+
+test "client surfaces CONNECT failure" {
+    const test_proxy = @import("proxy/test_proxy.zig");
+
+    var proxy = try test_proxy.TestProxy.init(
+        std.testing.allocator,
+        .{ .reject = .{ .status = 502, .reason = "Bad Gateway" } },
+        test_proxy.Options.default(),
+    );
+    defer proxy.deinit();
+    try proxy.start();
+
+    var options = Client.Options.default();
+    options.proxy = .{
+        .mode = .manual,
+        .manual = .{
+            .scheme = .http,
+            .host = "127.0.0.1",
+            .port = types.Port.init(proxy.port()),
+            .auth = null,
+        },
+    };
+
+    var client = Client.init(std.testing.allocator, options);
+    defer client.deinit();
+
+    const uri = types.Uri.init(.https, "example.com", types.Port.init(443), "/", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "example.com");
+
+    var handle = try client.request(&request);
+    defer handle.deinit();
+
+    try std.testing.expectError(error.ProxyConnectFailed, handle.wait());
 }
 
 test "client reuses keep-alive connection" {
