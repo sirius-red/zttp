@@ -949,6 +949,8 @@ pub const Client = struct {
                     return self.finalizeResponse(current_uri, response);
                 }
 
+                try self.storeCookies(current_uri, &response);
+
                 const location = response.headers.get("Location") orelse {
                     self.abandonRedirectResponse(&response);
                     return error.RedirectMissingLocation;
@@ -1001,6 +1003,7 @@ pub const Client = struct {
                     base_headers,
                     same_origin,
                 );
+                owned_request = try self.applyCookiesToOwnedRequest(owned_request.?);
                 self.submitRedirectRequest(owned_request.?) catch |err| {
                     self.cleanupOwnedRequest(owned_request);
                     owned_request = null;
@@ -1120,6 +1123,28 @@ pub const Client = struct {
                     error.OutOfMemory => error.OutOfMemory,
                 };
             };
+        }
+
+        /// Applies cookies to an owned request, replacing it if needed.
+        fn applyCookiesToOwnedRequest(
+            self: *RequestState,
+            request_value: *types.Request,
+        ) ResponseFuture.WaitError!*types.Request {
+            const jar = self.client.options.cookie_jar orelse return request_value;
+            const now = cookies.CookieJar.Timestamp.now();
+            const header_value = jar.buildCookieHeader(self.allocator, request_value.uri, now) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+
+            if (header_value == null) {
+                return request_value;
+            }
+            defer self.allocator.free(header_value.?);
+
+            const updated = try buildRequestWithCookies(self.allocator, request_value, header_value.?);
+            request_value.deinit();
+            self.allocator.destroy(request_value);
+            return updated;
         }
 
         /// Cleans up a redirect response before following the next hop.
@@ -2083,6 +2108,72 @@ test "client follows redirect responses" {
     try std.testing.expectEqualStrings("final", buffer[0..read_len]);
     const eof = try response.body.?.read(&buffer);
     try std.testing.expectEqual(@as(usize, 0), eof);
+}
+
+test "client applies cookies during redirects" {
+    const test_server = @import("http1/test_server.zig");
+
+    const scenarios = [_]test_server.Scenario{
+        .{
+            .steps = &.{
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .found,
+                            .reason = "Found",
+                            .headers = &.{
+                                .{ .name = "Location", .value = "/next" },
+                                .{ .name = "Set-Cookie", .value = "session=abc; Path=/" },
+                            },
+                        },
+                    },
+                    .close_after = false,
+                },
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .ok,
+                            .reason = "OK",
+                            .body = "ok",
+                        },
+                    },
+                    .expect_request_contains = "Cookie: session=abc",
+                    .close_after = true,
+                },
+            },
+        },
+    };
+
+    var server = try test_server.TestServer.init(&scenarios, test_server.Options.default());
+    defer server.deinit();
+    try server.start();
+
+    var jar = cookies.CookieJar.init(std.testing.allocator, cookies.CookieJar.Options.default());
+    defer jar.deinit();
+
+    var options = Client.Options.default();
+    options.cookie_jar = &jar;
+
+    var client = Client.init(std.testing.allocator, options);
+    defer client.deinit();
+
+    const uri = types.Uri.init(.http, "127.0.0.1", types.Port.init(server.port()), "/start", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "127.0.0.1");
+
+    var handle = try client.request(&request);
+    defer handle.deinit();
+
+    var response = try handle.wait();
+    defer response.deinit();
+    defer if (response.body) |body| body.close();
+
+    try std.testing.expectEqual(types.Status.ok, response.status);
+
+    var buffer: [4]u8 = undefined;
+    const read_len = try response.body.?.read(&buffer);
+    try std.testing.expectEqualStrings("ok", buffer[0..read_len]);
 }
 
 test "client detects redirect loops" {

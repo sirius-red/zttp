@@ -39,6 +39,8 @@ pub const Step = struct {
     payload: ResponsePayload,
     /// Read and discard a request before sending the response.
     read_request: bool = true,
+    /// Optional substring expected in the request headers.
+    expect_request_contains: ?[]const u8 = null,
     /// Delay before sending the response payload.
     delay_before_ns: u64 = 0,
     /// Close the connection after sending the response.
@@ -145,7 +147,11 @@ pub const TestServer = struct {
 
         for (scenario.steps) |step| {
             if (step.read_request) {
-                _ = readRequestHeaders(connection.stream, self.options.max_request_bytes) catch {};
+                try readRequestHeaders(
+                    connection.stream,
+                    self.options.max_request_bytes,
+                    step.expect_request_contains,
+                );
             }
 
             if (step.delay_before_ns > 0) {
@@ -173,13 +179,23 @@ pub const TestServer = struct {
     }
 
     /// Error set returned by request header reads.
-    pub const ReadRequestError = std.net.Stream.ReadError || error{LimitExceeded, EndOfStream};
+    pub const ReadRequestError = std.net.Stream.ReadError || error{
+        LimitExceeded,
+        EndOfStream,
+        MissingExpectedBytes,
+    };
 
     /// Reads request headers until the header terminator is reached.
-    fn readRequestHeaders(stream: std.net.Stream, max_bytes: usize) ReadRequestError!void {
+    fn readRequestHeaders(
+        stream: std.net.Stream,
+        max_bytes: usize,
+        expect_contains: ?[]const u8,
+    ) ReadRequestError!void {
         var buffer: [1024]u8 = undefined;
         var total: usize = 0;
         var state: u8 = 0;
+        var match_index: usize = 0;
+        var found = expect_contains == null;
 
         while (true) {
             const read_len = try stream.read(&buffer);
@@ -193,12 +209,27 @@ pub const TestServer = struct {
             }
 
             for (buffer[0..read_len]) |byte| {
+                if (!found) {
+                    const needle = expect_contains.?;
+                    if (byte == needle[match_index]) {
+                        match_index += 1;
+                        if (match_index == needle.len) {
+                            found = true;
+                        }
+                    } else {
+                        match_index = if (byte == needle[0]) 1 else 0;
+                    }
+                }
+
                 switch (state) {
                     0 => state = if (byte == '\r') 1 else 0,
                     1 => state = if (byte == '\n') 2 else if (byte == '\r') 1 else 0,
                     2 => state = if (byte == '\r') 3 else 0,
                     3 => {
                         if (byte == '\n') {
+                            if (!found) {
+                                return error.MissingExpectedBytes;
+                            }
                             return;
                         }
                         state = 0;
