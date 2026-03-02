@@ -3,6 +3,53 @@
 const std = @import("std");
 const types = @import("../types.zig");
 
+/// Error set returned by cookie jar operations.
+pub const Error = std.mem.Allocator.Error;
+
+/// Cookie jar configuration options.
+pub const Options = struct {
+    /// Maximum number of cookies to retain.
+    max_entries: usize,
+
+    /// Returns default cookie jar options.
+    pub fn default() Options {
+        return .{ .max_entries = 256 };
+    }
+};
+
+/// Timestamp in seconds since the Unix epoch.
+pub const Timestamp = struct {
+    /// Seconds since 1970-01-01T00:00:00Z.
+    seconds: i64,
+
+    /// Creates a timestamp from seconds.
+    pub fn fromSeconds(seconds: i64) Timestamp {
+        return .{ .seconds = seconds };
+    }
+
+    /// Returns the timestamp in seconds.
+    pub fn toSeconds(self: Timestamp) i64 {
+        return self.seconds;
+    }
+
+    /// Returns the current wall-clock timestamp.
+    pub fn now() Timestamp {
+        return .{ .seconds = std.time.timestamp() };
+    }
+};
+
+/// SameSite attribute value.
+pub const SameSite = enum {
+    /// No SameSite attribute was provided.
+    unspecified,
+    /// SameSite=Lax.
+    lax,
+    /// SameSite=Strict.
+    strict,
+    /// SameSite=None.
+    none,
+};
+
 /// Thread-safe in-memory cookie jar.
 pub const CookieJar = struct {
     /// Allocator used for cookie storage.
@@ -15,53 +62,6 @@ pub const CookieJar = struct {
     entries: std.ArrayListUnmanaged(Cookie),
     /// Monotonic counter for creation ordering.
     next_id: u64,
-
-    /// Error set returned by cookie jar operations.
-    pub const Error = std.mem.Allocator.Error;
-
-    /// Cookie jar configuration options.
-    pub const Options = struct {
-        /// Maximum number of cookies to retain.
-        max_entries: usize,
-
-        /// Returns default cookie jar options.
-        pub fn default() Options {
-            return .{ .max_entries = 256 };
-        }
-    };
-
-    /// Timestamp in seconds since the Unix epoch.
-    pub const Timestamp = struct {
-        /// Seconds since 1970-01-01T00:00:00Z.
-        seconds: i64,
-
-        /// Creates a timestamp from seconds.
-        pub fn fromSeconds(seconds: i64) Timestamp {
-            return .{ .seconds = seconds };
-        }
-
-        /// Returns the timestamp in seconds.
-        pub fn toSeconds(self: Timestamp) i64 {
-            return self.seconds;
-        }
-
-        /// Returns the current wall-clock timestamp.
-        pub fn now() Timestamp {
-            return .{ .seconds = std.time.timestamp() };
-        }
-    };
-
-    /// SameSite attribute value.
-    pub const SameSite = enum {
-        /// No SameSite attribute was provided.
-        unspecified,
-        /// SameSite=Lax.
-        lax,
-        /// SameSite=Strict.
-        strict,
-        /// SameSite=None.
-        none,
-    };
 
     /// Initializes a cookie jar with the provided allocator and options.
     pub fn init(allocator: std.mem.Allocator, options: Options) CookieJar {
@@ -259,9 +259,9 @@ const Cookie = struct {
     /// Indicates the cookie should be hidden from scripts.
     http_only: bool,
     /// SameSite attribute value.
-    same_site: CookieJar.SameSite,
+    same_site: SameSite,
     /// Expiration timestamp.
-    expires: ?CookieJar.Timestamp,
+    expires: ?Timestamp,
     /// Creation order used for eviction and sorting.
     created_id: u64,
 
@@ -292,13 +292,13 @@ const ParsedCookie = struct {
     /// Indicates the cookie should be hidden from scripts.
     http_only: bool,
     /// SameSite attribute value.
-    same_site: CookieJar.SameSite,
+    same_site: SameSite,
     /// Expiration timestamp.
-    expires: ?CookieJar.Timestamp,
+    expires: ?Timestamp,
 };
 
 /// Returns true when the parsed cookie is expired.
-fn isExpired(parsed: ParsedCookie, now: CookieJar.Timestamp) bool {
+fn isExpired(parsed: ParsedCookie, now: Timestamp) bool {
     if (parsed.expires) |expires| {
         return expires.toSeconds() <= now.toSeconds();
     }
@@ -306,7 +306,7 @@ fn isExpired(parsed: ParsedCookie, now: CookieJar.Timestamp) bool {
 }
 
 /// Returns true when the stored cookie is expired.
-fn isExpiredCookie(cookie: Cookie, now: CookieJar.Timestamp) bool {
+fn isExpiredCookie(cookie: Cookie, now: Timestamp) bool {
     if (cookie.expires) |expires| {
         return expires.toSeconds() <= now.toSeconds();
     }
@@ -354,7 +354,7 @@ fn cookieMatches(
     cookie: *const Cookie,
     uri: types.Uri,
     request_path: []const u8,
-    now: CookieJar.Timestamp,
+    now: Timestamp,
 ) bool {
     if (cookie.secure and uri.scheme != .https) {
         return false;
@@ -485,7 +485,7 @@ fn validCookieValue(value: []const u8) bool {
 fn parseSetCookie(
     value: []const u8,
     uri: types.Uri,
-    now: CookieJar.Timestamp,
+    now: Timestamp,
 ) ?ParsedCookie {
     var parts = std.mem.splitScalar(u8, value, ';');
     const first = parts.next() orelse return null;
@@ -502,10 +502,10 @@ fn parseSetCookie(
     var domain_attr: ?[]const u8 = null;
     var path_attr: ?[]const u8 = null;
     var max_age: ?i64 = null;
-    var expires: ?CookieJar.Timestamp = null;
+    var expires: ?Timestamp = null;
     var secure = false;
     var http_only = false;
-    var same_site = CookieJar.SameSite.unspecified;
+    var same_site = SameSite.unspecified;
 
     while (parts.next()) |raw_attr| {
         const attr = trimWhitespace(raw_attr);
@@ -563,9 +563,9 @@ fn parseSetCookie(
     var final_expires = expires;
     if (max_age) |delta| {
         if (delta <= 0) {
-            final_expires = CookieJar.Timestamp.fromSeconds(now.toSeconds() - 1);
+            final_expires = Timestamp.fromSeconds(now.toSeconds() - 1);
         } else {
-            final_expires = CookieJar.Timestamp.fromSeconds(now.toSeconds() + delta);
+            final_expires = Timestamp.fromSeconds(now.toSeconds() + delta);
         }
     }
 
@@ -591,7 +591,7 @@ fn trimLeadingDot(value: []const u8) []const u8 {
 }
 
 /// Parses a SameSite attribute value.
-fn parseSameSite(value: []const u8) CookieJar.SameSite {
+fn parseSameSite(value: []const u8) SameSite {
     if (std.ascii.eqlIgnoreCase(value, "lax")) {
         return .lax;
     }
@@ -622,7 +622,7 @@ fn cookieLessThan(_: void, left: *Cookie, right: *Cookie) bool {
 }
 
 /// Parses an HTTP-date for the Expires attribute.
-fn parseHttpDate(value: []const u8) ?CookieJar.Timestamp {
+fn parseHttpDate(value: []const u8) ?Timestamp {
     var trimmed = trimWhitespace(value);
     if (std.mem.indexOfScalar(u8, trimmed, ',')) |comma| {
         trimmed = trimWhitespace(trimmed[comma + 1 ..]);
@@ -656,7 +656,7 @@ fn parseHttpDate(value: []const u8) ?CookieJar.Timestamp {
     const second = std.fmt.parseInt(i32, sec_str, 10) catch return null;
 
     const seconds = unixSecondsFromDate(year, month, day, hour, minute, second) orelse return null;
-    return CookieJar.Timestamp.fromSeconds(seconds);
+    return Timestamp.fromSeconds(seconds);
 }
 
 /// Parses a month abbreviation into a 1-based month number.
@@ -741,7 +741,7 @@ fn daysFromCivil(year: i32, month: i32, day: i32) i64 {
 }
 
 test "cookie jar matches host-only cookies" {
-    var jar = CookieJar.init(std.testing.allocator, CookieJar.Options.default());
+    var jar = CookieJar.init(std.testing.allocator, Options.default());
     defer jar.deinit();
 
     var headers = types.Headers.init(std.testing.allocator);
@@ -750,7 +750,7 @@ test "cookie jar matches host-only cookies" {
     try headers.append("Set-Cookie", "a=1");
 
     const uri = types.Uri.init(.http, "example.com", types.Port.init(80), "/", null, null);
-    const now = CookieJar.Timestamp.fromSeconds(1000);
+    const now = Timestamp.fromSeconds(1000);
 
     try jar.storeFromResponse(uri, &headers, now);
 
@@ -765,7 +765,7 @@ test "cookie jar matches host-only cookies" {
 }
 
 test "cookie jar respects domain attribute" {
-    var jar = CookieJar.init(std.testing.allocator, CookieJar.Options.default());
+    var jar = CookieJar.init(std.testing.allocator, Options.default());
     defer jar.deinit();
 
     var headers = types.Headers.init(std.testing.allocator);
@@ -774,7 +774,7 @@ test "cookie jar respects domain attribute" {
     try headers.append("Set-Cookie", "a=1; Domain=example.com");
 
     const uri = types.Uri.init(.http, "www.example.com", types.Port.init(80), "/", null, null);
-    const now = CookieJar.Timestamp.fromSeconds(2000);
+    const now = Timestamp.fromSeconds(2000);
 
     try jar.storeFromResponse(uri, &headers, now);
 
@@ -790,7 +790,7 @@ test "cookie jar respects domain attribute" {
 }
 
 test "cookie jar respects path matching" {
-    var jar = CookieJar.init(std.testing.allocator, CookieJar.Options.default());
+    var jar = CookieJar.init(std.testing.allocator, Options.default());
     defer jar.deinit();
 
     var headers = types.Headers.init(std.testing.allocator);
@@ -799,7 +799,7 @@ test "cookie jar respects path matching" {
     try headers.append("Set-Cookie", "a=1; Path=/docs");
 
     const uri = types.Uri.init(.http, "example.com", types.Port.init(80), "/docs/index", null, null);
-    const now = CookieJar.Timestamp.fromSeconds(3000);
+    const now = Timestamp.fromSeconds(3000);
 
     try jar.storeFromResponse(uri, &headers, now);
 
@@ -815,7 +815,7 @@ test "cookie jar respects path matching" {
 }
 
 test "cookie jar expires cookies via max-age" {
-    var jar = CookieJar.init(std.testing.allocator, CookieJar.Options.default());
+    var jar = CookieJar.init(std.testing.allocator, Options.default());
     defer jar.deinit();
 
     var headers = types.Headers.init(std.testing.allocator);
@@ -824,25 +824,25 @@ test "cookie jar expires cookies via max-age" {
     try headers.append("Set-Cookie", "a=1; Max-Age=1");
 
     const uri = types.Uri.init(.http, "example.com", types.Port.init(80), "/", null, null);
-    const now = CookieJar.Timestamp.fromSeconds(4000);
+    const now = Timestamp.fromSeconds(4000);
 
     try jar.storeFromResponse(uri, &headers, now);
 
-    const later = CookieJar.Timestamp.fromSeconds(4002);
+    const later = Timestamp.fromSeconds(4002);
     const header = try jar.buildCookieHeader(std.testing.allocator, uri, later);
     defer if (header) |value| std.testing.allocator.free(value);
     try std.testing.expect(header == null);
 }
 
 test "cookie jar evicts oldest entries" {
-    var options = CookieJar.Options.default();
+    var options = Options.default();
     options.max_entries = 1;
 
     var jar = CookieJar.init(std.testing.allocator, options);
     defer jar.deinit();
 
     const uri = types.Uri.init(.http, "example.com", types.Port.init(80), "/", null, null);
-    const now = CookieJar.Timestamp.fromSeconds(5000);
+    const now = Timestamp.fromSeconds(5000);
 
     {
         var headers = types.Headers.init(std.testing.allocator);

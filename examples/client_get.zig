@@ -8,7 +8,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var client = zttp.Client.init(allocator, zttp.Client.Options.default());
+    var client = zttp.Client.init(allocator, zttp.ClientOptions.default());
     defer client.deinit();
 
     const uri = zttp.Uri.init(.http, "example.com", null, "/", null, null);

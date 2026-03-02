@@ -198,38 +198,38 @@ pub const Status = enum(u16) {
     }
 };
 
+/// Represents a single header field.
+pub const Header = struct {
+    /// Header name.
+    name: []const u8,
+    /// Header value.
+    value: []const u8,
+};
+
+/// Iterates over header fields.
+pub const HeadersIterator = struct {
+    /// Header collection being iterated.
+    headers: *const Headers,
+    /// Current iteration index.
+    index: usize,
+
+    /// Returns the next header or null when done.
+    pub fn next(self: *HeadersIterator) ?Header {
+        if (self.index >= self.headers.entries.items.len) {
+            return null;
+        }
+        const header = self.headers.entries.items[self.index];
+        self.index += 1;
+        return header;
+    }
+};
+
 /// Collection of HTTP header fields.
 pub const Headers = struct {
     /// Allocator used for header storage.
     allocator: std.mem.Allocator,
     /// Header entries in insertion order.
     entries: std.ArrayListUnmanaged(Header),
-
-    /// Represents a single header field.
-    pub const Header = struct {
-        /// Header name.
-        name: []const u8,
-        /// Header value.
-        value: []const u8,
-    };
-
-    /// Iterates over header fields.
-    pub const Iterator = struct {
-        /// Header collection being iterated.
-        headers: *const Headers,
-        /// Current iteration index.
-        index: usize,
-
-        /// Returns the next header or null when done.
-        pub fn next(self: *Iterator) ?Header {
-            if (self.index >= self.headers.entries.items.len) {
-                return null;
-            }
-            const header = self.headers.entries.items[self.index];
-            self.index += 1;
-            return header;
-        }
-    };
 
     /// Initializes an empty header collection.
     pub fn init(allocator: std.mem.Allocator) Headers {
@@ -271,7 +271,7 @@ pub const Headers = struct {
     }
 
     /// Returns an iterator over header fields in insertion order.
-    pub fn iterator(self: *const Headers) Iterator {
+    pub fn iterator(self: *const Headers) HeadersIterator {
         return .{
             .headers = self,
             .index = 0,
@@ -279,20 +279,20 @@ pub const Headers = struct {
     }
 };
 
+/// Error set returned by body reader implementations.
+pub const BodyReaderReadError = anyerror;
+
 /// Streaming request/response body reader.
 pub const BodyReader = struct {
-    /// Error set returned by reader implementations.
-    pub const ReadError = anyerror;
-
     /// Opaque reader context.
     ctx: ?*anyopaque,
     /// Reads up to `dest.len` bytes into `dest`.
-    read_fn: *const fn (ctx: ?*anyopaque, dest: []u8) ReadError!usize,
+    read_fn: *const fn (ctx: ?*anyopaque, dest: []u8) BodyReaderReadError!usize,
     /// Optional close hook.
     close_fn: ?*const fn (ctx: ?*anyopaque) void,
 
     /// Reads bytes into `dest`, returning the number of bytes read.
-    pub fn read(self: BodyReader, dest: []u8) ReadError!usize {
+    pub fn read(self: BodyReader, dest: []u8) BodyReaderReadError!usize {
         return self.read_fn(self.ctx, dest);
     }
 

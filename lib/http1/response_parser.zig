@@ -31,31 +31,373 @@ pub const Limits = struct {
     }
 };
 
+/// Parsed status line components.
+pub const StatusLine = struct {
+    /// Parsed HTTP version.
+    version: types.Version,
+    /// Parsed status code.
+    status: types.Status,
+};
+
+/// Parsed header name and value slices.
+pub const HeaderLine = struct {
+    /// Header name bytes.
+    name: []const u8,
+    /// Header value bytes.
+    value: []const u8,
+};
+
+/// Body transfer mode for response payloads.
+pub const BodyMode = enum {
+    /// Response has no body.
+    none,
+    /// Content-Length delimited body.
+    content_length,
+    /// Chunked transfer encoding body.
+    chunked,
+    /// Body ends at connection close.
+    close,
+};
+
+/// Returns the numeric value of a hexadecimal digit or null.
+fn hexValue(byte: u8) ?usize {
+    return switch (byte) {
+        '0'...'9' => byte - '0',
+        'a'...'f' => 10 + (byte - 'a'),
+        'A'...'F' => 10 + (byte - 'A'),
+        else => null,
+    };
+}
+
+pub fn ParserError(comptime ReaderType: type) type {
+    return ReaderType.Error || std.mem.Allocator.Error || error{
+        UnexpectedEof,
+        InvalidLineEnding,
+        LineTooLong,
+        InvalidStatusLine,
+        InvalidVersion,
+        InvalidStatusCode,
+        InvalidHeaderName,
+        InvalidHeaderValue,
+        HeaderTooLarge,
+        HeaderCountExceeded,
+        UnsupportedTransferEncoding,
+        DuplicateContentLength,
+        AmbiguousLength,
+        InvalidChunkSize,
+        InvalidChunkTerminator,
+        BodyTooLarge,
+        BodyLengthMismatch,
+    };
+}
+
+pub fn BufferedReaderReadError(comptime ReaderType: type) type {
+    return ReaderType.Error || std.mem.Allocator.Error || error{
+        EndOfStream,
+        InvalidLineEnding,
+        LineTooLong,
+    };
+}
+
+pub fn ParserBufferedReader(comptime ReaderType: type) type {
+    return struct {
+        reader: *ReaderType,
+        buffer: []u8,
+        start: usize,
+        end: usize,
+
+        pub fn init(
+            reader: *ReaderType,
+            buffer: []u8,
+            start: usize,
+            end: usize,
+        ) @This() {
+            return .{
+                .reader = reader,
+                .buffer = buffer,
+                .start = start,
+                .end = end,
+            };
+        }
+
+        pub fn readByte(self: *@This()) BufferedReaderReadError(ReaderType)!u8 {
+            if (self.start == self.end) {
+                try self.fill();
+            }
+            const byte = self.buffer[self.start];
+            self.start += 1;
+            return byte;
+        }
+
+        pub fn read(self: *@This(), dest: []u8) BufferedReaderReadError(ReaderType)!usize {
+            if (dest.len == 0) {
+                return 0;
+            }
+            if (self.start < self.end) {
+                const available = self.end - self.start;
+                const to_copy = @min(dest.len, available);
+                @memcpy(dest[0..to_copy], self.buffer[self.start..][0..to_copy]);
+                self.start += to_copy;
+                return to_copy;
+            }
+
+            const read_len = try self.reader.read(dest);
+            if (read_len == 0) {
+                return error.EndOfStream;
+            }
+            return read_len;
+        }
+
+        pub fn readLine(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            line_buffer: *std.ArrayListUnmanaged(u8),
+            max_len: usize,
+        ) BufferedReaderReadError(ReaderType)![]const u8 {
+            line_buffer.clearRetainingCapacity();
+            var saw_cr = false;
+            while (true) {
+                const byte = try self.readByte();
+                if (saw_cr) {
+                    if (byte != '\n') {
+                        return error.InvalidLineEnding;
+                    }
+                    return line_buffer.items;
+                }
+                if (byte == '\r') {
+                    saw_cr = true;
+                    continue;
+                }
+                if (byte == '\n') {
+                    return error.InvalidLineEnding;
+                }
+                try line_buffer.append(allocator, byte);
+                if (line_buffer.items.len > max_len) {
+                    return error.LineTooLong;
+                }
+            }
+        }
+
+        fn fill(self: *@This()) BufferedReaderReadError(ReaderType)!void {
+            self.start = 0;
+            self.end = 0;
+            const read_len = try self.reader.read(self.buffer);
+            if (read_len == 0) {
+                return error.EndOfStream;
+            }
+            self.end = read_len;
+        }
+    };
+}
+
+pub fn mapParserReadError(comptime ReaderType: type, err: BufferedReaderReadError(ReaderType)) ParserError(ReaderType) {
+    if (ReaderType.Error == error{}) {
+        return switch (err) {
+            error.EndOfStream => error.UnexpectedEof,
+            error.InvalidLineEnding => error.InvalidLineEnding,
+            error.LineTooLong => error.LineTooLong,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    }
+
+    return switch (err) {
+        error.EndOfStream => error.UnexpectedEof,
+        error.InvalidLineEnding => error.InvalidLineEnding,
+        error.LineTooLong => error.LineTooLong,
+        error.OutOfMemory => error.OutOfMemory,
+        else => |other| other,
+    };
+}
+
+const SlowReaderError = error{};
+
+pub fn ParserBodyState(comptime ReaderType: type) type {
+    return struct {
+        const Self = @This();
+        const BufferedReader = ParserBufferedReader(ReaderType);
+        const Error = ParserError(ReaderType);
+
+        allocator: std.mem.Allocator,
+        buffered: BufferedReader,
+        mode: BodyMode,
+        remaining: usize,
+        chunk_remaining: usize,
+        total_read: usize,
+        max_body_bytes: ?usize,
+        max_chunk_size: usize,
+        line_buffer: std.ArrayListUnmanaged(u8),
+        done: bool,
+
+        pub fn readBody(ctx: ?*anyopaque, dest: []u8) anyerror!usize {
+            const state: *Self = @ptrCast(@alignCast(ctx.?));
+            return state.read(dest);
+        }
+
+        pub fn closeBody(ctx: ?*anyopaque) void {
+            const state: *Self = @ptrCast(@alignCast(ctx.?));
+            state.line_buffer.deinit(state.allocator);
+            state.allocator.destroy(state);
+        }
+
+        fn read(self: *Self, dest: []u8) Error!usize {
+            switch (self.mode) {
+                .none => return 0,
+                .content_length => return self.readContentLength(dest),
+                .chunked => return self.readChunked(dest),
+                .close => return self.readUntilClose(dest),
+            }
+        }
+
+        fn readContentLength(self: *Self, dest: []u8) Error!usize {
+            if (self.remaining == 0) {
+                return 0;
+            }
+            const to_read = @min(dest.len, self.remaining);
+            const read_len = self.buffered.read(dest[0..to_read]) catch |err| {
+                return mapParserReadError(ReaderType, err);
+            };
+            if (read_len == 0) {
+                return error.UnexpectedEof;
+            }
+            self.remaining -= read_len;
+            try self.trackBody(read_len);
+            return read_len;
+        }
+
+        fn readUntilClose(self: *Self, dest: []u8) Error!usize {
+            const read_len = self.buffered.read(dest) catch |err| switch (err) {
+                error.EndOfStream => return 0,
+                else => return mapParserReadError(ReaderType, err),
+            };
+            if (read_len == 0) {
+                return 0;
+            }
+            try self.trackBody(read_len);
+            return read_len;
+        }
+
+        fn readChunked(self: *Self, dest: []u8) Error!usize {
+            if (self.done) {
+                return 0;
+            }
+            if (dest.len == 0) {
+                return 0;
+            }
+            if (self.chunk_remaining == 0) {
+                const next_size = try self.readChunkSize();
+                if (next_size == 0) {
+                    try self.readTrailers();
+                    self.done = true;
+                    return 0;
+                }
+                self.chunk_remaining = next_size;
+            }
+
+            const to_read = @min(dest.len, self.chunk_remaining);
+            const read_len = self.buffered.read(dest[0..to_read]) catch |err| {
+                return mapParserReadError(ReaderType, err);
+            };
+            if (read_len == 0) {
+                return error.UnexpectedEof;
+            }
+            self.chunk_remaining -= read_len;
+            try self.trackBody(read_len);
+
+            if (self.chunk_remaining == 0) {
+                try self.readChunkTerminator();
+            }
+
+            return read_len;
+        }
+
+        fn readChunkSize(self: *Self) Error!usize {
+            const line = self.buffered.readLine(
+                self.allocator,
+                &self.line_buffer,
+                self.max_chunk_size,
+            ) catch |err| {
+                return mapParserReadError(ReaderType, err);
+            };
+
+            const trimmed = std.mem.trim(u8, line, " \t");
+            if (trimmed.len == 0) {
+                return error.InvalidChunkSize;
+            }
+
+            var idx: usize = 0;
+            var size: usize = 0;
+            while (idx < trimmed.len) : (idx += 1) {
+                const byte = trimmed[idx];
+                const digit = hexValue(byte) orelse break;
+                size = (std.math.mul(usize, size, 16) catch return error.InvalidChunkSize) + digit;
+                if (size > self.max_chunk_size) {
+                    return error.BodyTooLarge;
+                }
+            }
+
+            if (idx == 0) {
+                return error.InvalidChunkSize;
+            }
+
+            if (idx < trimmed.len) {
+                const next = trimmed[idx];
+                if (next != ';' and next != ' ' and next != '\t') {
+                    return error.InvalidChunkSize;
+                }
+            }
+
+            return size;
+        }
+
+        fn readChunkTerminator(self: *Self) Error!void {
+            const cr = try self.readExactByte();
+            const lf = try self.readExactByte();
+            if (cr != '\r' or lf != '\n') {
+                return error.InvalidChunkTerminator;
+            }
+        }
+
+        fn readTrailers(self: *Self) Error!void {
+            while (true) {
+                const line = self.buffered.readLine(
+                    self.allocator,
+                    &self.line_buffer,
+                    self.max_chunk_size,
+                ) catch |err| {
+                    return mapParserReadError(ReaderType, err);
+                };
+                if (line.len == 0) {
+                    return;
+                }
+            }
+        }
+
+        fn readExactByte(self: *Self) Error!u8 {
+            return self.buffered.readByte() catch |err| {
+                return mapParserReadError(ReaderType, err);
+            };
+        }
+
+        fn trackBody(self: *Self, amount: usize) Error!void {
+            self.total_read += amount;
+            if (self.max_body_bytes) |limit| {
+                if (self.total_read > limit) {
+                    return error.BodyTooLarge;
+                }
+            }
+        }
+    };
+}
+
 /// Creates an HTTP/1.1 response parser for the provided reader type.
 pub fn ResponseParser(comptime ReaderType: type) type {
     return struct {
         const Self = @This();
 
         /// Error set returned by parsing operations.
-        pub const Error = ReaderType.Error || std.mem.Allocator.Error || error{
-            UnexpectedEof,
-            InvalidLineEnding,
-            LineTooLong,
-            InvalidStatusLine,
-            InvalidVersion,
-            InvalidStatusCode,
-            InvalidHeaderName,
-            InvalidHeaderValue,
-            HeaderTooLarge,
-            HeaderCountExceeded,
-            UnsupportedTransferEncoding,
-            DuplicateContentLength,
-            AmbiguousLength,
-            InvalidChunkSize,
-            InvalidChunkTerminator,
-            BodyTooLarge,
-            BodyLengthMismatch,
-        };
+        pub const Error = ParserError(ReaderType);
+        const BufferedReader = ParserBufferedReader(ReaderType);
+        const BodyState = ParserBodyState(ReaderType);
 
         /// Allocator used for header storage and parser state.
         allocator: std.mem.Allocator,
@@ -186,29 +528,9 @@ pub fn ResponseParser(comptime ReaderType: type) type {
             max_len: usize,
         ) Error![]const u8 {
             const line = buffered.readLine(self.allocator, line_buffer, max_len) catch |err| {
-                return mapReadError(err);
+                return mapParserReadError(ReaderType, err);
             };
             return line;
-        }
-
-        /// Maps buffered reader errors into parser errors.
-        fn mapReadError(err: BufferedReader.ReadError) Error {
-            if (ReaderType.Error == error{}) {
-                return switch (err) {
-                    error.EndOfStream => error.UnexpectedEof,
-                    error.InvalidLineEnding => error.InvalidLineEnding,
-                    error.LineTooLong => error.LineTooLong,
-                    error.OutOfMemory => error.OutOfMemory,
-                };
-            }
-
-            return switch (err) {
-                error.EndOfStream => error.UnexpectedEof,
-                error.InvalidLineEnding => error.InvalidLineEnding,
-                error.LineTooLong => error.LineTooLong,
-                error.OutOfMemory => error.OutOfMemory,
-                else => |other| other,
-            };
         }
 
         /// Creates a body reader based on the selected mode.
@@ -242,14 +564,6 @@ pub fn ResponseParser(comptime ReaderType: type) type {
                 .close_fn = BodyState.closeBody,
             };
         }
-
-        /// Parsed status line components.
-        const StatusLine = struct {
-            /// Parsed HTTP version.
-            version: types.Version,
-            /// Parsed status code.
-            status: types.Status,
-        };
 
         /// Parse the HTTP status line into version and status.
         fn parseStatusLine(line: []const u8) Error!StatusLine {
@@ -295,14 +609,6 @@ pub fn ResponseParser(comptime ReaderType: type) type {
             }
             return value;
         }
-
-        /// Parsed header name and value slices.
-        const HeaderLine = struct {
-            /// Header name bytes.
-            name: []const u8,
-            /// Header value bytes.
-            value: []const u8,
-        };
 
         /// Parses a header line into name and value.
         fn parseHeaderLine(line: []const u8) Error!HeaderLine {
@@ -425,328 +731,6 @@ pub fn ResponseParser(comptime ReaderType: type) type {
                 else => false,
             };
         }
-
-        /// Returns the numeric value of a hexadecimal digit or null.
-        fn hexValue(byte: u8) ?usize {
-            return switch (byte) {
-                '0'...'9' => byte - '0',
-                'a'...'f' => 10 + (byte - 'a'),
-                'A'...'F' => 10 + (byte - 'A'),
-                else => null,
-            };
-        }
-
-        /// Body transfer mode for response payloads.
-        const BodyMode = enum {
-            /// Response has no body.
-            none,
-            /// Content-Length delimited body.
-            content_length,
-            /// Chunked transfer encoding body.
-            chunked,
-            /// Body ends at connection close.
-            close,
-        };
-
-        /// Buffered reader wrapper for incremental parsing.
-        const BufferedReader = struct {
-            /// Underlying reader for input bytes.
-            reader: *ReaderType,
-            /// Buffer storage.
-            buffer: []u8,
-            /// Offset to the first unread byte.
-            start: usize,
-            /// Offset past the last buffered byte.
-            end: usize,
-
-            /// Error set returned by buffered reads.
-            pub const ReadError = ReaderType.Error || std.mem.Allocator.Error || error{
-                EndOfStream,
-                InvalidLineEnding,
-                LineTooLong,
-            };
-
-            /// Initializes a buffered reader with the provided state.
-            pub fn init(
-                reader: *ReaderType,
-                buffer: []u8,
-                start: usize,
-                end: usize,
-            ) BufferedReader {
-                return .{
-                    .reader = reader,
-                    .buffer = buffer,
-                    .start = start,
-                    .end = end,
-                };
-            }
-
-            /// Reads a single byte from the buffer or underlying reader.
-            pub fn readByte(self: *BufferedReader) ReadError!u8 {
-                if (self.start == self.end) {
-                    try self.fill();
-                }
-                const byte = self.buffer[self.start];
-                self.start += 1;
-                return byte;
-            }
-
-            /// Reads up to `dest.len` bytes into `dest`.
-            pub fn read(self: *BufferedReader, dest: []u8) ReadError!usize {
-                if (dest.len == 0) {
-                    return 0;
-                }
-                if (self.start < self.end) {
-                    const available = self.end - self.start;
-                    const to_copy = @min(dest.len, available);
-                    @memcpy(dest[0..to_copy], self.buffer[self.start..][0..to_copy]);
-                    self.start += to_copy;
-                    return to_copy;
-                }
-
-                const read_len = try self.reader.read(dest);
-                if (read_len == 0) {
-                    return error.EndOfStream;
-                }
-                return read_len;
-            }
-
-            /// Reads a CRLF-terminated line into `line_buffer`.
-            pub fn readLine(
-                self: *BufferedReader,
-                allocator: std.mem.Allocator,
-                line_buffer: *std.ArrayListUnmanaged(u8),
-                max_len: usize,
-            ) ReadError![]const u8 {
-                line_buffer.clearRetainingCapacity();
-                var saw_cr = false;
-                while (true) {
-                    const byte = try self.readByte();
-                    if (saw_cr) {
-                        if (byte != '\n') {
-                            return error.InvalidLineEnding;
-                        }
-                        return line_buffer.items;
-                    }
-                    if (byte == '\r') {
-                        saw_cr = true;
-                        continue;
-                    }
-                    if (byte == '\n') {
-                        return error.InvalidLineEnding;
-                    }
-                    try line_buffer.append(allocator, byte);
-                    if (line_buffer.items.len > max_len) {
-                        return error.LineTooLong;
-                    }
-                }
-            }
-
-            /// Refills the buffer from the underlying reader.
-            fn fill(self: *BufferedReader) ReadError!void {
-                self.start = 0;
-                self.end = 0;
-                const read_len = try self.reader.read(self.buffer);
-                if (read_len == 0) {
-                    return error.EndOfStream;
-                }
-                self.end = read_len;
-            }
-        };
-
-        /// State for response body streaming.
-        const BodyState = struct {
-            /// Allocator used for internal buffers.
-            allocator: std.mem.Allocator,
-            /// Buffered reader for body bytes.
-            buffered: BufferedReader,
-            /// Selected body mode.
-            mode: BodyMode,
-            /// Remaining bytes in content-length mode.
-            remaining: usize,
-            /// Remaining bytes in the current chunk.
-            chunk_remaining: usize,
-            /// Total bytes read from the body.
-            total_read: usize,
-            /// Maximum total body bytes, or null for unlimited.
-            max_body_bytes: ?usize,
-            /// Maximum chunk size in bytes.
-            max_chunk_size: usize,
-            /// Buffer for chunk lines.
-            line_buffer: std.ArrayListUnmanaged(u8),
-            /// Indicates the chunked body is complete.
-            done: bool,
-
-            /// Reads body bytes into `dest`.
-            pub fn readBody(ctx: ?*anyopaque, dest: []u8) anyerror!usize {
-                const state: *BodyState = @ptrCast(@alignCast(ctx.?));
-                return state.read(dest);
-            }
-
-            /// Releases internal resources.
-            pub fn closeBody(ctx: ?*anyopaque) void {
-                const state: *BodyState = @ptrCast(@alignCast(ctx.?));
-                state.line_buffer.deinit(state.allocator);
-                state.allocator.destroy(state);
-            }
-
-            /// Reads body bytes according to the selected transfer mode.
-            fn read(self: *BodyState, dest: []u8) Error!usize {
-                switch (self.mode) {
-                    .none => return 0,
-                    .content_length => return self.readContentLength(dest),
-                    .chunked => return self.readChunked(dest),
-                    .close => return self.readUntilClose(dest),
-                }
-            }
-
-            /// Reads content-length delimited data.
-            fn readContentLength(self: *BodyState, dest: []u8) Error!usize {
-                if (self.remaining == 0) {
-                    return 0;
-                }
-                const to_read = @min(dest.len, self.remaining);
-                const read_len = self.buffered.read(dest[0..to_read]) catch |err| {
-                    return mapReadError(err);
-                };
-                if (read_len == 0) {
-                    return error.UnexpectedEof;
-                }
-                self.remaining -= read_len;
-                try self.trackBody(read_len);
-                return read_len;
-            }
-
-            /// Reads until the stream closes.
-            fn readUntilClose(self: *BodyState, dest: []u8) Error!usize {
-                const read_len = self.buffered.read(dest) catch |err| switch (err) {
-                    error.EndOfStream => return 0,
-                    else => return mapReadError(err),
-                };
-                if (read_len == 0) {
-                    return 0;
-                }
-                try self.trackBody(read_len);
-                return read_len;
-            }
-
-            /// Reads chunked transfer encoding data.
-            fn readChunked(self: *BodyState, dest: []u8) Error!usize {
-                if (self.done) {
-                    return 0;
-                }
-                if (dest.len == 0) {
-                    return 0;
-                }
-                if (self.chunk_remaining == 0) {
-                    const next_size = try self.readChunkSize();
-                    if (next_size == 0) {
-                        try self.readTrailers();
-                        self.done = true;
-                        return 0;
-                    }
-                    self.chunk_remaining = next_size;
-                }
-
-                const to_read = @min(dest.len, self.chunk_remaining);
-                const read_len = self.buffered.read(dest[0..to_read]) catch |err| {
-                    return mapReadError(err);
-                };
-                if (read_len == 0) {
-                    return error.UnexpectedEof;
-                }
-                self.chunk_remaining -= read_len;
-                try self.trackBody(read_len);
-
-                if (self.chunk_remaining == 0) {
-                    try self.readChunkTerminator();
-                }
-
-                return read_len;
-            }
-
-            /// Reads and parses the next chunk size line.
-            fn readChunkSize(self: *BodyState) Error!usize {
-                const line = self.buffered.readLine(
-                    self.allocator,
-                    &self.line_buffer,
-                    self.max_chunk_size,
-                ) catch |err| {
-                    return mapReadError(err);
-                };
-
-                const trimmed = std.mem.trim(u8, line, " \t");
-                if (trimmed.len == 0) {
-                    return error.InvalidChunkSize;
-                }
-
-                var idx: usize = 0;
-                var size: usize = 0;
-                while (idx < trimmed.len) : (idx += 1) {
-                    const byte = trimmed[idx];
-                    const digit = hexValue(byte) orelse break;
-                    size = (std.math.mul(usize, size, 16) catch return error.InvalidChunkSize) + digit;
-                    if (size > self.max_chunk_size) {
-                        return error.BodyTooLarge;
-                    }
-                }
-
-                if (idx == 0) {
-                    return error.InvalidChunkSize;
-                }
-
-                if (idx < trimmed.len) {
-                    const next = trimmed[idx];
-                    if (next != ';' and next != ' ' and next != '\t') {
-                        return error.InvalidChunkSize;
-                    }
-                }
-
-                return size;
-            }
-
-            /// Reads the trailing CRLF after a chunk.
-            fn readChunkTerminator(self: *BodyState) Error!void {
-                const cr = try self.readExactByte();
-                const lf = try self.readExactByte();
-                if (cr != '\r' or lf != '\n') {
-                    return error.InvalidChunkTerminator;
-                }
-            }
-
-            /// Reads trailer headers until the empty line.
-            fn readTrailers(self: *BodyState) Error!void {
-                while (true) {
-                    const line = self.buffered.readLine(
-                        self.allocator,
-                        &self.line_buffer,
-                        self.max_chunk_size,
-                    ) catch |err| {
-                        return mapReadError(err);
-                    };
-                    if (line.len == 0) {
-                        return;
-                    }
-                }
-            }
-
-            /// Reads a single byte or returns UnexpectedEof.
-            fn readExactByte(self: *BodyState) Error!u8 {
-                return self.buffered.readByte() catch |err| {
-                    return mapReadError(err);
-                };
-            }
-
-            /// Tracks body bytes against the configured limit.
-            fn trackBody(self: *BodyState, amount: usize) Error!void {
-                self.total_read += amount;
-                if (self.max_body_bytes) |limit| {
-                    if (self.total_read > limit) {
-                        return error.BodyTooLarge;
-                    }
-                }
-            }
-        };
     };
 }
 
@@ -760,7 +744,7 @@ const SlowReader = struct {
     max_chunk: usize,
 
     /// Error set for SlowReader reads.
-    pub const Error = error{};
+    pub const Error = SlowReaderError;
 
     /// Creates a slow reader for the provided data.
     pub fn init(data: []const u8, max_chunk: usize) SlowReader {

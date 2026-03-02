@@ -102,7 +102,7 @@ const Cli = struct {
             return;
         }
 
-        const request_args = self.parseRequestArgs(args) catch |err| {
+        var request_args = self.parseRequestArgs(args) catch |err| {
             try self.err.print("zttp request: {s}\n", .{@errorName(err)});
             return error.InvalidArguments;
         };
@@ -113,7 +113,7 @@ const Cli = struct {
             return error.InvalidArguments;
         };
 
-        var client = zttp.Client.init(self.allocator, zttp.Client.Options.default());
+        var client = zttp.Client.init(self.allocator, zttp.ClientOptions.default());
         defer client.deinit();
 
         const uri = zttp.Uri.init(
@@ -355,6 +355,8 @@ const Cli = struct {
 
     /// Error set returned by argument parsing.
     const RequestArgsError = error{
+        /// Memory allocation failed while collecting arguments.
+        OutOfMemory,
         /// A required URL argument was missing.
         MissingUrl,
         /// A flag value was missing.

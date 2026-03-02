@@ -2,17 +2,24 @@
 
 const std = @import("std");
 
+/// Error set returned by `send`.
+pub const MailboxSendError = error{Closed} || std.mem.Allocator.Error;
+/// Error set returned by `recv`.
+pub const MailboxRecvError = error{Closed};
+/// Error set returned by `timedRecv`.
+pub const MailboxTimedRecvError = error{ Closed, Timeout };
+
 /// Provides a thread-safe FIFO mailbox for values of type `T`.
 pub fn Mailbox(comptime T: type) type {
     return struct {
         const Self = @This();
 
         /// Error set returned by `send`.
-        pub const SendError = error{Closed} || std.mem.Allocator.Error;
+        pub const SendError = MailboxSendError;
         /// Error set returned by `recv`.
-        pub const RecvError = error{Closed};
+        pub const RecvError = MailboxRecvError;
         /// Error set returned by `timedRecv`.
-        pub const TimedRecvError = error{Closed, Timeout};
+        pub const TimedRecvError = MailboxTimedRecvError;
 
         /// Allocator used for queue storage.
         allocator: std.mem.Allocator,
@@ -46,7 +53,7 @@ pub fn Mailbox(comptime T: type) type {
         }
 
         /// Adds an item to the mailbox.
-        pub fn send(self: *Self, item: T) SendError!void {
+        pub fn send(self: *Self, item: T) MailboxSendError!void {
             self.mutex.lock();
             defer self.mutex.unlock();
 
@@ -59,7 +66,7 @@ pub fn Mailbox(comptime T: type) type {
         }
 
         /// Receives the next item, blocking until one is available or the mailbox is closed.
-        pub fn recv(self: *Self) RecvError!T {
+        pub fn recv(self: *Self) MailboxRecvError!T {
             self.mutex.lock();
             defer self.mutex.unlock();
 
@@ -74,7 +81,7 @@ pub fn Mailbox(comptime T: type) type {
         }
 
         /// Receives the next item or returns `error.Timeout` after `timeout_ns` nanoseconds.
-        pub fn timedRecv(self: *Self, timeout_ns: u64) TimedRecvError!T {
+        pub fn timedRecv(self: *Self, timeout_ns: u64) MailboxTimedRecvError!T {
             const deadline = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ns));
 
             self.mutex.lock();

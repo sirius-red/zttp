@@ -2,6 +2,11 @@
 
 const std = @import("std");
 
+/// Error set returned by `init`.
+pub const InitError = std.mem.Allocator.Error || error{InvalidCapacity};
+/// Error set returned by `writeAll`.
+pub const WriteError = error{ReaderClosed};
+
 /// Provides a bounded byte pipe with one writer and one reader.
 pub const BodyPipe = struct {
     /// Allocator used for buffer storage and object lifetime.
@@ -24,11 +29,6 @@ pub const BodyPipe = struct {
     pending_error: ?anyerror,
     /// Reference count for reader and writer lifetimes.
     ref_count: std.atomic.Value(u8),
-
-    /// Error set returned by `init`.
-    pub const InitError = std.mem.Allocator.Error || error{InvalidCapacity};
-    /// Error set returned by `writeAll`.
-    pub const WriteError = error{ReaderClosed};
 
     /// Allocates a new pipe with the requested capacity in bytes.
     pub fn init(allocator: std.mem.Allocator, capacity: usize) InitError!*BodyPipe {

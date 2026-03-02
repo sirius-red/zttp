@@ -11,26 +11,126 @@ pub const RequestTargetMode = enum {
     absolute_form,
 };
 
+const root = @This();
+
+/// Body transfer mode for encoded requests.
+pub const BodyMode = enum {
+    /// No body is allowed.
+    none,
+    /// Content-Length is enforced.
+    content_length,
+    /// Chunked transfer encoding is used.
+    chunked,
+};
+
+/// Parsed header metadata.
+const HeaderInfo = struct {
+    /// Selected body mode.
+    mode: BodyMode,
+    /// Parsed content length when present.
+    content_length: usize,
+};
+
+/// Error set returned by request encoding operations.
+pub fn EncoderError(comptime WriterType: type) type {
+    return WriterType.Error || std.fmt.BufPrintError || error{
+        InvalidMethod,
+        InvalidVersion,
+        InvalidRequestTarget,
+        InvalidHeaderName,
+        InvalidHeaderValue,
+        UnsupportedTransferEncoding,
+        MissingContentLength,
+        AmbiguousLength,
+        DuplicateContentLength,
+        BodyTooLarge,
+        BodyLengthMismatch,
+        BodyClosed,
+    };
+}
+
+/// Streaming body writer for request payloads.
+pub fn RequestBodyWriter(comptime WriterType: type) type {
+    return struct {
+        /// Underlying writer for body bytes.
+        writer: *WriterType,
+        /// Body transfer mode.
+        mode: BodyMode,
+        /// Remaining bytes for content-length mode.
+        remaining: usize,
+        /// Indicates the body has been finalized.
+        finalized: bool,
+
+        const Error = EncoderError(WriterType);
+
+        /// Writes the provided bytes to the request body.
+        pub fn writeAll(self: *@This(), bytes: []const u8) Error!void {
+            if (self.finalized) {
+                return error.BodyClosed;
+            }
+
+            switch (self.mode) {
+                .none => return error.BodyTooLarge,
+                .content_length => {
+                    if (bytes.len > self.remaining) {
+                        return error.BodyTooLarge;
+                    }
+                    if (bytes.len == 0) {
+                        return;
+                    }
+                    try self.writer.writeAll(bytes);
+                    self.remaining -= bytes.len;
+                },
+                .chunked => try writeChunk(self, bytes),
+            }
+        }
+
+        /// Flushes the body writer and finalizes chunked encoding if used.
+        pub fn flush(self: *@This()) Error!void {
+            if (self.finalized) {
+                return;
+            }
+
+            switch (self.mode) {
+                .none => {},
+                .content_length => {
+                    if (self.remaining != 0) {
+                        return error.BodyLengthMismatch;
+                    }
+                },
+                .chunked => {
+                    try self.writer.writeAll("0\r\n\r\n");
+                },
+            }
+
+            self.finalized = true;
+        }
+
+        /// Writes a single chunk in chunked transfer encoding.
+        fn writeChunk(self: *@This(), bytes: []const u8) Error!void {
+            if (bytes.len == 0) {
+                return;
+            }
+
+            var header_buf: [32]u8 = undefined;
+            const header = try std.fmt.bufPrint(&header_buf, "{x}\r\n", .{bytes.len});
+            try self.writer.writeAll(header);
+            try self.writer.writeAll(bytes);
+            try self.writer.writeAll("\r\n");
+        }
+    };
+}
+
 /// Creates an HTTP/1.1 request encoder for the provided writer type.
 pub fn RequestEncoder(comptime WriterType: type) type {
     return struct {
         const Self = @This();
 
         /// Error set returned by request encoding operations.
-        pub const Error = WriterType.Error || std.fmt.BufPrintError || error{
-            InvalidMethod,
-            InvalidVersion,
-            InvalidRequestTarget,
-            InvalidHeaderName,
-            InvalidHeaderValue,
-            UnsupportedTransferEncoding,
-            MissingContentLength,
-            AmbiguousLength,
-            DuplicateContentLength,
-            BodyTooLarge,
-            BodyLengthMismatch,
-            BodyClosed,
-        };
+        pub const Error = EncoderError(WriterType);
+
+        /// Streaming body writer for request payloads.
+        pub const BodyWriter = RequestBodyWriter(WriterType);
 
         /// Encoder output writer.
         writer: *WriterType,
@@ -39,74 +139,6 @@ pub fn RequestEncoder(comptime WriterType: type) type {
         pub fn init(writer: *WriterType) Self {
             return .{ .writer = writer };
         }
-
-        /// Streaming body writer for request payloads.
-        pub const BodyWriter = struct {
-            /// Underlying writer for body bytes.
-            writer: *WriterType,
-            /// Body transfer mode.
-            mode: BodyMode,
-            /// Remaining bytes for content-length mode.
-            remaining: usize,
-            /// Indicates the body has been finalized.
-            finalized: bool,
-
-            /// Writes the provided bytes to the request body.
-            pub fn writeAll(self: *BodyWriter, bytes: []const u8) Error!void {
-                if (self.finalized) {
-                    return error.BodyClosed;
-                }
-
-                switch (self.mode) {
-                    .none => return error.BodyTooLarge,
-                    .content_length => {
-                        if (bytes.len > self.remaining) {
-                            return error.BodyTooLarge;
-                        }
-                        if (bytes.len == 0) {
-                            return;
-                        }
-                        try self.writer.writeAll(bytes);
-                        self.remaining -= bytes.len;
-                    },
-                    .chunked => try writeChunk(self, bytes),
-                }
-            }
-
-            /// Flushes the body writer and finalizes chunked encoding if used.
-            pub fn flush(self: *BodyWriter) Error!void {
-                if (self.finalized) {
-                    return;
-                }
-
-                switch (self.mode) {
-                    .none => {},
-                    .content_length => {
-                        if (self.remaining != 0) {
-                            return error.BodyLengthMismatch;
-                        }
-                    },
-                    .chunked => {
-                        try self.writer.writeAll("0\r\n\r\n");
-                    },
-                }
-
-                self.finalized = true;
-            }
-
-            /// Writes a single chunk in chunked transfer encoding.
-            fn writeChunk(self: *BodyWriter, bytes: []const u8) Error!void {
-                if (bytes.len == 0) {
-                    return;
-                }
-
-                var header_buf: [32]u8 = undefined;
-                const header = try std.fmt.bufPrint(&header_buf, "{x}\r\n", .{bytes.len});
-                try self.writer.writeAll(header);
-                try self.writer.writeAll(bytes);
-                try self.writer.writeAll("\r\n");
-            }
-        };
 
         /// Encodes the request line and headers, returning a body writer.
         pub fn writeRequest(
@@ -145,24 +177,6 @@ pub fn RequestEncoder(comptime WriterType: type) type {
                 .finalized = false,
             };
         }
-
-        /// Body transfer mode for encoded requests.
-        const BodyMode = enum {
-            /// No body is allowed.
-            none,
-            /// Content-Length is enforced.
-            content_length,
-            /// Chunked transfer encoding is used.
-            chunked,
-        };
-
-        /// Parsed header metadata.
-        const HeaderInfo = struct {
-            /// Selected body mode.
-            mode: BodyMode,
-            /// Parsed content length when present.
-            content_length: usize,
-        };
 
         /// Parses headers to determine transfer mode and validate bytes.
         fn analyzeHeaders(headers: *const types.Headers) Error!HeaderInfo {
@@ -255,7 +269,7 @@ pub fn RequestEncoder(comptime WriterType: type) type {
         }
 
         /// Writes a header line with canonicalized name.
-        fn writeHeader(writer: *WriterType, header: types.Headers.Header) Error!void {
+        fn writeHeader(writer: *WriterType, header: types.Header) Error!void {
             try writeHeaderName(writer, header.name);
             try writer.writeAll(": ");
             try writer.writeAll(header.value);
@@ -594,6 +608,6 @@ test "request encoder rejects missing content length for body" {
 }
 
 /// Returns end-of-stream without producing data.
-fn readNoop(_: ?*anyopaque, _: []u8) types.BodyReader.ReadError!usize {
+fn readNoop(_: ?*anyopaque, _: []u8) types.BodyReaderReadError!usize {
     return 0;
 }

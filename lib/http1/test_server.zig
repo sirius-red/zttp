@@ -72,6 +72,19 @@ pub const Options = struct {
     }
 };
 
+/// Error set returned by `start`.
+pub const StartError = error{AlreadyStarted} || std.Thread.SpawnError;
+
+/// Error set returned by request header reads.
+pub const ReadRequestError = std.net.Stream.ReadError || error{
+    LimitExceeded,
+    EndOfStream,
+    MissingExpectedBytes,
+};
+
+/// Error set returned by response writes.
+pub const WriteResponseError = std.net.Stream.WriteError || std.fmt.BufPrintError;
+
 /// HTTP/1.1 test server harness.
 pub const TestServer = struct {
     /// Listening server socket.
@@ -82,9 +95,6 @@ pub const TestServer = struct {
     options: Options,
     /// Background thread running the accept loop.
     thread: ?std.Thread,
-
-    /// Error set returned by `start`.
-    pub const StartError = error{AlreadyStarted} || std.Thread.SpawnError;
 
     /// Creates a test server bound to the provided address.
     pub fn init(scenarios: []const Scenario, options: Options) !TestServer {
@@ -178,13 +188,6 @@ pub const TestServer = struct {
         }
     }
 
-    /// Error set returned by request header reads.
-    pub const ReadRequestError = std.net.Stream.ReadError || error{
-        LimitExceeded,
-        EndOfStream,
-        MissingExpectedBytes,
-    };
-
     /// Reads request headers until the header terminator is reached.
     fn readRequestHeaders(
         stream: std.net.Stream,
@@ -239,9 +242,6 @@ pub const TestServer = struct {
             }
         }
     }
-
-    /// Error set returned by response writes.
-    pub const WriteResponseError = std.net.Stream.WriteError || std.fmt.BufPrintError;
 
     /// Writes a structured response to the stream.
     fn writeResponse(

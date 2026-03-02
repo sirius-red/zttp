@@ -9,6 +9,186 @@ const body_pipe = @import("../util/body_pipe.zig");
 const request_encoder = @import("request_encoder.zig");
 const response_parser = @import("response_parser.zig");
 
+/// Error set returned by connection operations.
+pub const Error = error{
+    /// Operation exceeded a timeout.
+    Timeout,
+    /// URI is invalid or unsupported.
+    InvalidUri,
+    /// Transport failure (DNS/TCP).
+    Transport,
+    /// Proxy CONNECT request failed.
+    ProxyConnectFailed,
+    /// Protocol violation or malformed data.
+    Protocol,
+    /// Configured limit was exceeded.
+    LimitExceeded,
+    /// Operation was canceled.
+    Canceled,
+    /// Allocation failed.
+    OutOfMemory,
+};
+
+/// Future type for HTTP/1.1 responses.
+pub const ResponseFuture = future.RequestFuture(types.Response, Error);
+
+/// Connection target information.
+pub const Origin = struct {
+    /// Scheme used for the TCP connection.
+    scheme: types.Scheme,
+    /// Hostname or IP literal to connect to.
+    host: []const u8,
+    /// Port to connect to.
+    port: types.Port,
+    /// Request target mode used for this connection.
+    target_mode: request_encoder.RequestTargetMode,
+    /// Tunnel target to CONNECT through a proxy, if any.
+    tunnel: ?TunnelTarget,
+    /// Proxy-Authorization header value for CONNECT, if any.
+    proxy_authorization: ?[]const u8,
+};
+
+/// Target host and port for CONNECT tunnels.
+pub const TunnelTarget = struct {
+    /// Hostname or IP literal for the tunnel target.
+    host: []const u8,
+    /// Port for the tunnel target.
+    port: types.Port,
+};
+
+/// Connection configuration options.
+pub const Options = struct {
+    /// Connection timeout in nanoseconds.
+    connect_timeout_ns: ?u64,
+    /// Write timeout in nanoseconds.
+    write_timeout_ns: ?u64,
+    /// Read timeout in nanoseconds.
+    read_timeout_ns: ?u64,
+    /// Total request timeout in nanoseconds.
+    request_timeout_ns: ?u64,
+    /// Maximum total header bytes.
+    max_header_bytes: usize,
+    /// Maximum number of header fields.
+    max_header_count: usize,
+    /// Maximum length of the status line in bytes.
+    max_status_line_bytes: usize,
+    /// Maximum total response body bytes, or null for unlimited.
+    max_body_bytes: ?usize,
+    /// Maximum chunk size in bytes.
+    max_chunk_size: usize,
+    /// Buffer size for socket reads.
+    io_buffer_bytes: usize,
+    /// Buffer size for response body streaming.
+    body_buffer_bytes: usize,
+
+    /// Returns default connection options.
+    pub fn default() Options {
+        const limits = response_parser.Limits.default();
+        return .{
+            .connect_timeout_ns = null,
+            .write_timeout_ns = null,
+            .read_timeout_ns = null,
+            .request_timeout_ns = null,
+            .max_header_bytes = limits.max_header_bytes,
+            .max_header_count = limits.max_header_count,
+            .max_status_line_bytes = limits.max_status_line_bytes,
+            .max_body_bytes = limits.max_body_bytes,
+            .max_chunk_size = limits.max_chunk_size,
+            .io_buffer_bytes = 16 * 1024,
+            .body_buffer_bytes = 64 * 1024,
+        };
+    }
+};
+
+/// Error set returned by `start`.
+pub const StartError = error{AlreadyStarted} || std.Thread.SpawnError;
+
+/// Error set returned by `submit`.
+pub const SubmitError = Mailbox.SendError || error{NotStarted};
+
+/// Command mailbox type.
+const Mailbox = mailbox.Mailbox(Command);
+
+/// Command payloads handled by the connection thread.
+const Command = union(enum) {
+    /// Execute a request.
+    request: RequestCommand,
+    /// Shutdown command.
+    shutdown: void,
+};
+
+/// Request command payload.
+const RequestCommand = struct {
+    /// Request to execute.
+    request: *const types.Request,
+    /// Completion handle for the response.
+    completion: ResponseFuture.Completion,
+};
+
+/// Parsed response and optional body reader for forwarding.
+const ResponseInfo = struct {
+    /// Parsed response headers and metadata.
+    response: types.Response,
+    /// Body reader sourced from the socket.
+    body: ?types.BodyReader,
+};
+
+/// Error set returned while parsing CONNECT responses.
+const ConnectResponseError = StreamReader.Error || std.mem.Allocator.Error || error{
+    UnexpectedEof,
+    InvalidLineEnding,
+    LineTooLong,
+    InvalidStatusLine,
+    InvalidStatusCode,
+    InvalidVersion,
+    HeaderTooLarge,
+    HeaderCountExceeded,
+};
+
+/// Reader wrapper for raw stream reads.
+const StreamReader = struct {
+    /// Stream handle for reading.
+    stream: *std.net.Stream,
+
+    /// Error set returned by stream reads.
+    pub const Error = std.net.Stream.ReadError;
+
+    /// Initializes a reader for the provided stream.
+    pub fn init(stream: *std.net.Stream) StreamReader {
+        return .{ .stream = stream };
+    }
+
+    /// Reads bytes from the underlying stream.
+    pub fn read(self: *StreamReader, dest: []u8) StreamReader.Error!usize {
+        return self.stream.read(dest);
+    }
+};
+
+/// Writer wrapper for raw stream writes.
+const StreamWriter = struct {
+    /// Stream handle for writing.
+    stream: *std.net.Stream,
+
+    /// Error set returned by stream writes.
+    pub const Error = std.net.Stream.WriteError;
+
+    /// Initializes a writer for the provided stream.
+    pub fn init(stream: *std.net.Stream) StreamWriter {
+        return .{ .stream = stream };
+    }
+
+    /// Writes all bytes to the underlying stream.
+    pub fn writeAll(self: *StreamWriter, bytes: []const u8) StreamWriter.Error!void {
+        try self.stream.writeAll(bytes);
+    }
+
+    /// Writes a single byte to the underlying stream.
+    pub fn writeByte(self: *StreamWriter, byte: u8) StreamWriter.Error!void {
+        var buf: [1]u8 = .{byte};
+        try self.stream.writeAll(&buf);
+    }
+};
+
 /// HTTP/1.1 connection implementation backed by a dedicated thread.
 pub const ConnectionH1 = struct {
     /// Allocator used for per-request allocations.
@@ -25,102 +205,6 @@ pub const ConnectionH1 = struct {
     stream: ?std.net.Stream,
     /// Indicates whether a CONNECT tunnel is established.
     tunnel_established: bool,
-
-    /// Error set returned by connection operations.
-    pub const Error = error{
-        /// Operation exceeded a timeout.
-        Timeout,
-        /// URI is invalid or unsupported.
-        InvalidUri,
-        /// Transport failure (DNS/TCP).
-        Transport,
-        /// Proxy CONNECT request failed.
-        ProxyConnectFailed,
-        /// Protocol violation or malformed data.
-        Protocol,
-        /// Configured limit was exceeded.
-        LimitExceeded,
-        /// Operation was canceled.
-        Canceled,
-        /// Allocation failed.
-        OutOfMemory,
-    };
-
-    /// Future type for HTTP/1.1 responses.
-    pub const ResponseFuture = future.RequestFuture(types.Response, Error);
-
-    /// Connection target information.
-    pub const Origin = struct {
-        /// Scheme used for the TCP connection.
-        scheme: types.Scheme,
-        /// Hostname or IP literal to connect to.
-        host: []const u8,
-        /// Port to connect to.
-        port: types.Port,
-        /// Request target mode used for this connection.
-        target_mode: request_encoder.RequestTargetMode,
-        /// Tunnel target to CONNECT through a proxy, if any.
-        tunnel: ?TunnelTarget,
-        /// Proxy-Authorization header value for CONNECT, if any.
-        proxy_authorization: ?[]const u8,
-    };
-
-    /// Target host and port for CONNECT tunnels.
-    pub const TunnelTarget = struct {
-        /// Hostname or IP literal for the tunnel target.
-        host: []const u8,
-        /// Port for the tunnel target.
-        port: types.Port,
-    };
-
-    /// Connection configuration options.
-    pub const Options = struct {
-        /// Connection timeout in nanoseconds.
-        connect_timeout_ns: ?u64,
-        /// Write timeout in nanoseconds.
-        write_timeout_ns: ?u64,
-        /// Read timeout in nanoseconds.
-        read_timeout_ns: ?u64,
-        /// Total request timeout in nanoseconds.
-        request_timeout_ns: ?u64,
-        /// Maximum total header bytes.
-        max_header_bytes: usize,
-        /// Maximum number of header fields.
-        max_header_count: usize,
-        /// Maximum length of the status line in bytes.
-        max_status_line_bytes: usize,
-        /// Maximum total response body bytes, or null for unlimited.
-        max_body_bytes: ?usize,
-        /// Maximum chunk size in bytes.
-        max_chunk_size: usize,
-        /// Buffer size for socket reads.
-        io_buffer_bytes: usize,
-        /// Buffer size for response body streaming.
-        body_buffer_bytes: usize,
-
-        /// Returns default connection options.
-        pub fn default() Options {
-            const limits = response_parser.Limits.default();
-            return .{
-                .connect_timeout_ns = null,
-                .write_timeout_ns = null,
-                .read_timeout_ns = null,
-                .request_timeout_ns = null,
-                .max_header_bytes = limits.max_header_bytes,
-                .max_header_count = limits.max_header_count,
-                .max_status_line_bytes = limits.max_status_line_bytes,
-                .max_body_bytes = limits.max_body_bytes,
-                .max_chunk_size = limits.max_chunk_size,
-                .io_buffer_bytes = 16 * 1024,
-                .body_buffer_bytes = 64 * 1024,
-            };
-        }
-    };
-
-    /// Error set returned by `start`.
-    pub const StartError = error{AlreadyStarted} || std.Thread.SpawnError;
-    /// Error set returned by `submit`.
-    pub const SubmitError = Mailbox.SendError || error{NotStarted};
 
     /// Initializes a connection without starting the background thread.
     pub fn init(allocator: std.mem.Allocator, origin: Origin, options: Options) ConnectionH1 {
@@ -165,25 +249,6 @@ pub const ConnectionH1 = struct {
         self.mailbox.deinit();
         self.closeStream();
     }
-
-    /// Command mailbox type.
-    const Mailbox = mailbox.Mailbox(Command);
-
-    /// Command payloads handled by the connection thread.
-    const Command = union(enum) {
-        /// Execute a request.
-        request: RequestCommand,
-        /// Shutdown command.
-        shutdown: void,
-    };
-
-    /// Request command payload.
-    const RequestCommand = struct {
-        /// Request to execute.
-        request: *const types.Request,
-        /// Completion handle for the response.
-        completion: ResponseFuture.Completion,
-    };
 
     /// Runs the connection loop until the mailbox is closed.
     fn run(self: *ConnectionH1) void {
@@ -335,14 +400,6 @@ pub const ConnectionH1 = struct {
         try self.sendRequest(request, request_start);
         return self.readResponse(request_start);
     }
-
-    /// Parsed response and optional body reader for forwarding.
-    const ResponseInfo = struct {
-        /// Parsed response headers and metadata.
-        response: types.Response,
-        /// Body reader sourced from the socket.
-        body: ?types.BodyReader,
-    };
 
     /// Validates the request against the connection origin.
     fn validateRequest(self: *ConnectionH1, request: *const types.Request) Error!void {
@@ -510,18 +567,6 @@ pub const ConnectionH1 = struct {
 
         return status_code;
     }
-
-    /// Error set returned while parsing CONNECT responses.
-    const ConnectResponseError = StreamReader.Error || std.mem.Allocator.Error || error{
-        UnexpectedEof,
-        InvalidLineEnding,
-        LineTooLong,
-        InvalidStatusLine,
-        InvalidStatusCode,
-        InvalidVersion,
-        HeaderTooLarge,
-        HeaderCountExceeded,
-    };
 
     /// Reads a CRLF-terminated line from the stream.
     fn readConnectLine(
@@ -704,8 +749,8 @@ pub const ConnectionH1 = struct {
         }
 
         var tv = std.posix.timeval{
-            .tv_sec = @intCast(timeout_ns / std.time.ns_per_s),
-            .tv_usec = @intCast((timeout_ns % std.time.ns_per_s) / std.time.ns_per_us),
+            .sec = @intCast(timeout_ns / std.time.ns_per_s),
+            .usec = @intCast((timeout_ns % std.time.ns_per_s) / std.time.ns_per_us),
         };
         try std.posix.setsockopt(socket, std.posix.SOL.SOCKET, opt, std.mem.asBytes(&tv));
     }
@@ -747,7 +792,7 @@ pub const ConnectionH1 = struct {
     }
 
     /// Maps pipe initialization errors into connection errors.
-    fn mapPipeInitError(err: body_pipe.BodyPipe.InitError) Error {
+    fn mapPipeInitError(err: body_pipe.InitError) Error {
         return switch (err) {
             error.InvalidCapacity => error.LimitExceeded,
             error.OutOfMemory => error.OutOfMemory,
@@ -808,55 +853,10 @@ pub const ConnectionH1 = struct {
             error.ConnectionTimedOut,
             error.WouldBlock,
             => error.Timeout,
-            error.Canceled => error.Canceled,
-            else => error.Protocol,
+            else => error.Transport,
         };
     }
-
-    /// Reader wrapper for raw stream reads.
-    const StreamReader = struct {
-        /// Stream handle for reading.
-        stream: *std.net.Stream,
-
-        /// Error set returned by stream reads.
-        pub const Error = std.net.Stream.ReadError;
-
-        /// Initializes a reader for the provided stream.
-        pub fn init(stream: *std.net.Stream) StreamReader {
-            return .{ .stream = stream };
-        }
-
-        /// Reads bytes from the underlying stream.
-        pub fn read(self: *StreamReader, dest: []u8) StreamReader.Error!usize {
-            return self.stream.read(dest);
-        }
-    };
-
-    /// Writer wrapper for raw stream writes.
-    const StreamWriter = struct {
-        /// Stream handle for writing.
-        stream: *std.net.Stream,
-
-        /// Error set returned by stream writes.
-        pub const Error = std.net.Stream.WriteError;
-
-        /// Initializes a writer for the provided stream.
-        pub fn init(stream: *std.net.Stream) StreamWriter {
-            return .{ .stream = stream };
-        }
-
-        /// Writes all bytes to the underlying stream.
-        pub fn writeAll(self: *StreamWriter, bytes: []const u8) StreamWriter.Error!void {
-            try self.stream.writeAll(bytes);
-        }
-
-        /// Writes a single byte to the underlying stream.
-        pub fn writeByte(self: *StreamWriter, byte: u8) StreamWriter.Error!void {
-            var buf: [1]u8 = .{byte};
-            try self.stream.writeAll(&buf);
-        }
-    };
-};
+}; // End of ConnectionH1 struct
 
 test "connection executes a request and streams the response body" {
     const test_server = @import("test_server.zig");
@@ -891,7 +891,7 @@ test "connection executes a request and streams the response body" {
             .tunnel = null,
             .proxy_authorization = null,
         },
-        ConnectionH1.Options.default(),
+        Options.default(),
     );
     defer conn.deinit();
     try conn.start();
@@ -901,7 +901,7 @@ test "connection executes a request and streams the response body" {
     defer request.deinit();
     try request.headers.append("Host", "127.0.0.1");
 
-    var response_future = ConnectionH1.ResponseFuture.init();
+    var response_future = ResponseFuture.init();
     try conn.submit(&request, response_future.completion());
 
     var response = try response_future.wait();

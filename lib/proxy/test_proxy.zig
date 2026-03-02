@@ -40,6 +40,46 @@ pub const Options = struct {
     }
 };
 
+/// Error set returned by `start`.
+pub const StartError = error{AlreadyStarted} || std.Thread.SpawnError;
+
+/// CONNECT request data parsed from a proxy client.
+const ConnectRequest = struct {
+    /// Allocator used for stored buffers.
+    allocator: std.mem.Allocator,
+    /// Parsed target host.
+    host: []u8,
+    /// Parsed target port.
+    port: u16,
+    /// Extra bytes after the CONNECT headers.
+    extra: []u8,
+
+    /// Releases stored buffers.
+    fn deinit(self: *ConnectRequest) void {
+        self.allocator.free(self.host);
+        if (self.extra.len > 0) {
+            self.allocator.free(self.extra);
+        }
+        self.* = undefined;
+    }
+};
+
+/// Error set returned by CONNECT request parsing.
+const ReadConnectError = std.mem.Allocator.Error || std.net.Stream.ReadError || error{
+    EndOfStream,
+    InvalidRequest,
+    LimitExceeded,
+    MissingExpectedBytes,
+};
+
+/// Target host and port parsed from CONNECT request lines.
+const ConnectTarget = struct {
+    /// Target host bytes.
+    host: []const u8,
+    /// Target port number.
+    port: u16,
+};
+
 /// HTTP proxy harness that supports CONNECT for tests.
 pub const TestProxy = struct {
     /// Allocator used for request parsing buffers.
@@ -52,9 +92,6 @@ pub const TestProxy = struct {
     options: Options,
     /// Background thread running the accept loop.
     thread: ?std.Thread,
-
-    /// Error set returned by `start`.
-    pub const StartError = error{AlreadyStarted} || std.Thread.SpawnError;
 
     /// Creates a proxy bound to the provided address.
     pub fn init(allocator: std.mem.Allocator, mode: Mode, options: Options) !TestProxy {
@@ -143,35 +180,6 @@ pub const TestProxy = struct {
         forward.join();
     }
 
-    /// CONNECT request data parsed from a proxy client.
-    const ConnectRequest = struct {
-        /// Allocator used for stored buffers.
-        allocator: std.mem.Allocator,
-        /// Parsed target host.
-        host: []u8,
-        /// Parsed target port.
-        port: u16,
-        /// Extra bytes after the CONNECT headers.
-        extra: []u8,
-
-        /// Releases stored buffers.
-        fn deinit(self: *ConnectRequest) void {
-            self.allocator.free(self.host);
-            if (self.extra.len > 0) {
-                self.allocator.free(self.extra);
-            }
-            self.* = undefined;
-        }
-    };
-
-    /// Error set returned by CONNECT request parsing.
-    const ReadConnectError = std.mem.Allocator.Error || std.net.Stream.ReadError || error{
-        EndOfStream,
-        InvalidRequest,
-        LimitExceeded,
-        MissingExpectedBytes,
-    };
-
     /// Reads and parses a CONNECT request.
     fn readConnectRequest(
         allocator: std.mem.Allocator,
@@ -222,7 +230,7 @@ pub const TestProxy = struct {
         const host_copy = try allocator.dupe(u8, parsed.host);
         errdefer allocator.free(host_copy);
 
-        const extra = buffer.items[header_end.? ..];
+        const extra = buffer.items[header_end.?..];
         var extra_copy: []u8 = &[_]u8{};
         if (extra.len > 0) {
             extra_copy = try allocator.dupe(u8, extra);
@@ -235,14 +243,6 @@ pub const TestProxy = struct {
             .extra = extra_copy,
         };
     }
-
-    /// Target host and port parsed from CONNECT request lines.
-    const ConnectTarget = struct {
-        /// Target host bytes.
-        host: []const u8,
-        /// Target port number.
-        port: u16,
-    };
 
     /// Parses the CONNECT target host and port.
     fn parseConnectTarget(value: []const u8) ?ConnectTarget {

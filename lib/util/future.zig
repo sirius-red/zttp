@@ -2,41 +2,54 @@
 
 const std = @import("std");
 
+/// Error set returned by request future waits.
+pub fn RequestFutureWaitError(comptime E: type) type {
+    return E || error{ Canceled, Timeout };
+}
+
+/// Completion handle that can resolve a request future.
+pub fn RequestFutureCompletion(comptime FutureType: type, comptime T: type, comptime E: type) type {
+    return struct {
+        /// Future being completed.
+        future: *FutureType,
+
+        /// Completes the future with the provided result.
+        pub fn finish(self: *@This(), result: E!T) bool {
+            return self.future.complete(result);
+        }
+
+        /// Cancels the future.
+        pub fn cancel(self: *@This()) bool {
+            return self.future.cancel();
+        }
+    };
+}
+
+/// Internal state of a request future.
+pub fn RequestFutureState(comptime T: type, comptime E: type) type {
+    return union(enum) {
+        /// Waiting for completion.
+        pending,
+        /// Completed successfully with a value.
+        ok: T,
+        /// Completed with an error.
+        err: E,
+        /// Canceled by the caller.
+        canceled,
+    };
+}
+
 /// Creates a request future type for payload `T` and error set `E`.
 pub fn RequestFuture(comptime T: type, comptime E: type) type {
     return struct {
         const Self = @This();
 
         /// Error set returned by `wait` and `timedWait`.
-        pub const WaitError = E || error{Canceled, Timeout};
-
+        pub const WaitError = RequestFutureWaitError(E);
         /// Completion handle that can resolve the future.
-        pub const Completion = struct {
-            /// Future being completed.
-            future: *Self,
-
-            /// Completes the future with the provided result.
-            pub fn finish(self: *Completion, result: E!T) bool {
-                return self.future.complete(result);
-            }
-
-            /// Cancels the future.
-            pub fn cancel(self: *Completion) bool {
-                return self.future.cancel();
-            }
-        };
-
+        pub const Completion = RequestFutureCompletion(Self, T, E);
         /// Internal state of the future.
-        const State = union(enum) {
-            /// Waiting for completion.
-            pending,
-            /// Completed successfully with a value.
-            ok: T,
-            /// Completed with an error.
-            err: E,
-            /// Canceled by the caller.
-            canceled,
-        };
+        const State = RequestFutureState(T, E);
 
         /// Mutex guarding state transitions.
         mutex: std.Thread.Mutex,
