@@ -53,10 +53,10 @@ const server_help =
 const Cli = struct {
     /// Allocator used for argument parsing.
     allocator: std.mem.Allocator,
-    /// Writer for standard output.
-    out: std.fs.File.Writer,
-    /// Writer for standard error.
-    err: std.fs.File.Writer,
+    /// Standard output handle.
+    out: std.fs.File,
+    /// Standard error handle.
+    err: std.fs.File,
 
     /// Executes the CLI with the provided argument list.
     pub fn run(self: *Cli, args: []const []const u8) !void {
@@ -76,7 +76,7 @@ const Cli = struct {
             return;
         }
 
-        try self.err.print("zttp: unknown command '{s}'\n", .{command});
+        try self.printErr("zttp: unknown command '{s}'\n", .{command});
         return error.InvalidArguments;
     }
 
@@ -103,13 +103,13 @@ const Cli = struct {
         }
 
         var request_args = self.parseRequestArgs(args) catch |err| {
-            try self.err.print("zttp request: {s}\n", .{@errorName(err)});
+            try self.printErr("zttp request: {s}\n", .{@errorName(err)});
             return error.InvalidArguments;
         };
         defer request_args.deinit(self.allocator);
 
         const parsed = parseUrl(request_args.url) catch |err| {
-            try self.err.print("zttp request: {s}\n", .{@errorName(err)});
+            try self.printErr("zttp request: {s}\n", .{@errorName(err)});
             return error.InvalidArguments;
         };
 
@@ -152,7 +152,7 @@ const Cli = struct {
         var response = try handle.wait();
         defer response.deinit();
 
-        try self.err.print("{s} {d}\n", .{ response.version.asBytes(), response.status.code() });
+        try self.printErr("{s} {d}\n", .{ response.version.asBytes(), response.status.code() });
 
         if (response.body) |body_reader| {
             defer body_reader.close();
@@ -172,6 +172,13 @@ const Cli = struct {
 
         try self.err.writeAll("zttp server: not implemented\n");
         return error.NotImplemented;
+    }
+
+    /// Writes a formatted message to standard error.
+    fn printErr(self: *Cli, comptime format: []const u8, args: anytype) !void {
+        const message = try std.fmt.allocPrint(self.allocator, format, args);
+        defer self.allocator.free(message);
+        try self.err.writeAll(message);
     }
 
     /// Returns true when any argument is a help flag.
@@ -556,19 +563,19 @@ pub fn main() void {
     const allocator = gpa.allocator();
 
     const args = std.process.argsAlloc(allocator) catch {
-        std.io.getStdErr().writer().writeAll("zttp: failed to read arguments\n") catch {};
+        std.fs.File.stderr().writeAll("zttp: failed to read arguments\n") catch {};
         return;
     };
     defer std.process.argsFree(allocator, args);
 
     var cli = Cli{
         .allocator = allocator,
-        .out = std.io.getStdOut().writer(),
-        .err = std.io.getStdErr().writer(),
+        .out = std.fs.File.stdout(),
+        .err = std.fs.File.stderr(),
     };
 
     cli.run(args) catch |err| {
-        cli.err.print("zttp: {s}\n", .{@errorName(err)}) catch {};
+        cli.printErr("zttp: {s}\n", .{@errorName(err)}) catch {};
         if (err == error.InvalidArguments) {
             cli.printHelp() catch {};
         }
