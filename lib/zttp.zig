@@ -62,7 +62,12 @@ test {
     _ = @import("http1/request_encoder.zig");
     _ = @import("http1/response_parser.zig");
     _ = @import("http1/connection_h1.zig");
+    _ = @import("tls/config.zig");
+    _ = @import("tls/client.zig");
     _ = @import("tls/client_test.zig");
+    _ = @import("http2/frame.zig");
+    _ = @import("http2/hpack.zig");
+    _ = @import("http2/connection.zig");
     _ = @import("http2/connection_test.zig");
     _ = @import("cookies/cookie_jar.zig");
     _ = @import("redirects/redirects.zig");

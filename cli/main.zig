@@ -27,13 +27,17 @@ const request_help =
     \\  zttp request [options] <url>
     \\
     \\Options:
-    \\  -X, --method <token>  HTTP method (default: GET, or POST when -d is used)
-    \\  -H, --header <h:v>    Add a header (repeatable)
-    \\  -d, --data <bytes>    Request body (sets Content-Length if missing)
-    \\  -h, --help  Show help
+    \\  -X, --method <token>    HTTP method (default: GET, or POST when -d is used)
+    \\  -H, --header <h:v>      Add a header (repeatable)
+    \\  -d, --data <bytes>      Request body (sets Content-Length if missing)
+    \\      --tls-insecure      Disable TLS certificate verification
+    \\      --tls-ca <path>     Use an explicit trust bundle for HTTPS
+    \\      --tls-cert <path>   Present a certificate chain for local HTTPS tests
+    \\      --tls-key <path>    Present the matching private key for --tls-cert
+    \\  -h, --help              Show help
     \\
     \\Notes:
-    \\  Only http:// URLs are supported in this build.
+    \\  http:// and https:// URLs are accepted.
     \\
 ;
 
@@ -113,7 +117,10 @@ const Cli = struct {
             return error.InvalidArguments;
         };
 
-        var client = zttp.Client.init(self.allocator, zttp.ClientOptions.default());
+        var client_options = zttp.ClientOptions.default();
+        try self.applyTlsOptions(&client_options, request_args);
+
+        var client = zttp.Client.init(self.allocator, client_options);
         defer client.deinit();
 
         const uri = zttp.Uri.init(
@@ -153,6 +160,7 @@ const Cli = struct {
         defer response.deinit();
 
         try self.printErr("{s} {d}\n", .{ response.version.asBytes(), response.status.code() });
+        try self.printErr("protocol: {s}\n", .{response.version.asBytes()});
 
         if (response.body) |body_reader| {
             defer body_reader.close();
@@ -232,7 +240,7 @@ const Cli = struct {
         const scheme = if (std.ascii.eqlIgnoreCase(scheme_bytes, "http"))
             zttp.Scheme.http
         else if (std.ascii.eqlIgnoreCase(scheme_bytes, "https"))
-            return error.UnsupportedScheme
+            zttp.Scheme.https
         else
             return error.UnsupportedScheme;
 
@@ -349,6 +357,14 @@ const Cli = struct {
         method: ?[]const u8,
         /// Request body data, if provided.
         data: ?[]const u8,
+        /// Disable TLS verification for local testing.
+        tls_insecure: bool,
+        /// Explicit CA bundle path for HTTPS requests.
+        tls_ca: ?[]const u8,
+        /// Certificate chain path for local client identity tests.
+        tls_cert: ?[]const u8,
+        /// Private key path for the client identity.
+        tls_key: ?[]const u8,
         /// Target URL argument.
         url: []const u8,
         /// Header list parsed from flags.
@@ -376,6 +392,12 @@ const Cli = struct {
         DuplicateMethod,
         /// The data flag was provided more than once.
         DuplicateData,
+        /// The CA bundle flag was provided more than once.
+        DuplicateTlsCa,
+        /// The certificate flag was provided more than once.
+        DuplicateTlsCert,
+        /// The key flag was provided more than once.
+        DuplicateTlsKey,
         /// A header argument was invalid.
         InvalidHeader,
     };
@@ -387,6 +409,10 @@ const Cli = struct {
 
         var method: ?[]const u8 = null;
         var data: ?[]const u8 = null;
+        var tls_insecure = false;
+        var tls_ca: ?[]const u8 = null;
+        var tls_cert: ?[]const u8 = null;
+        var tls_key: ?[]const u8 = null;
         var url: ?[]const u8 = null;
 
         var index: usize = 0;
@@ -412,6 +438,32 @@ const Cli = struct {
                 }
                 const value = try requireValue(args, &index);
                 data = value;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--tls-insecure")) {
+                tls_insecure = true;
+                index += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--tls-ca")) {
+                if (tls_ca != null) {
+                    return error.DuplicateTlsCa;
+                }
+                tls_ca = try requireValue(args, &index);
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--tls-cert")) {
+                if (tls_cert != null) {
+                    return error.DuplicateTlsCert;
+                }
+                tls_cert = try requireValue(args, &index);
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--tls-key")) {
+                if (tls_key != null) {
+                    return error.DuplicateTlsKey;
+                }
+                tls_key = try requireValue(args, &index);
                 continue;
             }
             if (std.mem.eql(u8, arg, "--")) {
@@ -443,6 +495,10 @@ const Cli = struct {
         return .{
             .method = method,
             .data = data,
+            .tls_insecure = tls_insecure,
+            .tls_ca = tls_ca,
+            .tls_cert = tls_cert,
+            .tls_key = tls_key,
             .url = url.?,
             .headers = headers,
         };
@@ -506,6 +562,24 @@ const Cli = struct {
         _ = self;
         for (args.headers.items) |header| {
             try request.headers.append(header.name, header.value);
+        }
+    }
+
+    /// Applies TLS-related CLI flags to the client options.
+    fn applyTlsOptions(self: *Cli, options: *zttp.ClientOptions, args: RequestArgs) !void {
+        _ = self;
+        if (args.tls_insecure) {
+            options.tls.verify = .insecure;
+        }
+        if (args.tls_ca) |path| {
+            options.tls.root_store_mode = .explicit;
+            options.tls.explicit_roots_path = path;
+        }
+        if (args.tls_cert) |path| {
+            options.tls.certificate_chain_path = path;
+        }
+        if (args.tls_key) |path| {
+            options.tls.private_key_path = path;
         }
     }
 

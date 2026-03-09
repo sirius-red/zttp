@@ -5,6 +5,7 @@ const types = @import("types.zig");
 const mailbox = @import("util/mailbox.zig");
 const future = @import("util/future.zig");
 const connection_h1 = @import("http1/connection_h1.zig");
+const tls_config = @import("tls/config.zig");
 const request_encoder = @import("http1/request_encoder.zig");
 const redirects = @import("redirects/redirects.zig");
 const cookies = @import("cookies/cookie_jar.zig");
@@ -1185,7 +1186,7 @@ const RequestState = struct {
         defer if (proxy_value) |*value| value.deinit();
 
         const origin = try self.client.buildOriginKey(request_value, proxy_value, proxy_auth_header);
-        const connection_options = self.client.buildConnectionOptions();
+        const connection_options = self.client.buildConnectionOptions(request_value);
         var lease = try self.pool.checkout(origin, connection_options);
 
         self.mutex.lock();
@@ -1366,7 +1367,7 @@ pub const Client = struct {
         errdefer if (cleanup_prepared) self.cleanupPreparedRequest(prepared);
 
         const origin = try self.buildOriginKey(prepared.request, proxy_endpoint, proxy_auth_header);
-        const connection_options = self.buildConnectionOptions();
+        const connection_options = self.buildConnectionOptions(prepared.request);
         var lease = try self.pool.checkout(origin, connection_options);
         if (proxy_endpoint) |*proxy_value| {
             proxy_value.deinit();
@@ -1478,7 +1479,7 @@ pub const Client = struct {
                     .host = proxy_value.host,
                     .port = proxy_value.port,
                     .tls_id = self.options.tls.identity(),
-                    .negotiated_protocol = .http_1_1,
+                    .negotiated_protocol = plannedProtocolForRequest(request_value),
                     .target_mode = .absolute_form,
                     .tunnel = null,
                     .proxy_authorization = null,
@@ -1494,20 +1495,20 @@ pub const Client = struct {
             }
             return .{
                 .scheme = proxy_value.scheme,
-                    .host = proxy_value.host,
-                    .port = proxy_value.port,
-                    .tls_id = self.options.tls.identity(),
-                    .negotiated_protocol = .http_1_1,
-                    .target_mode = .origin_form,
-                    .tunnel = .{
-                        .host = tunnel_host,
+                .host = proxy_value.host,
+                .port = proxy_value.port,
+                .tls_id = self.options.tls.identity(),
+                .negotiated_protocol = plannedProtocolForRequest(request_value),
+                .target_mode = .origin_form,
+                .tunnel = .{
+                    .host = tunnel_host,
                     .port = request_value.uri.effectivePort(),
                 },
                 .proxy_authorization = proxy_auth_header,
             };
         }
 
-        if (request_value.uri.scheme != .http) {
+        if (request_value.uri.scheme != .http and request_value.uri.scheme != .https) {
             return error.InvalidUri;
         }
         const port = request_value.uri.effectivePort();
@@ -1516,7 +1517,7 @@ pub const Client = struct {
             .host = request_value.uri.host,
             .port = port,
             .tls_id = self.options.tls.identity(),
-            .negotiated_protocol = .http_1_1,
+            .negotiated_protocol = plannedProtocolForRequest(request_value),
             .target_mode = .origin_form,
             .tunnel = null,
             .proxy_authorization = null,
@@ -1682,7 +1683,7 @@ pub const Client = struct {
     }
 
     /// Maps client options into connection options.
-    fn buildConnectionOptions(self: *Client) connection_h1.Options {
+    fn buildConnectionOptions(self: *Client, request_value: *const types.Request) connection_h1.Options {
         var options = connection_h1.Options.default();
         options.connect_timeout_ns = if (self.options.timeouts.connect) |timeout|
             timeout.toNanos()
@@ -1703,6 +1704,8 @@ pub const Client = struct {
         options.max_header_bytes = self.options.limits.max_header_bytes.toInt();
         options.max_header_count = self.options.limits.max_header_count.toInt();
         options.max_status_line_bytes = self.options.limits.max_response_line_bytes.toInt();
+        options.tls_config = if (request_value.uri.scheme == .https) self.options.tls else null;
+        options.expected_protocol = plannedProtocolForRequest(request_value);
         return options;
     }
 
@@ -1711,21 +1714,8 @@ pub const Client = struct {
         if (self.options.pool.max_connections.toInt() == 0) {
             return error.InvalidConfig;
         }
-        try self.validateTlsConfig(self.options.tls);
+        tls_config.validate(self.options.tls) catch return error.InvalidConfig;
         try self.validateProxyConfig(self.options.proxy);
-    }
-
-    /// Validates shared TLS configuration values.
-    fn validateTlsConfig(_: *const Client, config: TlsConfig) Error!void {
-        if (config.root_store_mode == .explicit and config.explicit_roots_path == null) {
-            return error.InvalidConfig;
-        }
-        if ((config.certificate_chain_path == null) != (config.private_key_path == null)) {
-            return error.InvalidConfig;
-        }
-        if (config.alpn_protocols.len == 0) {
-            return error.InvalidConfig;
-        }
     }
 
     /// Validates proxy configuration values.
@@ -1749,6 +1739,12 @@ fn mapConnectionTargetMode(mode: types.ConnectionTargetMode) request_encoder.Req
         .origin_form => .origin_form,
         .absolute_form => .absolute_form,
     };
+}
+
+/// Returns the currently planned application protocol for a request.
+fn plannedProtocolForRequest(request_value: *const types.Request) types.NegotiatedProtocol {
+    _ = request_value;
+    return .http_1_1;
 }
 
 /// Builds a request copy with optional Cookie and Proxy-Authorization headers.

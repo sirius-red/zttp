@@ -80,6 +80,10 @@ pub const Options = struct {
     io_buffer_bytes: usize,
     /// Buffer size for response body streaming.
     body_buffer_bytes: usize,
+    /// Optional TLS configuration for HTTPS requests.
+    tls_config: ?types.TlsConfig,
+    /// Expected application protocol for this connection.
+    expected_protocol: types.NegotiatedProtocol,
 
     /// Returns default connection options.
     pub fn default() Options {
@@ -96,6 +100,8 @@ pub const Options = struct {
             .max_chunk_size = limits.max_chunk_size,
             .io_buffer_bytes = 16 * 1024,
             .body_buffer_bytes = 64 * 1024,
+            .tls_config = null,
+            .expected_protocol = .http_1_1,
         };
     }
 };
@@ -424,7 +430,10 @@ pub const ConnectionH1 = struct {
                 if (request.uri.scheme != self.origin.scheme) {
                     return error.InvalidUri;
                 }
-                if (request.uri.scheme != .http) {
+                if (request.uri.scheme == .https and self.options.tls_config == null) {
+                    return error.InvalidUri;
+                }
+                if (request.uri.scheme != .http and request.uri.scheme != .https) {
                     return error.InvalidUri;
                 }
                 if (request.uri.host.len == 0) {
