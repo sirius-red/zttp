@@ -62,8 +62,11 @@ test {
     _ = @import("http1/request_encoder.zig");
     _ = @import("http1/response_parser.zig");
     _ = @import("http1/connection_h1.zig");
+    _ = @import("tls/client_test.zig");
+    _ = @import("http2/connection_test.zig");
     _ = @import("cookies/cookie_jar.zig");
     _ = @import("redirects/redirects.zig");
     _ = @import("proxy/proxy_env.zig");
+    _ = @import("testing/client_interop_test.zig");
     _ = testing;
 }
