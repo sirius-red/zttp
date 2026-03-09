@@ -104,6 +104,101 @@ pub const Port = struct {
     }
 };
 
+/// Duration expressed in nanoseconds.
+pub const Duration = struct {
+    /// Duration value in nanoseconds.
+    nanoseconds: u64,
+
+    /// Creates a duration from nanoseconds.
+    pub fn fromNanos(nanoseconds: u64) Duration {
+        return .{ .nanoseconds = nanoseconds };
+    }
+
+    /// Creates a duration from milliseconds.
+    pub fn fromMillis(milliseconds: u64) Duration {
+        return .{ .nanoseconds = milliseconds * std.time.ns_per_ms };
+    }
+
+    /// Creates a duration from seconds.
+    pub fn fromSeconds(seconds: u64) Duration {
+        return .{ .nanoseconds = seconds * std.time.ns_per_s };
+    }
+
+    /// Returns the duration in nanoseconds.
+    pub fn toNanos(self: Duration) u64 {
+        return self.nanoseconds;
+    }
+};
+
+/// Size in bytes with an explicit unit.
+pub const ByteSize = struct {
+    /// Size in bytes.
+    bytes: usize,
+
+    /// Creates a size from bytes.
+    pub fn fromBytes(bytes: usize) ByteSize {
+        return .{ .bytes = bytes };
+    }
+
+    /// Creates a size from kibibytes.
+    pub fn fromKib(kibibytes: usize) ByteSize {
+        return .{ .bytes = kibibytes * 1024 };
+    }
+
+    /// Returns the size in bytes.
+    pub fn toInt(self: ByteSize) usize {
+        return self.bytes;
+    }
+};
+
+/// Header field count with an explicit unit.
+pub const HeaderCount = struct {
+    /// Number of header fields.
+    count: usize,
+
+    /// Creates a header count from the provided value.
+    pub fn init(count: usize) HeaderCount {
+        return .{ .count = count };
+    }
+
+    /// Returns the header count.
+    pub fn toInt(self: HeaderCount) usize {
+        return self.count;
+    }
+};
+
+/// Line length expressed in bytes.
+pub const LineLength = struct {
+    /// Line length in bytes.
+    bytes: usize,
+
+    /// Creates a line length from bytes.
+    pub fn fromBytes(bytes: usize) LineLength {
+        return .{ .bytes = bytes };
+    }
+
+    /// Returns the line length in bytes.
+    pub fn toInt(self: LineLength) usize {
+        return self.bytes;
+    }
+};
+
+/// Connection count with an explicit unit.
+pub const ConnectionCount = struct {
+    /// Number of connections.
+    count: usize,
+
+    /// Creates a connection count from the provided value.
+    pub fn init(count: usize) ConnectionCount {
+        return .{ .count = count };
+    }
+
+    /// Returns the connection count.
+    pub fn toInt(self: ConnectionCount) usize {
+        return self.count;
+    }
+};
+
 /// Represents a non-owning, parsed URI.
 pub const Uri = struct {
     /// Scheme component.
@@ -142,6 +237,171 @@ pub const Uri = struct {
     pub fn effectivePort(self: Uri) Port {
         return self.port orelse self.scheme.defaultPort();
     }
+};
+
+/// Identity token for TLS configuration matching.
+pub const TlsIdentityToken = struct {
+    /// Opaque identifier value.
+    value: u64,
+
+    /// Creates an identity token from the provided value.
+    pub fn init(value: u64) TlsIdentityToken {
+        return .{ .value = value };
+    }
+
+    /// Returns the raw identity value.
+    pub fn toInt(self: TlsIdentityToken) u64 {
+        return self.value;
+    }
+};
+
+/// TLS certificate verification mode.
+pub const TlsVerifyMode = enum {
+    /// Verify certificates and hostnames.
+    verify,
+    /// Do not verify certificates.
+    insecure,
+};
+
+/// Root store selection mode for TLS verification.
+pub const TlsRootStoreMode = enum {
+    /// Use the platform or process default roots.
+    system,
+    /// Use explicit local roots provided by path.
+    explicit,
+};
+
+/// Negotiated application protocol for a connection.
+pub const NegotiatedProtocol = enum {
+    /// HTTP/1.1 or equivalent ALPN fallback.
+    http_1_1,
+    /// HTTP/2 negotiated through ALPN.
+    h2,
+    /// HTTP/3 negotiated through QUIC transport.
+    h3,
+
+    /// Returns the ALPN token for the protocol.
+    pub fn asAlpnBytes(self: NegotiatedProtocol) []const u8 {
+        return switch (self) {
+            .http_1_1 => "http/1.1",
+            .h2 => "h2",
+            .h3 => "h3",
+        };
+    }
+
+    /// Returns the closest HTTP version label for the protocol.
+    pub fn asVersion(self: NegotiatedProtocol) Version {
+        return switch (self) {
+            .http_1_1 => .http_1_1,
+            .h2 => .http_2,
+            .h3 => .http_3,
+        };
+    }
+};
+
+/// Request target format used for connection pooling decisions.
+pub const ConnectionTargetMode = enum {
+    /// Origin-form request target.
+    origin_form,
+    /// Absolute-form request target.
+    absolute_form,
+};
+
+/// Target host and port for CONNECT tunnels.
+pub const TunnelTarget = struct {
+    /// Hostname or IP literal for the tunnel target.
+    host: []const u8,
+    /// Port for the tunnel target.
+    port: Port,
+};
+
+const default_alpn_protocols = [_]NegotiatedProtocol{ .h2, .http_1_1 };
+
+/// Shared TLS configuration for client and server flows.
+pub const TlsConfig = struct {
+    /// Certificate verification mode.
+    verify: TlsVerifyMode,
+    /// Root store selection mode.
+    root_store_mode: TlsRootStoreMode,
+    /// Optional path to an explicit trust store bundle.
+    explicit_roots_path: ?[]const u8,
+    /// Optional path to a certificate chain for local listeners or mutual TLS.
+    certificate_chain_path: ?[]const u8,
+    /// Optional path to the matching private key.
+    private_key_path: ?[]const u8,
+    /// Ordered list of ALPN protocols to advertise.
+    alpn_protocols: []const NegotiatedProtocol,
+    /// Optional override token to force pool identity separation.
+    identity_token: ?TlsIdentityToken,
+
+    /// Returns true when the configuration advertises the provided protocol.
+    pub fn supportsProtocol(self: TlsConfig, protocol: NegotiatedProtocol) bool {
+        for (self.alpn_protocols) |candidate| {
+            if (candidate == protocol) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Returns a stable identity token for pooling decisions.
+    pub fn identity(self: TlsConfig) TlsIdentityToken {
+        if (self.identity_token) |identity_token| {
+            return identity_token;
+        }
+
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(&[_]u8{@intFromEnum(self.verify)});
+        hasher.update(&[_]u8{@intFromEnum(self.root_store_mode)});
+
+        if (self.explicit_roots_path) |path| {
+            hasher.update(path);
+        }
+        if (self.certificate_chain_path) |path| {
+            hasher.update(path);
+        }
+        if (self.private_key_path) |path| {
+            hasher.update(path);
+        }
+        for (self.alpn_protocols) |protocol| {
+            hasher.update(protocol.asAlpnBytes());
+        }
+
+        return TlsIdentityToken.init(hasher.final());
+    }
+
+    /// Returns the default TLS configuration.
+    pub fn default() TlsConfig {
+        return .{
+            .verify = .verify,
+            .root_store_mode = .system,
+            .explicit_roots_path = null,
+            .certificate_chain_path = null,
+            .private_key_path = null,
+            .alpn_protocols = &default_alpn_protocols,
+            .identity_token = null,
+        };
+    }
+};
+
+/// Connection-pool identity shared across protocol modules.
+pub const OriginKey = struct {
+    /// Scheme used for the socket connection.
+    scheme: Scheme,
+    /// Hostname or IP literal used for the connection.
+    host: []const u8,
+    /// Port used for the connection.
+    port: Port,
+    /// TLS configuration identity.
+    tls_id: TlsIdentityToken,
+    /// Negotiated or expected application protocol.
+    negotiated_protocol: NegotiatedProtocol,
+    /// Request target mode used on the connection.
+    target_mode: ConnectionTargetMode,
+    /// Optional tunnel target when using proxy CONNECT.
+    tunnel: ?TunnelTarget,
+    /// Optional proxy authorization header value for CONNECT.
+    proxy_authorization: ?[]const u8,
 };
 
 /// Represents an HTTP status code.
@@ -360,3 +620,15 @@ pub const Response = struct {
         self.headers.deinit();
     }
 };
+
+test "tls config default identity is stable" {
+    const config = TlsConfig.default();
+    try std.testing.expect(config.supportsProtocol(.h2));
+    try std.testing.expect(config.supportsProtocol(.http_1_1));
+    try std.testing.expectEqual(config.identity().toInt(), TlsConfig.default().identity().toInt());
+}
+
+test "negotiated protocol exposes ALPN token" {
+    try std.testing.expectEqualStrings("h2", NegotiatedProtocol.h2.asAlpnBytes());
+    try std.testing.expectEqual(Version.http_3, NegotiatedProtocol.h3.asVersion());
+}

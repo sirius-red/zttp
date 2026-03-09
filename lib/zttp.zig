@@ -2,6 +2,11 @@
 
 const types = @import("types.zig");
 const client = @import("client.zig");
+const tls = @import("tls/tls.zig");
+const http2 = @import("http2/http2.zig");
+const server = @import("server/server.zig");
+const http3 = @import("http3/http3.zig");
+const testing = @import("testing/testing.zig");
 
 /// HTTP method type.
 pub const Method = types.Method;
@@ -13,8 +18,22 @@ pub const Version = types.Version;
 pub const Scheme = types.Scheme;
 /// Port type for URI components.
 pub const Port = types.Port;
+/// Duration type with explicit units.
+pub const Duration = types.Duration;
+/// Byte-size type with explicit units.
+pub const ByteSize = types.ByteSize;
 /// Parsed URI type.
 pub const Uri = types.Uri;
+/// TLS verification mode.
+pub const TlsVerifyMode = types.TlsVerifyMode;
+/// TLS root-store selection mode.
+pub const TlsRootStoreMode = types.TlsRootStoreMode;
+/// Negotiated protocol identifier.
+pub const NegotiatedProtocol = types.NegotiatedProtocol;
+/// TLS configuration type.
+pub const TlsConfig = types.TlsConfig;
+/// Shared origin-key type for connection pooling.
+pub const OriginKey = types.OriginKey;
 /// HTTP header collection type.
 pub const Headers = types.Headers;
 /// Streaming body reader type.
@@ -27,6 +46,16 @@ pub const Response = types.Response;
 pub const Client = client.Client;
 /// HTTP client configuration options.
 pub const ClientOptions = client.Options;
+/// TLS module entrypoint.
+pub const Tls = tls;
+/// HTTP/2 module entrypoint.
+pub const Http2 = http2;
+/// Server module entrypoint.
+pub const Server = server;
+/// Experimental HTTP/3 module entrypoint.
+pub const Http3 = http3;
+/// Shared testing module entrypoint.
+pub const Testing = testing;
 
 test {
     _ = @import("http1/test_server.zig");
@@ -36,4 +65,5 @@ test {
     _ = @import("cookies/cookie_jar.zig");
     _ = @import("redirects/redirects.zig");
     _ = @import("proxy/proxy_env.zig");
+    _ = testing;
 }

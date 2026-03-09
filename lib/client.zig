@@ -44,6 +44,27 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// Duration expressed in nanoseconds.
+pub const Duration = types.Duration;
+/// Size in bytes with an explicit unit.
+pub const ByteSize = types.ByteSize;
+/// Header field count with an explicit unit.
+pub const HeaderCount = types.HeaderCount;
+/// Line length expressed in bytes.
+pub const LineLength = types.LineLength;
+/// Connection count with an explicit unit.
+pub const ConnectionCount = types.ConnectionCount;
+/// TLS identity token used in pool matching.
+pub const TlsIdentityToken = types.TlsIdentityToken;
+/// TLS certificate verification mode.
+pub const TlsVerifyMode = types.TlsVerifyMode;
+/// Root store selection mode for TLS verification.
+pub const TlsRootStoreMode = types.TlsRootStoreMode;
+/// TLS configuration.
+pub const TlsConfig = types.TlsConfig;
+/// Shared origin key used for pool lookups.
+const OriginKey = types.OriginKey;
+
 /// Cancellation token shared across operations.
 pub const CancellationToken = struct {
     /// Cancellation flag.
@@ -62,101 +83,6 @@ pub const CancellationToken = struct {
     /// Returns true if the token has been canceled.
     pub fn isCanceled(self: *const CancellationToken) bool {
         return self.flag.load(.seq_cst);
-    }
-};
-
-/// Duration expressed in nanoseconds.
-pub const Duration = struct {
-    /// Duration value in nanoseconds.
-    nanoseconds: u64,
-
-    /// Creates a duration from nanoseconds.
-    pub fn fromNanos(nanoseconds: u64) Duration {
-        return .{ .nanoseconds = nanoseconds };
-    }
-
-    /// Creates a duration from milliseconds.
-    pub fn fromMillis(milliseconds: u64) Duration {
-        return .{ .nanoseconds = milliseconds * std.time.ns_per_ms };
-    }
-
-    /// Creates a duration from seconds.
-    pub fn fromSeconds(seconds: u64) Duration {
-        return .{ .nanoseconds = seconds * std.time.ns_per_s };
-    }
-
-    /// Returns the duration in nanoseconds.
-    pub fn toNanos(self: Duration) u64 {
-        return self.nanoseconds;
-    }
-};
-
-/// Size in bytes with an explicit unit.
-pub const ByteSize = struct {
-    /// Size in bytes.
-    bytes: usize,
-
-    /// Creates a size from bytes.
-    pub fn fromBytes(bytes: usize) ByteSize {
-        return .{ .bytes = bytes };
-    }
-
-    /// Creates a size from kibibytes (1024 bytes).
-    pub fn fromKib(kibibytes: usize) ByteSize {
-        return .{ .bytes = kibibytes * 1024 };
-    }
-
-    /// Returns the size in bytes.
-    pub fn toInt(self: ByteSize) usize {
-        return self.bytes;
-    }
-};
-
-/// Header field count with an explicit unit.
-pub const HeaderCount = struct {
-    /// Number of header fields.
-    count: usize,
-
-    /// Creates a header count from the provided value.
-    pub fn init(count: usize) HeaderCount {
-        return .{ .count = count };
-    }
-
-    /// Returns the header count.
-    pub fn toInt(self: HeaderCount) usize {
-        return self.count;
-    }
-};
-
-/// Line length expressed in bytes.
-pub const LineLength = struct {
-    /// Line length in bytes.
-    bytes: usize,
-
-    /// Creates a line length from bytes.
-    pub fn fromBytes(bytes: usize) LineLength {
-        return .{ .bytes = bytes };
-    }
-
-    /// Returns the line length in bytes.
-    pub fn toInt(self: LineLength) usize {
-        return self.bytes;
-    }
-};
-
-/// Connection count with an explicit unit.
-pub const ConnectionCount = struct {
-    /// Number of connections.
-    count: usize,
-
-    /// Creates a connection count from the provided value.
-    pub fn init(count: usize) ConnectionCount {
-        return .{ .count = count };
-    }
-
-    /// Returns the connection count.
-    pub fn toInt(self: ConnectionCount) usize {
-        return self.count;
     }
 };
 
@@ -297,51 +223,6 @@ pub const ProxyConfig = struct {
 /// Thread-safe cookie jar implementation.
 pub const CookieJar = cookies.CookieJar;
 
-/// Identity token for TLS configuration matching.
-const TlsConfigId = struct {
-    /// Opaque identifier value.
-    value: u64,
-
-    /// Creates a TLS config identity from the provided value.
-    pub fn init(value: u64) TlsConfigId {
-        return .{ .value = value };
-    }
-
-    /// Returns the identifier value.
-    pub fn toInt(self: TlsConfigId) u64 {
-        return self.value;
-    }
-};
-
-/// TLS certificate verification mode.
-pub const TlsVerifyMode = enum {
-    /// Verify certificates and hostnames.
-    verify,
-    /// Do not verify certificates.
-    insecure,
-};
-
-/// TLS configuration.
-pub const TlsConfig = struct {
-    /// Certificate verification mode.
-    verify: TlsVerifyMode,
-
-    /// Returns a stable identity token for pooling decisions.
-    fn identity(self: TlsConfig) TlsConfigId {
-        var hasher = std.hash.Wyhash.init(0);
-        const verify_byte: u8 = @intFromEnum(self.verify);
-        hasher.update(&[_]u8{verify_byte});
-        return TlsConfigId.init(hasher.final());
-    }
-
-    /// Returns the default TLS configuration.
-    pub fn default() TlsConfig {
-        return .{
-            .verify = .verify,
-        };
-    }
-};
-
 /// Client configuration options.
 pub const Options = struct {
     /// Timeout configuration.
@@ -432,24 +313,6 @@ const OriginMap = std.HashMapUnmanaged(
     std.hash_map.default_max_load_percentage,
 );
 
-/// Connection target key used for pooling decisions.
-const OriginKey = struct {
-    /// Scheme used for the TCP connection.
-    scheme: types.Scheme,
-    /// Hostname or IP literal to connect to.
-    host: []const u8,
-    /// Port to connect to.
-    port: types.Port,
-    /// TLS configuration identity.
-    tls_id: TlsConfigId,
-    /// Request target mode for the connection.
-    target_mode: request_encoder.RequestTargetMode,
-    /// Optional tunnel target for CONNECT proxies.
-    tunnel: ?connection_h1.TunnelTarget,
-    /// Optional Proxy-Authorization header value for CONNECT.
-    proxy_authorization: ?[]const u8,
-};
-
 /// Hashing context for origin keys.
 const OriginKeyContext = struct {
     /// Hashes the origin key for the pool map.
@@ -463,6 +326,9 @@ const OriginKeyContext = struct {
 
         const tls_bytes = std.mem.toBytes(key.tls_id.toInt());
         hasher.update(&tls_bytes);
+
+        const protocol_byte: u8 = @intFromEnum(key.negotiated_protocol);
+        hasher.update(&[_]u8{protocol_byte});
 
         const mode_byte: u8 = @intFromEnum(key.target_mode);
         hasher.update(&[_]u8{mode_byte});
@@ -497,6 +363,7 @@ const OriginKeyContext = struct {
         if (a.scheme != b.scheme or
             a.port.toInt() != b.port.toInt() or
             a.tls_id.toInt() != b.tls_id.toInt() or
+            a.negotiated_protocol != b.negotiated_protocol or
             a.target_mode != b.target_mode)
         {
             return false;
@@ -741,8 +608,11 @@ const ConnectionPool = struct {
                 .scheme = origin.scheme,
                 .host = origin.host,
                 .port = origin.port,
-                .target_mode = origin.target_mode,
-                .tunnel = origin.tunnel,
+                .target_mode = mapConnectionTargetMode(origin.target_mode),
+                .tunnel = if (origin.tunnel) |tunnel|
+                    .{ .host = tunnel.host, .port = tunnel.port }
+                else
+                    null,
                 .proxy_authorization = origin.proxy_authorization,
             },
             options,
@@ -809,7 +679,7 @@ const ConnectionPool = struct {
         };
         errdefer self.allocator.free(host_copy);
 
-        var tunnel_copy: ?connection_h1.TunnelTarget = null;
+        var tunnel_copy: ?types.TunnelTarget = null;
         if (key.tunnel) |tunnel| {
             const tunnel_host = self.allocator.dupe(u8, tunnel.host) catch {
                 return error.OutOfMemory;
@@ -835,6 +705,7 @@ const ConnectionPool = struct {
             .host = host_copy,
             .port = key.port,
             .tls_id = key.tls_id,
+            .negotiated_protocol = key.negotiated_protocol,
             .target_mode = key.target_mode,
             .tunnel = tunnel_copy,
             .proxy_authorization = proxy_auth_copy,
@@ -1607,6 +1478,7 @@ pub const Client = struct {
                     .host = proxy_value.host,
                     .port = proxy_value.port,
                     .tls_id = self.options.tls.identity(),
+                    .negotiated_protocol = .http_1_1,
                     .target_mode = .absolute_form,
                     .tunnel = null,
                     .proxy_authorization = null,
@@ -1622,12 +1494,13 @@ pub const Client = struct {
             }
             return .{
                 .scheme = proxy_value.scheme,
-                .host = proxy_value.host,
-                .port = proxy_value.port,
-                .tls_id = self.options.tls.identity(),
-                .target_mode = .origin_form,
-                .tunnel = .{
-                    .host = tunnel_host,
+                    .host = proxy_value.host,
+                    .port = proxy_value.port,
+                    .tls_id = self.options.tls.identity(),
+                    .negotiated_protocol = .http_1_1,
+                    .target_mode = .origin_form,
+                    .tunnel = .{
+                        .host = tunnel_host,
                     .port = request_value.uri.effectivePort(),
                 },
                 .proxy_authorization = proxy_auth_header,
@@ -1643,6 +1516,7 @@ pub const Client = struct {
             .host = request_value.uri.host,
             .port = port,
             .tls_id = self.options.tls.identity(),
+            .negotiated_protocol = .http_1_1,
             .target_mode = .origin_form,
             .tunnel = null,
             .proxy_authorization = null,
@@ -1837,7 +1711,21 @@ pub const Client = struct {
         if (self.options.pool.max_connections.toInt() == 0) {
             return error.InvalidConfig;
         }
+        try self.validateTlsConfig(self.options.tls);
         try self.validateProxyConfig(self.options.proxy);
+    }
+
+    /// Validates shared TLS configuration values.
+    fn validateTlsConfig(_: *const Client, config: TlsConfig) Error!void {
+        if (config.root_store_mode == .explicit and config.explicit_roots_path == null) {
+            return error.InvalidConfig;
+        }
+        if ((config.certificate_chain_path == null) != (config.private_key_path == null)) {
+            return error.InvalidConfig;
+        }
+        if (config.alpn_protocols.len == 0) {
+            return error.InvalidConfig;
+        }
     }
 
     /// Validates proxy configuration values.
@@ -1854,6 +1742,14 @@ pub const Client = struct {
         }
     }
 };
+
+/// Maps the shared target-mode type into the HTTP/1.1 encoder mode.
+fn mapConnectionTargetMode(mode: types.ConnectionTargetMode) request_encoder.RequestTargetMode {
+    return switch (mode) {
+        .origin_form => .origin_form,
+        .absolute_form => .absolute_form,
+    };
+}
 
 /// Builds a request copy with optional Cookie and Proxy-Authorization headers.
 fn buildRequestWithExtras(
