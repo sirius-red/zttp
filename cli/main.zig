@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const zttp = @import("zttp");
+const BuildOptions = @import("zttp_build_options");
 
 /// General help text for the CLI.
 const help_text =
@@ -12,7 +13,7 @@ const help_text =
     \\
     \\Commands:
     \\  request   HTTP client request
-    \\  server    HTTP server harness (stub)
+    \\  server    HTTP server harness
     \\
     \\Flags:
     \\  -h, --help  Show help
@@ -41,6 +42,13 @@ const request_help =
     \\
 ;
 
+/// Extra help text for HTTP/3-enabled request builds.
+const request_help_http3 =
+    \\  Experimental:
+    \\      --http3             Use the local in-process HTTP/3 harness flow
+    \\
+;
+
 /// Help text for the server subcommand.
 const server_help =
     \\zttp server - HTTP server harness
@@ -55,6 +63,13 @@ const server_help =
     \\      --tls-key <path>    Private key for TLS listener mode
     \\      --http2             Enable minimal HTTP/2 negotiation planning
     \\  -h, --help              Show help
+    \\
+;
+
+/// Extra help text for HTTP/3-enabled server builds.
+const server_help_http3 =
+    \\  Experimental:
+    \\      --http3             Print the UDP HTTP/3 harness endpoint metadata
     \\
 ;
 
@@ -97,11 +112,17 @@ const Cli = struct {
     /// Prints the help text for the request subcommand.
     fn printRequestHelp(self: *Cli) !void {
         try self.out.writeAll(request_help);
+        if (BuildOptions.http3) {
+            try self.out.writeAll(request_help_http3);
+        }
     }
 
     /// Prints the help text for the server subcommand.
     fn printServerHelp(self: *Cli) !void {
         try self.out.writeAll(server_help);
+        if (BuildOptions.http3) {
+            try self.out.writeAll(server_help_http3);
+        }
     }
 
     /// Handles the request subcommand.
@@ -125,9 +146,6 @@ const Cli = struct {
         var client_options = zttp.ClientOptions.default();
         try self.applyTlsOptions(&client_options, request_args);
 
-        var client = zttp.Client.init(self.allocator, client_options);
-        defer client.deinit();
-
         const uri = zttp.Uri.init(
             parsed.scheme,
             parsed.host,
@@ -140,6 +158,9 @@ const Cli = struct {
         const method = self.selectMethod(request_args);
         var request = zttp.Request.init(self.allocator, method, uri);
         defer request.deinit();
+        if (request_args.http3) {
+            request.version = .http_3;
+        }
         try self.applyHeaders(&request, request_args);
         try self.addHostHeader(&request, parsed);
 
@@ -158,19 +179,28 @@ const Cli = struct {
             };
         }
 
+        if (request_args.http3) {
+            if (!BuildOptions.http3) {
+                return error.InvalidArguments;
+            }
+
+            var response = try zttp.Http3.Client.executeHarnessRequest(self.allocator, &request);
+            defer response.deinit();
+            defer if (response.body) |body_reader| body_reader.close();
+            try self.printResponse(&response);
+            return;
+        }
+
+        var client = zttp.Client.init(self.allocator, client_options);
+        defer client.deinit();
+
         var handle = try client.request(&request);
         defer handle.deinit();
 
         var response = try handle.wait();
         defer response.deinit();
-
-        try self.printErr("{s} {d}\n", .{ response.version.asBytes(), response.status.code() });
-        try self.printErr("protocol: {s}\n", .{response.version.asBytes()});
-
-        if (response.body) |body_reader| {
-            defer body_reader.close();
-            try self.writeBody(body_reader);
-        }
+        defer if (response.body) |body_reader| body_reader.close();
+        try self.printResponse(&response);
     }
 
     /// Handles the server subcommand.
@@ -189,6 +219,23 @@ const Cli = struct {
         config.listen_host = server_args.listen;
         config.port = zttp.Port.init(server_args.port);
         config.http2_enabled = server_args.http2;
+
+        if (server_args.http3) {
+            if (!BuildOptions.http3) {
+                return error.InvalidArguments;
+            }
+
+            const http3_server = zttp.Http3.Server.init(self.allocator, .{
+                .host = server_args.listen,
+                .port = zttp.Port.init(server_args.port),
+            });
+            const endpoint = http3_server.endpoint();
+            try self.printErr("http3 harness endpoint udp://{s}:{d}\n", .{
+                endpoint.host,
+                endpoint.port.toInt(),
+            });
+            return;
+        }
 
         if (server_args.tls_cert != null or server_args.tls_key != null) {
             var tls = zttp.TlsConfig.default();
@@ -216,6 +263,15 @@ const Cli = struct {
         const message = try std.fmt.allocPrint(self.allocator, format, args);
         defer self.allocator.free(message);
         try self.err.writeAll(message);
+    }
+
+    /// Writes the response line, protocol metadata, and body.
+    fn printResponse(self: *Cli, response: *zttp.Response) !void {
+        try self.printErr("{s} {d}\n", .{ response.version.asBytes(), response.status.code() });
+        try self.printErr("protocol: {s}\n", .{response.version.asBytes()});
+        if (response.body) |body_reader| {
+            try self.writeBody(body_reader);
+        }
     }
 
     /// Returns true when any argument is a help flag.
@@ -386,6 +442,8 @@ const Cli = struct {
         method: ?[]const u8,
         /// Request body data, if provided.
         data: ?[]const u8,
+        /// Enables the experimental local HTTP/3 harness flow.
+        http3: bool,
         /// Disable TLS verification for local testing.
         tls_insecure: bool,
         /// Explicit CA bundle path for HTTPS requests.
@@ -421,6 +479,8 @@ const Cli = struct {
         DuplicateMethod,
         /// The data flag was provided more than once.
         DuplicateData,
+        /// The HTTP/3 flag was provided more than once.
+        DuplicateHttp3,
         /// The CA bundle flag was provided more than once.
         DuplicateTlsCa,
         /// The certificate flag was provided more than once.
@@ -443,6 +503,8 @@ const Cli = struct {
         tls_key: ?[]const u8,
         /// Enables minimal HTTP/2 negotiation planning.
         http2: bool,
+        /// Prints the experimental UDP HTTP/3 harness endpoint metadata.
+        http3: bool,
     };
 
     /// Error set returned by server argument parsing.
@@ -461,6 +523,8 @@ const Cli = struct {
         DuplicateTlsKey,
         /// The HTTP/2 flag was provided more than once.
         DuplicateHttp2,
+        /// The HTTP/3 flag was provided more than once.
+        DuplicateHttp3,
         /// The port value was invalid.
         InvalidPort,
     };
@@ -472,6 +536,7 @@ const Cli = struct {
 
         var method: ?[]const u8 = null;
         var data: ?[]const u8 = null;
+        var http3 = false;
         var tls_insecure = false;
         var tls_ca: ?[]const u8 = null;
         var tls_cert: ?[]const u8 = null;
@@ -501,6 +566,17 @@ const Cli = struct {
                 }
                 const value = try requireValue(args, &index);
                 data = value;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--http3")) {
+                if (!BuildOptions.http3) {
+                    return error.UnknownFlag;
+                }
+                if (http3) {
+                    return error.DuplicateHttp3;
+                }
+                http3 = true;
+                index += 1;
                 continue;
             }
             if (std.mem.eql(u8, arg, "--tls-insecure")) {
@@ -558,6 +634,7 @@ const Cli = struct {
         return .{
             .method = method,
             .data = data,
+            .http3 = http3,
             .tls_insecure = tls_insecure,
             .tls_ca = tls_ca,
             .tls_cert = tls_cert,
@@ -576,6 +653,7 @@ const Cli = struct {
         var tls_cert: ?[]const u8 = null;
         var tls_key: ?[]const u8 = null;
         var http2 = false;
+        var http3 = false;
 
         var index: usize = 0;
         while (index < args.len) {
@@ -617,6 +695,17 @@ const Cli = struct {
                 index += 1;
                 continue;
             }
+            if (std.mem.eql(u8, arg, "--http3")) {
+                if (!BuildOptions.http3) {
+                    return error.UnknownFlag;
+                }
+                if (http3) {
+                    return error.DuplicateHttp3;
+                }
+                http3 = true;
+                index += 1;
+                continue;
+            }
             return error.UnknownFlag;
         }
 
@@ -626,6 +715,7 @@ const Cli = struct {
             .tls_cert = tls_cert,
             .tls_key = tls_key,
             .http2 = http2,
+            .http3 = http3,
         };
     }
 
@@ -843,6 +933,48 @@ test "server args parser accepts bind and tls flags" {
     try std.testing.expectEqualStrings("server.pem", args.tls_cert.?);
     try std.testing.expectEqualStrings("server.key", args.tls_key.?);
     try std.testing.expect(args.http2);
+}
+
+test "request args parser accepts http3 in http3-enabled builds" {
+    if (!BuildOptions.http3) {
+        return;
+    }
+
+    var cli = Cli{
+        .allocator = std.testing.allocator,
+        .out = std.fs.File.stdout(),
+        .err = std.fs.File.stderr(),
+    };
+
+    var args = try cli.parseRequestArgs(&.{
+        "--http3",
+        "https://127.0.0.1:4433/health",
+    });
+    defer args.deinit(std.testing.allocator);
+
+    try std.testing.expect(args.http3);
+}
+
+test "server args parser accepts http3 in http3-enabled builds" {
+    if (!BuildOptions.http3) {
+        return;
+    }
+
+    var cli = Cli{
+        .allocator = std.testing.allocator,
+        .out = std.fs.File.stdout(),
+        .err = std.fs.File.stderr(),
+    };
+
+    const args = try cli.parseServerArgs(&.{
+        "--listen",
+        "127.0.0.1",
+        "--port",
+        "4433",
+        "--http3",
+    });
+
+    try std.testing.expect(args.http3);
 }
 
 pub fn main() void {

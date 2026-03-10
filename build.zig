@@ -105,4 +105,8 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&lib_tests.step);
     test_step.dependOn(&cli_tests.step);
+
+    const test_http3_step = b.step("test-http3", "Run the HTTP/3-enabled test suite when built with -Dhttp3=true");
+    test_http3_step.dependOn(&lib_tests.step);
+    test_http3_step.dependOn(&cli_tests.step);
 }

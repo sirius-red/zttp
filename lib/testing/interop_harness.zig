@@ -38,6 +38,26 @@ pub const ResponseMode = enum {
     binary_stream,
 };
 
+/// Socket transport used by a harness scenario.
+pub const Transport = enum {
+    /// TCP listener or client flow.
+    tcp,
+    /// UDP datagram listener or client flow.
+    udp,
+};
+
+/// Endpoint metadata attached to a harness scenario.
+pub const Endpoint = struct {
+    /// Host advertised by the harness.
+    host: []const u8,
+    /// Port advertised by the harness.
+    port: types.Port,
+    /// Socket transport used by the scenario.
+    transport: Transport,
+    /// Application protocol expected on the endpoint.
+    protocol: types.NegotiatedProtocol,
+};
+
 /// Declarative local harness scenario used across client, server, and CLI tests.
 pub const Scenario = struct {
     /// Stable route identifier.
@@ -68,6 +88,53 @@ pub const Scenario = struct {
         }
         return false;
     }
+};
+
+/// Semantic request shared across TCP and UDP harness implementations.
+pub const SemanticRequest = struct {
+    /// HTTP method for the request.
+    method: types.Method,
+    /// Request path without a query suffix.
+    path: []const u8,
+    /// Optional query string without a leading `?`.
+    query: ?[]const u8,
+    /// Negotiated application protocol for the route.
+    negotiated_protocol: types.NegotiatedProtocol,
+    /// Fully buffered request body.
+    body: []const u8,
+    /// Observed `Cookie` header, if present.
+    cookie_header: ?[]const u8,
+};
+
+/// Owned response returned by the semantic harness helpers.
+pub const SemanticResponse = struct {
+    /// Allocator used for headers and body storage.
+    allocator: std.mem.Allocator,
+    /// Response status code.
+    status: types.Status,
+    /// Response headers.
+    headers: types.Headers,
+    /// Fully buffered response body.
+    body: []u8,
+
+    /// Releases the owned headers and body bytes.
+    pub fn deinit(self: *SemanticResponse) void {
+        self.headers.deinit();
+        self.allocator.free(self.body);
+        self.* = undefined;
+    }
+};
+
+/// UDP-focused HTTP/3 scenario metadata.
+pub const Http3DatagramScenario = struct {
+    /// Route served by the datagram scenario.
+    route: RouteId,
+    /// UDP endpoint used for the scenario.
+    endpoint: Endpoint,
+    /// Suggested maximum datagram size.
+    max_datagram_size: usize,
+    /// Maximum buffered application data for the scenario.
+    datagram_budget: usize,
 };
 
 const route_protocols = [_]types.NegotiatedProtocol{ .http_1_1, .h2, .h3 };
@@ -163,6 +230,53 @@ const default_scenarios = [_]Scenario{
     },
 };
 
+const default_http3_datagram_scenarios = [_]Http3DatagramScenario{
+    .{
+        .route = .health,
+        .endpoint = .{
+            .host = "127.0.0.1",
+            .port = types.Port.init(4433),
+            .transport = .udp,
+            .protocol = .h3,
+        },
+        .max_datagram_size = 1200,
+        .datagram_budget = 16 * 1024,
+    },
+    .{
+        .route = .echo_get,
+        .endpoint = .{
+            .host = "127.0.0.1",
+            .port = types.Port.init(4433),
+            .transport = .udp,
+            .protocol = .h3,
+        },
+        .max_datagram_size = 1200,
+        .datagram_budget = 16 * 1024,
+    },
+    .{
+        .route = .echo_post,
+        .endpoint = .{
+            .host = "127.0.0.1",
+            .port = types.Port.init(4433),
+            .transport = .udp,
+            .protocol = .h3,
+        },
+        .max_datagram_size = 1200,
+        .datagram_budget = 64 * 1024,
+    },
+    .{
+        .route = .stream_large,
+        .endpoint = .{
+            .host = "127.0.0.1",
+            .port = types.Port.init(4433),
+            .transport = .udp,
+            .protocol = .h3,
+        },
+        .max_datagram_size = 1200,
+        .datagram_budget = 96 * 1024,
+    },
+};
+
 /// Returns the default interop route catalog.
 pub fn defaultScenarios() []const Scenario {
     return &default_scenarios;
@@ -171,6 +285,21 @@ pub fn defaultScenarios() []const Scenario {
 /// Returns the route definition for the provided identifier, or null if absent.
 pub fn scenarioForRoute(route: RouteId) ?Scenario {
     for (default_scenarios) |scenario| {
+        if (scenario.route == route) {
+            return scenario;
+        }
+    }
+    return null;
+}
+
+/// Returns the UDP-focused HTTP/3 scenario catalog.
+pub fn defaultHttp3DatagramScenarios() []const Http3DatagramScenario {
+    return &default_http3_datagram_scenarios;
+}
+
+/// Returns the UDP-focused HTTP/3 scenario for the provided route, if any.
+pub fn http3DatagramScenarioForRoute(route: RouteId) ?Http3DatagramScenario {
+    for (default_http3_datagram_scenarios) |scenario| {
         if (scenario.route == route) {
             return scenario;
         }
@@ -219,108 +348,138 @@ pub fn matchRoute(method: types.Method, path: []const u8) ?RouteMatch {
     return null;
 }
 
+/// Builds a semantic response for a shared harness request.
+pub fn buildSemanticResponse(
+    allocator: std.mem.Allocator,
+    request: SemanticRequest,
+) !SemanticResponse {
+    const route = matchRoute(request.method, request.path) orelse {
+        var headers = types.Headers.init(allocator);
+        errdefer headers.deinit();
+        try headers.append("Content-Type", "application/json");
+        return .{
+            .allocator = allocator,
+            .status = .not_found,
+            .headers = headers,
+            .body = try allocator.dupe(u8, "{\"error\":\"not_found\"}"),
+        };
+    };
+
+    var headers = types.Headers.init(allocator);
+    errdefer headers.deinit();
+
+    var body = try allocator.alloc(u8, 0);
+    errdefer allocator.free(body);
+    var status = scenarioForRoute(route.route).?.success_status;
+
+    switch (route.route) {
+        .health => {
+            allocator.free(body);
+            try headers.append("Content-Type", "application/json");
+            body = try std.fmt.allocPrint(
+                allocator,
+                "{{\"status\":\"ok\",\"protocol\":\"{s}\"}}",
+                .{request.negotiated_protocol.asAlpnBytes()},
+            );
+        },
+        .echo_get, .echo_post => {
+            allocator.free(body);
+            try headers.append("Content-Type", "application/json");
+            body = try std.fmt.allocPrint(
+                allocator,
+                "{{\"method\":\"{s}\",\"path\":\"{s}\",\"protocol\":\"{s}\",\"body_size\":{d}}}",
+                .{
+                    request.method.asBytes(),
+                    request.path,
+                    request.negotiated_protocol.asAlpnBytes(),
+                    request.body.len,
+                },
+            );
+        },
+        .redirect_count => {
+            const count = route.redirect_count.?;
+            if (count == 0) {
+                status = .ok;
+                allocator.free(body);
+                try headers.append("Content-Type", "application/json");
+                body = try allocator.dupe(u8, "{\"redirects_followed\":0}");
+            } else {
+                status = .found;
+                const location = try std.fmt.allocPrint(allocator, "/redirect/{d}", .{count - 1});
+                defer allocator.free(location);
+                try headers.append("Location", location);
+            }
+        },
+        .cookies_set => {
+            const cookie_name = queryValue(request.query, "name") orelse "cookie";
+            const cookie_value = queryValue(request.query, "value") orelse "value";
+            const header = try std.fmt.allocPrint(
+                allocator,
+                "{s}={s}; Path=/",
+                .{ cookie_name, cookie_value },
+            );
+            defer allocator.free(header);
+            status = .no_content;
+            try headers.append("Set-Cookie", header);
+        },
+        .cookies_read => {
+            allocator.free(body);
+            try headers.append("Content-Type", "application/json");
+            body = try std.fmt.allocPrint(
+                allocator,
+                "{{\"cookie_header\":\"{s}\"}}",
+                .{request.cookie_header orelse ""},
+            );
+        },
+        .stream_chunked => {
+            allocator.free(body);
+            try headers.append("Content-Type", "text/plain");
+            body = try allocator.dupe(u8, "chunk-one\nchunk-two\nchunk-three\n");
+        },
+        .stream_large => {
+            allocator.free(body);
+            try headers.append("Content-Type", "application/octet-stream");
+            body = try allocator.alloc(u8, 64 * 1024);
+            for (body, 0..) |*byte, index| {
+                byte.* = @intCast(index % 251);
+            }
+        },
+    }
+
+    return .{
+        .allocator = allocator,
+        .status = status,
+        .headers = headers,
+        .body = body,
+    };
+}
+
 /// Default in-repo handler that serves the interop-harness contract.
 pub fn handleServerRequest(
     _: ?*anyopaque,
     request: *server_types.ServerRequest,
     writer: *server_types.ServerResponseWriter,
 ) !void {
-    const route = matchRoute(request.method, request.uri.path) orelse {
-        writer.setStatus(.not_found);
-        try writer.appendHeader("Content-Type", "application/json");
-        try writer.writeAll("{\"error\":\"not_found\"}");
-        return;
-    };
+    const body_bytes = try request.readBodyAlloc(request.allocator, 256 * 1024);
+    defer request.allocator.free(body_bytes);
 
-    switch (route.route) {
-        .health => {
-            const body = try std.fmt.allocPrint(
-                request.allocator,
-                "{{\"status\":\"ok\",\"protocol\":\"{s}\"}}",
-                .{request.negotiated_protocol.asAlpnBytes()},
-            );
-            defer request.allocator.free(body);
-            try writer.appendHeader("Content-Type", "application/json");
-            try writer.writeAll(body);
-        },
-        .echo_get, .echo_post => {
-            const body_bytes = try request.readBodyAlloc(
-                request.allocator,
-                256 * 1024,
-            );
-            defer request.allocator.free(body_bytes);
+    var response = try buildSemanticResponse(request.allocator, .{
+        .method = request.method,
+        .path = request.uri.path,
+        .query = request.uri.query,
+        .negotiated_protocol = request.negotiated_protocol,
+        .body = body_bytes,
+        .cookie_header = request.header("cookie"),
+    });
+    defer response.deinit();
 
-            const body = try std.fmt.allocPrint(
-                request.allocator,
-                "{{\"method\":\"{s}\",\"path\":\"{s}\",\"protocol\":\"{s}\",\"body_size\":{d}}}",
-                .{
-                    request.method.asBytes(),
-                    request.uri.path,
-                    request.negotiated_protocol.asAlpnBytes(),
-                    body_bytes.len,
-                },
-            );
-            defer request.allocator.free(body);
-            try writer.appendHeader("Content-Type", "application/json");
-            try writer.writeAll(body);
-        },
-        .redirect_count => {
-            const count = route.redirect_count.?;
-            if (count == 0) {
-                try writer.appendHeader("Content-Type", "application/json");
-                try writer.writeAll("{\"redirects_followed\":0}");
-                return;
-            }
-
-            writer.setStatus(.found);
-            const location = try std.fmt.allocPrint(request.allocator, "/redirect/{d}", .{count - 1});
-            defer request.allocator.free(location);
-            try writer.appendHeader("Location", location);
-        },
-        .cookies_set => {
-            const cookie_name = queryValue(request.uri.query, "name") orelse "cookie";
-            const cookie_value = queryValue(request.uri.query, "value") orelse "value";
-            const header = try std.fmt.allocPrint(
-                request.allocator,
-                "{s}={s}; Path=/",
-                .{ cookie_name, cookie_value },
-            );
-            defer request.allocator.free(header);
-            writer.setStatus(.no_content);
-            try writer.appendHeader("Set-Cookie", header);
-        },
-        .cookies_read => {
-            const cookie_header = request.header("cookie") orelse "";
-            const body = try std.fmt.allocPrint(
-                request.allocator,
-                "{{\"cookie_header\":\"{s}\"}}",
-                .{cookie_header},
-            );
-            defer request.allocator.free(body);
-            try writer.appendHeader("Content-Type", "application/json");
-            try writer.writeAll(body);
-        },
-        .stream_chunked => {
-            try writer.appendHeader("Content-Type", "text/plain");
-            try writer.writeAll("chunk-one\n");
-            try writer.writeAll("chunk-two\n");
-            try writer.writeAll("chunk-three\n");
-        },
-        .stream_large => {
-            try writer.appendHeader("Content-Type", "application/octet-stream");
-
-            var chunk: [4096]u8 = undefined;
-            for (&chunk, 0..) |*byte, index| {
-                byte.* = @intCast(index % 251);
-            }
-
-            var remaining: usize = 64 * 1024;
-            while (remaining > 0) {
-                const to_write = @min(remaining, chunk.len);
-                try writer.writeAll(chunk[0..to_write]);
-                remaining -= to_write;
-            }
-        },
+    writer.setStatus(response.status);
+    var iterator = response.headers.iterator();
+    while (iterator.next()) |header| {
+        try writer.appendHeader(header.name, header.value);
+    }
+    if (response.body.len > 0) {
+        try writer.writeAll(response.body);
     }
 }
 
@@ -353,4 +512,42 @@ test "route matcher resolves contract endpoints" {
     try std.testing.expectEqual(RouteId.health, matchRoute(.get, "/health").?.route);
     try std.testing.expectEqual(RouteId.echo_post, matchRoute(.post, "/echo").?.route);
     try std.testing.expectEqual(@as(u32, 3), matchRoute(.get, "/redirect/3").?.redirect_count.?);
+}
+
+test "semantic responses preserve http3 health and cookie semantics" {
+    var response = try buildSemanticResponse(std.testing.allocator, .{
+        .method = .get,
+        .path = "/health",
+        .query = null,
+        .negotiated_protocol = .h3,
+        .body = "",
+        .cookie_header = null,
+    });
+    defer response.deinit();
+
+    try std.testing.expectEqual(types.Status.ok, response.status);
+    try std.testing.expectEqualStrings("application/json", response.headers.get("content-type").?);
+    try std.testing.expect(std.mem.containsAtLeast(u8, response.body, 1, "\"protocol\":\"h3\""));
+
+    var cookies = try buildSemanticResponse(std.testing.allocator, .{
+        .method = .get,
+        .path = "/cookies/read",
+        .query = null,
+        .negotiated_protocol = .http_1_1,
+        .body = "",
+        .cookie_header = "session=abc",
+    });
+    defer cookies.deinit();
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, cookies.body, 1, "session=abc"));
+}
+
+test "udp http3 scenarios advertise local health and echo coverage" {
+    const scenarios = defaultHttp3DatagramScenarios();
+
+    try std.testing.expectEqual(@as(usize, 4), scenarios.len);
+    try std.testing.expectEqual(RouteId.health, scenarios[0].route);
+    try std.testing.expectEqual(Transport.udp, scenarios[0].endpoint.transport);
+    try std.testing.expectEqual(types.NegotiatedProtocol.h3, scenarios[1].endpoint.protocol);
+    try std.testing.expectEqual(@as(usize, 64 * 1024), http3DatagramScenarioForRoute(.echo_post).?.datagram_budget);
 }
