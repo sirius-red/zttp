@@ -14,4 +14,7 @@ test {
     _ = InteropHarness;
     _ = FixtureLoader;
     _ = SmokeRunner;
+    if (BuildOptions.http3) {
+        _ = @import("http3_interop_test.zig");
+    }
 }

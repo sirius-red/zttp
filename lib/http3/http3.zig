@@ -7,4 +7,7 @@ pub const enabled = BuildOptions.http3;
 
 test {
     _ = enabled;
+    if (enabled) {
+        _ = @import("quic_test.zig");
+    }
 }
