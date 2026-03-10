@@ -38,6 +38,8 @@ pub const OriginKey = types.OriginKey;
 pub const Headers = types.Headers;
 /// Streaming body reader type.
 pub const BodyReader = types.BodyReader;
+/// Streaming body writer type for server handlers.
+pub const BodyWriter = server.Types.BodyWriter;
 /// HTTP request type.
 pub const Request = types.Request;
 /// HTTP response type.
@@ -52,6 +54,14 @@ pub const Tls = tls;
 pub const Http2 = http2;
 /// Server module entrypoint.
 pub const Server = server;
+/// Server listener configuration type.
+pub const ServerConfig = server.ServerConfig;
+/// Server request type.
+pub const ServerRequest = server.ServerRequest;
+/// Server response writer type.
+pub const ServerResponseWriter = server.ServerResponseWriter;
+/// Bound server runtime type.
+pub const ServerRuntime = server.Server;
 /// Experimental HTTP/3 module entrypoint.
 pub const Http3 = http3;
 /// Shared testing module entrypoint.

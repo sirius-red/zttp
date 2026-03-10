@@ -6,9 +6,12 @@ pub const BuildOptions = @import("zttp_build_options");
 pub const Config = @import("config.zig");
 /// TLS client planning helpers.
 pub const Client = @import("client.zig");
+/// TLS server planning helpers.
+pub const Server = @import("server.zig");
 
 test {
     _ = BuildOptions;
     _ = Config;
     _ = Client;
+    _ = Server;
 }

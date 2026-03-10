@@ -43,13 +43,18 @@ const request_help =
 
 /// Help text for the server subcommand.
 const server_help =
-    \\zttp server - HTTP server harness (stub)
+    \\zttp server - HTTP server harness
     \\
     \\Usage:
     \\  zttp server [options]
     \\
     \\Options:
-    \\  -h, --help  Show help
+    \\      --listen <addr>     Bind host or IPv4 literal (default: 127.0.0.1)
+    \\      --port <number>     Bind TCP port (default: 8080)
+    \\      --tls-cert <path>   Certificate chain for TLS listener mode
+    \\      --tls-key <path>    Private key for TLS listener mode
+    \\      --http2             Enable minimal HTTP/2 negotiation planning
+    \\  -h, --help              Show help
     \\
 ;
 
@@ -175,11 +180,35 @@ const Cli = struct {
             return;
         }
 
-        _ = zttp.Version.http_1_1;
-        _ = zttp.Status.ok;
+        const server_args = self.parseServerArgs(args) catch |err| {
+            try self.printErr("zttp server: {s}\n", .{@errorName(err)});
+            return error.InvalidArguments;
+        };
 
-        try self.err.writeAll("zttp server: not implemented\n");
-        return error.NotImplemented;
+        var config = zttp.ServerConfig.init(zttp.Testing.InteropHarness.handleServerRequest);
+        config.listen_host = server_args.listen;
+        config.port = zttp.Port.init(server_args.port);
+        config.http2_enabled = server_args.http2;
+
+        if (server_args.tls_cert != null or server_args.tls_key != null) {
+            var tls = zttp.TlsConfig.default();
+            tls.verify = .insecure;
+            tls.certificate_chain_path = server_args.tls_cert;
+            tls.private_key_path = server_args.tls_key;
+            config.tls = tls;
+
+            const listener_plan = try zttp.Tls.Server.buildListenerPlan(tls);
+            _ = listener_plan;
+        }
+
+        var server = try zttp.ServerRuntime.init(self.allocator, config);
+        defer server.deinit();
+
+        try self.printErr("listening on {s}:{d}\n", .{
+            server_args.listen,
+            server.port(),
+        });
+        try server.serve();
     }
 
     /// Writes a formatted message to standard error.
@@ -402,6 +431,40 @@ const Cli = struct {
         InvalidHeader,
     };
 
+    /// Parsed arguments for the server command.
+    const ServerArgs = struct {
+        /// Bind host or IPv4 literal.
+        listen: []const u8,
+        /// Bind TCP port.
+        port: u16,
+        /// Optional TLS certificate chain.
+        tls_cert: ?[]const u8,
+        /// Optional TLS private key.
+        tls_key: ?[]const u8,
+        /// Enables minimal HTTP/2 negotiation planning.
+        http2: bool,
+    };
+
+    /// Error set returned by server argument parsing.
+    const ServerArgsError = error{
+        /// A required flag value was missing.
+        MissingFlagValue,
+        /// An unknown flag was provided.
+        UnknownFlag,
+        /// The listen flag was provided more than once.
+        DuplicateListen,
+        /// The port flag was provided more than once.
+        DuplicatePort,
+        /// The TLS certificate flag was provided more than once.
+        DuplicateTlsCert,
+        /// The TLS key flag was provided more than once.
+        DuplicateTlsKey,
+        /// The HTTP/2 flag was provided more than once.
+        DuplicateHttp2,
+        /// The port value was invalid.
+        InvalidPort,
+    };
+
     /// Parses request subcommand arguments into structured values.
     fn parseRequestArgs(self: *Cli, args: []const []const u8) RequestArgsError!RequestArgs {
         var headers = std.ArrayListUnmanaged(HeaderArg){};
@@ -504,8 +567,80 @@ const Cli = struct {
         };
     }
 
+    /// Parses server subcommand arguments into structured values.
+    fn parseServerArgs(self: *Cli, args: []const []const u8) ServerArgsError!ServerArgs {
+        _ = self;
+
+        var listen: ?[]const u8 = null;
+        var port: ?u16 = null;
+        var tls_cert: ?[]const u8 = null;
+        var tls_key: ?[]const u8 = null;
+        var http2 = false;
+
+        var index: usize = 0;
+        while (index < args.len) {
+            const arg = args[index];
+            if (std.mem.eql(u8, arg, "--listen")) {
+                if (listen != null) {
+                    return error.DuplicateListen;
+                }
+                listen = try requireServerValue(args, &index);
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--port")) {
+                if (port != null) {
+                    return error.DuplicatePort;
+                }
+                const raw_port = try requireServerValue(args, &index);
+                port = std.fmt.parseInt(u16, raw_port, 10) catch return error.InvalidPort;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--tls-cert")) {
+                if (tls_cert != null) {
+                    return error.DuplicateTlsCert;
+                }
+                tls_cert = try requireServerValue(args, &index);
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--tls-key")) {
+                if (tls_key != null) {
+                    return error.DuplicateTlsKey;
+                }
+                tls_key = try requireServerValue(args, &index);
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--http2")) {
+                if (http2) {
+                    return error.DuplicateHttp2;
+                }
+                http2 = true;
+                index += 1;
+                continue;
+            }
+            return error.UnknownFlag;
+        }
+
+        return .{
+            .listen = listen orelse "127.0.0.1",
+            .port = port orelse 8080,
+            .tls_cert = tls_cert,
+            .tls_key = tls_key,
+            .http2 = http2,
+        };
+    }
+
     /// Requires a value after a flag and advances the index.
     fn requireValue(args: []const []const u8, index: *usize) RequestArgsError![]const u8 {
+        if (index.* + 1 >= args.len) {
+            return error.MissingFlagValue;
+        }
+        const value = args[index.* + 1];
+        index.* += 2;
+        return value;
+    }
+
+    /// Requires a value after a server flag and advances the index.
+    fn requireServerValue(args: []const []const u8, index: *usize) ServerArgsError![]const u8 {
         if (index.* + 1 >= args.len) {
             return error.MissingFlagValue;
         }
@@ -682,6 +817,32 @@ test "smoke scenarios retain client and server cross-check coverage" {
 
     try std.testing.expect(request_http_found);
     try std.testing.expect(server_found);
+}
+
+test "server args parser accepts bind and tls flags" {
+    var cli = Cli{
+        .allocator = std.testing.allocator,
+        .out = std.fs.File.stdout(),
+        .err = std.fs.File.stderr(),
+    };
+
+    const args = try cli.parseServerArgs(&.{
+        "--listen",
+        "127.0.0.1",
+        "--port",
+        "9090",
+        "--tls-cert",
+        "server.pem",
+        "--tls-key",
+        "server.key",
+        "--http2",
+    });
+
+    try std.testing.expectEqualStrings("127.0.0.1", args.listen);
+    try std.testing.expectEqual(@as(u16, 9090), args.port);
+    try std.testing.expectEqualStrings("server.pem", args.tls_cert.?);
+    try std.testing.expectEqualStrings("server.key", args.tls_key.?);
+    try std.testing.expect(args.http2);
 }
 
 pub fn main() void {

@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const types = @import("../types.zig");
+const server_types = @import("../server/types.zig");
 
 /// Stable route identifier from the interop harness contract.
 pub const RouteId = enum {
@@ -177,6 +178,167 @@ pub fn scenarioForRoute(route: RouteId) ?Scenario {
     return null;
 }
 
+/// Route match result for a concrete request path.
+pub const RouteMatch = struct {
+    /// Matched route identifier.
+    route: RouteId,
+    /// Parsed redirect count for `/redirect/{count}`, when applicable.
+    redirect_count: ?u32 = null,
+};
+
+/// Matches a method and path to one of the shared interop routes.
+pub fn matchRoute(method: types.Method, path: []const u8) ?RouteMatch {
+    if (method == .get and std.mem.eql(u8, path, "/health")) {
+        return .{ .route = .health };
+    }
+    if (std.mem.eql(u8, path, "/echo")) {
+        return .{
+            .route = if (method == .post) .echo_post else .echo_get,
+        };
+    }
+    if (method == .get and std.mem.startsWith(u8, path, "/redirect/")) {
+        const count_bytes = path["/redirect/".len..];
+        const count = std.fmt.parseInt(u32, count_bytes, 10) catch return null;
+        return .{
+            .route = .redirect_count,
+            .redirect_count = count,
+        };
+    }
+    if (method == .get and std.mem.eql(u8, path, "/cookies/set")) {
+        return .{ .route = .cookies_set };
+    }
+    if (method == .get and std.mem.eql(u8, path, "/cookies/read")) {
+        return .{ .route = .cookies_read };
+    }
+    if (method == .get and std.mem.eql(u8, path, "/stream/chunked")) {
+        return .{ .route = .stream_chunked };
+    }
+    if (method == .get and std.mem.eql(u8, path, "/stream/large")) {
+        return .{ .route = .stream_large };
+    }
+    return null;
+}
+
+/// Default in-repo handler that serves the interop-harness contract.
+pub fn handleServerRequest(
+    _: ?*anyopaque,
+    request: *server_types.ServerRequest,
+    writer: *server_types.ServerResponseWriter,
+) !void {
+    const route = matchRoute(request.method, request.uri.path) orelse {
+        writer.setStatus(.not_found);
+        try writer.appendHeader("Content-Type", "application/json");
+        try writer.writeAll("{\"error\":\"not_found\"}");
+        return;
+    };
+
+    switch (route.route) {
+        .health => {
+            const body = try std.fmt.allocPrint(
+                request.allocator,
+                "{{\"status\":\"ok\",\"protocol\":\"{s}\"}}",
+                .{request.negotiated_protocol.asAlpnBytes()},
+            );
+            defer request.allocator.free(body);
+            try writer.appendHeader("Content-Type", "application/json");
+            try writer.writeAll(body);
+        },
+        .echo_get, .echo_post => {
+            const body_bytes = try request.readBodyAlloc(
+                request.allocator,
+                256 * 1024,
+            );
+            defer request.allocator.free(body_bytes);
+
+            const body = try std.fmt.allocPrint(
+                request.allocator,
+                "{{\"method\":\"{s}\",\"path\":\"{s}\",\"protocol\":\"{s}\",\"body_size\":{d}}}",
+                .{
+                    request.method.asBytes(),
+                    request.uri.path,
+                    request.negotiated_protocol.asAlpnBytes(),
+                    body_bytes.len,
+                },
+            );
+            defer request.allocator.free(body);
+            try writer.appendHeader("Content-Type", "application/json");
+            try writer.writeAll(body);
+        },
+        .redirect_count => {
+            const count = route.redirect_count.?;
+            if (count == 0) {
+                try writer.appendHeader("Content-Type", "application/json");
+                try writer.writeAll("{\"redirects_followed\":0}");
+                return;
+            }
+
+            writer.setStatus(.found);
+            const location = try std.fmt.allocPrint(request.allocator, "/redirect/{d}", .{count - 1});
+            defer request.allocator.free(location);
+            try writer.appendHeader("Location", location);
+        },
+        .cookies_set => {
+            const cookie_name = queryValue(request.uri.query, "name") orelse "cookie";
+            const cookie_value = queryValue(request.uri.query, "value") orelse "value";
+            const header = try std.fmt.allocPrint(
+                request.allocator,
+                "{s}={s}; Path=/",
+                .{ cookie_name, cookie_value },
+            );
+            defer request.allocator.free(header);
+            writer.setStatus(.no_content);
+            try writer.appendHeader("Set-Cookie", header);
+        },
+        .cookies_read => {
+            const cookie_header = request.header("cookie") orelse "";
+            const body = try std.fmt.allocPrint(
+                request.allocator,
+                "{{\"cookie_header\":\"{s}\"}}",
+                .{cookie_header},
+            );
+            defer request.allocator.free(body);
+            try writer.appendHeader("Content-Type", "application/json");
+            try writer.writeAll(body);
+        },
+        .stream_chunked => {
+            try writer.appendHeader("Content-Type", "text/plain");
+            try writer.writeAll("chunk-one\n");
+            try writer.writeAll("chunk-two\n");
+            try writer.writeAll("chunk-three\n");
+        },
+        .stream_large => {
+            try writer.appendHeader("Content-Type", "application/octet-stream");
+
+            var chunk: [4096]u8 = undefined;
+            for (&chunk, 0..) |*byte, index| {
+                byte.* = @intCast(index % 251);
+            }
+
+            var remaining: usize = 64 * 1024;
+            while (remaining > 0) {
+                const to_write = @min(remaining, chunk.len);
+                try writer.writeAll(chunk[0..to_write]);
+                remaining -= to_write;
+            }
+        },
+    }
+}
+
+/// Returns the first matching query value for the given key.
+fn queryValue(query: ?[]const u8, name: []const u8) ?[]const u8 {
+    const raw_query = query orelse return null;
+    var pairs = std.mem.splitScalar(u8, raw_query, '&');
+    while (pairs.next()) |pair| {
+        var entry = std.mem.splitScalar(u8, pair, '=');
+        const key = entry.next() orelse continue;
+        const value = entry.next() orelse continue;
+        if (std.mem.eql(u8, key, name)) {
+            return value;
+        }
+    }
+    return null;
+}
+
 test "route catalog includes contract endpoints" {
     const health = scenarioForRoute(.health).?;
     try std.testing.expectEqualStrings("/health", health.path_template);
@@ -185,4 +347,10 @@ test "route catalog includes contract endpoints" {
     const redirect = scenarioForRoute(.redirect_count).?;
     try std.testing.expectEqual(types.Status.found, redirect.success_status);
     try std.testing.expectEqual(ResponseMode.redirect, redirect.response_mode);
+}
+
+test "route matcher resolves contract endpoints" {
+    try std.testing.expectEqual(RouteId.health, matchRoute(.get, "/health").?.route);
+    try std.testing.expectEqual(RouteId.echo_post, matchRoute(.post, "/echo").?.route);
+    try std.testing.expectEqual(@as(u32, 3), matchRoute(.get, "/redirect/3").?.redirect_count.?);
 }

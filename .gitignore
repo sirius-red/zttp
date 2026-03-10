@@ -4,6 +4,13 @@
 .zig-local-cache
 zig-out
 
+### Common ###
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+.idea/
+
 ### Docs build ###
 /procz.o
 /procz.obj
