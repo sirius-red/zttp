@@ -14,6 +14,7 @@ test {
     _ = InteropHarness;
     _ = FixtureLoader;
     _ = SmokeRunner;
+    _ = @import("malformed_input_test.zig");
     if (BuildOptions.http3) {
         _ = @import("http3_interop_test.zig");
     }

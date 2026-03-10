@@ -103,6 +103,11 @@ pub const Server = struct {
     }
 };
 
+/// Returns a harness server for the provided host and port.
+pub fn init(allocator: std.mem.Allocator, options: Options) Server {
+    return Server.init(allocator, options);
+}
+
 /// Decodes request frames into a semantic request.
 pub fn decodeRequest(allocator: std.mem.Allocator, bytes: []const u8) Error!DecodedRequest {
     const frames = try qpack.decodeFrames(allocator, bytes);
