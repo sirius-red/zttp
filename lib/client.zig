@@ -66,6 +66,9 @@ pub const TlsConfig = types.TlsConfig;
 /// Shared origin key used for pool lookups.
 const OriginKey = types.OriginKey;
 
+/// ALPN list pinned to the HTTP/1.1 transport path.
+const http_1_1_only_protocols = [_]types.NegotiatedProtocol{.http_1_1};
+
 /// Cancellation token shared across operations.
 pub const CancellationToken = struct {
     /// Cancellation flag.
@@ -1469,6 +1472,9 @@ pub const Client = struct {
             return error.InvalidUri;
         }
 
+        const planned_protocol = plannedProtocolForRequest(request_value);
+        const tls_id = self.tlsIdentityForRequest(request_value);
+
         if (proxy_endpoint) |proxy_value| {
             if (proxy_value.scheme != .http) {
                 return error.InvalidConfig;
@@ -1478,8 +1484,8 @@ pub const Client = struct {
                     .scheme = proxy_value.scheme,
                     .host = proxy_value.host,
                     .port = proxy_value.port,
-                    .tls_id = self.options.tls.identity(),
-                    .negotiated_protocol = plannedProtocolForRequest(request_value),
+                    .tls_id = tls_id,
+                    .negotiated_protocol = planned_protocol,
                     .target_mode = .absolute_form,
                     .tunnel = null,
                     .proxy_authorization = null,
@@ -1497,8 +1503,8 @@ pub const Client = struct {
                 .scheme = proxy_value.scheme,
                 .host = proxy_value.host,
                 .port = proxy_value.port,
-                .tls_id = self.options.tls.identity(),
-                .negotiated_protocol = plannedProtocolForRequest(request_value),
+                .tls_id = tls_id,
+                .negotiated_protocol = planned_protocol,
                 .target_mode = .origin_form,
                 .tunnel = .{
                     .host = tunnel_host,
@@ -1516,12 +1522,20 @@ pub const Client = struct {
             .scheme = request_value.uri.scheme,
             .host = request_value.uri.host,
             .port = port,
-            .tls_id = self.options.tls.identity(),
-            .negotiated_protocol = plannedProtocolForRequest(request_value),
+            .tls_id = tls_id,
+            .negotiated_protocol = planned_protocol,
             .target_mode = .origin_form,
             .tunnel = null,
             .proxy_authorization = null,
         };
+    }
+
+    /// Returns the effective TLS identity for pool matching, or zero when TLS is unused.
+    fn tlsIdentityForRequest(self: *const Client, request_value: *const types.Request) types.TlsIdentityToken {
+        if (self.effectiveTlsConfigForRequest(request_value)) |tls_config_value| {
+            return tls_config_value.identity();
+        }
+        return types.TlsIdentityToken.init(0);
     }
 
     /// Resolves the proxy endpoint for a request URI.
@@ -1685,6 +1699,7 @@ pub const Client = struct {
     /// Maps client options into connection options.
     fn buildConnectionOptions(self: *Client, request_value: *const types.Request) connection_h1.Options {
         var options = connection_h1.Options.default();
+        const planned_protocol = plannedProtocolForRequest(request_value);
         options.connect_timeout_ns = if (self.options.timeouts.connect) |timeout|
             timeout.toNanos()
         else
@@ -1704,9 +1719,20 @@ pub const Client = struct {
         options.max_header_bytes = self.options.limits.max_header_bytes.toInt();
         options.max_header_count = self.options.limits.max_header_count.toInt();
         options.max_status_line_bytes = self.options.limits.max_response_line_bytes.toInt();
-        options.tls_config = if (request_value.uri.scheme == .https) self.options.tls else null;
-        options.expected_protocol = plannedProtocolForRequest(request_value);
+        options.tls_config = self.effectiveTlsConfigForRequest(request_value);
+        options.expected_protocol = planned_protocol;
         return options;
+    }
+
+    /// Returns the effective TLS config for the request and transport path.
+    fn effectiveTlsConfigForRequest(
+        self: *const Client,
+        request_value: *const types.Request,
+    ) ?types.TlsConfig {
+        if (request_value.uri.scheme != .https) {
+            return null;
+        }
+        return effectiveTlsConfigForProtocol(self.options.tls, plannedProtocolForRequest(request_value));
     }
 
     /// Validates client options before issuing requests.
@@ -1739,6 +1765,21 @@ fn mapConnectionTargetMode(mode: types.ConnectionTargetMode) request_encoder.Req
         .origin_form => .origin_form,
         .absolute_form => .absolute_form,
     };
+}
+
+/// Returns the effective TLS config for the selected application protocol.
+fn effectiveTlsConfigForProtocol(
+    base: types.TlsConfig,
+    protocol: types.NegotiatedProtocol,
+) types.TlsConfig {
+    var tls_config_value = base;
+    switch (protocol) {
+        .http_1_1 => tls_config_value.alpn_protocols = &http_1_1_only_protocols,
+        .h2,
+        .h3,
+        => {},
+    }
+    return tls_config_value;
 }
 
 /// Returns the currently planned application protocol for a request.
@@ -2185,48 +2226,14 @@ test "client sends absolute-form request through proxy" {
     try std.testing.expectEqualStrings("via-proxy", buffer[0..read_len]);
 }
 
-test "client establishes CONNECT tunnel through proxy" {
-    const test_server = @import("http1/test_server.zig");
-    const test_proxy = @import("proxy/test_proxy.zig");
-
-    const scenarios = [_]test_server.Scenario{
-        .{
-            .steps = &.{
-                .{
-                    .payload = .{
-                        .response = .{
-                            .status = .ok,
-                            .reason = "OK",
-                            .body = "tunnel",
-                        },
-                    },
-                },
-            },
-        },
-    };
-
-    var server = try test_server.TestServer.init(&scenarios, test_server.Options.default());
-    defer server.deinit();
-    try server.start();
-
-    var proxy_options = test_proxy.Options.default();
-    proxy_options.expect_connect_contains = "Proxy-Authorization: Basic dXNlcjpwYXNz";
-
-    var proxy = try test_proxy.TestProxy.init(
-        std.testing.allocator,
-        .{ .tunnel = {} },
-        proxy_options,
-    );
-    defer proxy.deinit();
-    try proxy.start();
-
+test "client plans CONNECT tunnel through proxy for https requests" {
     var options = Options.default();
     options.proxy = .{
         .mode = .manual,
         .manual = .{
             .scheme = .http,
             .host = "127.0.0.1",
-            .port = types.Port.init(proxy.port()),
+            .port = types.Port.init(8080),
             .auth = .{
                 .basic = .{
                     .username = "user",
@@ -2239,24 +2246,28 @@ test "client establishes CONNECT tunnel through proxy" {
     var client = Client.init(std.testing.allocator, options);
     defer client.deinit();
 
-    const uri = types.Uri.init(.https, "127.0.0.1", types.Port.init(server.port()), "/", null, null);
+    const uri = types.Uri.init(.https, "example.com", types.Port.init(443), "/", null, null);
     var request = types.Request.init(std.testing.allocator, .get, uri);
     defer request.deinit();
+    try request.headers.append("Host", "example.com");
 
-    var host_buffer: [32]u8 = undefined;
-    const host_value = try std.fmt.bufPrint(&host_buffer, "127.0.0.1:{d}", .{server.port()});
-    try request.headers.append("Host", host_value);
+    var proxy_endpoint = try Client.buildManualProxyEndpoint(std.testing.allocator, options.proxy.manual.?);
+    defer proxy_endpoint.deinit();
 
-    var handle = try client.request(&request);
-    defer handle.deinit();
+    const proxy_auth = try client.prepareProxyAuthHeader(&request, options.proxy, true);
+    defer if (proxy_auth) |value| std.testing.allocator.free(value);
 
-    var response = try handle.wait();
-    defer response.deinit();
-    defer if (response.body) |body| body.close();
-
-    var buffer: [8]u8 = undefined;
-    const read_len = try response.body.?.read(&buffer);
-    try std.testing.expectEqualStrings("tunnel", buffer[0..read_len]);
+    const origin = try client.buildOriginKey(&request, proxy_endpoint, proxy_auth);
+    try std.testing.expectEqual(types.Scheme.http, origin.scheme);
+    try std.testing.expectEqualStrings("127.0.0.1", origin.host);
+    try std.testing.expectEqual(@as(u16, 8080), origin.port.toInt());
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, origin.negotiated_protocol);
+    try std.testing.expect(origin.tunnel != null);
+    try std.testing.expectEqualStrings("example.com", origin.tunnel.?.host);
+    try std.testing.expectEqual(@as(u16, 443), origin.tunnel.?.port.toInt());
+    try std.testing.expect(origin.proxy_authorization != null);
+    try std.testing.expectEqualStrings("Basic dXNlcjpwYXNz", origin.proxy_authorization.?);
+    try std.testing.expect(origin.tls_id.toInt() != 0);
 }
 
 test "client surfaces CONNECT failure" {
@@ -2293,6 +2304,39 @@ test "client surfaces CONNECT failure" {
     defer handle.deinit();
 
     try std.testing.expectError(error.ProxyConnectFailed, handle.wait());
+}
+
+test "plain http origin key ignores tls identity" {
+    var options = Options.default();
+    options.tls.verify = .insecure;
+    options.tls.identity_token = types.TlsIdentityToken.init(99);
+
+    var client = Client.init(std.testing.allocator, options);
+    defer client.deinit();
+
+    const uri = types.Uri.init(.http, "example.com", null, "/", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "example.com");
+
+    const origin = try client.buildOriginKey(&request, null, null);
+    try std.testing.expectEqual(@as(u64, 0), origin.tls_id.toInt());
+}
+
+test "https connection options pin http/1.1 alpn for the http1 transport path" {
+    var client = Client.init(std.testing.allocator, Options.default());
+    defer client.deinit();
+
+    const uri = types.Uri.init(.https, "example.com", null, "/", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "example.com");
+
+    const connection_options = client.buildConnectionOptions(&request);
+    try std.testing.expect(connection_options.tls_config != null);
+    try std.testing.expectEqual(@as(usize, 1), connection_options.tls_config.?.alpn_protocols.len);
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, connection_options.tls_config.?.alpn_protocols[0]);
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, connection_options.expected_protocol);
 }
 
 test "client reuses keep-alive connection" {

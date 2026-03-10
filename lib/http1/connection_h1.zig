@@ -8,6 +8,7 @@ const future = @import("../util/future.zig");
 const body_pipe = @import("../util/body_pipe.zig");
 const request_encoder = @import("request_encoder.zig");
 const response_parser = @import("response_parser.zig");
+const tls_client = @import("../tls/client.zig");
 
 /// Error set returned by connection operations.
 pub const Error = error{
@@ -151,6 +152,9 @@ const ConnectResponseError = StreamReader.Error || std.mem.Allocator.Error || er
     HeaderCountExceeded,
 };
 
+/// Application protocols accepted by the HTTP/1.1 transport path.
+const http_1_1_protocols = [_]types.NegotiatedProtocol{.http_1_1};
+
 /// Reader wrapper for raw stream reads.
 const StreamReader = struct {
     /// Stream handle for reading.
@@ -195,6 +199,62 @@ const StreamWriter = struct {
     }
 };
 
+/// Reader wrapper that abstracts over raw and TLS-backed streams.
+const TransportReader = struct {
+    /// Connection owning the active transport.
+    connection: *ConnectionH1,
+
+    /// Error set returned by transport reads.
+    pub const Error = std.net.Stream.ReadError || std.Io.Reader.ShortError;
+
+    /// Initializes a reader for the provided connection.
+    pub fn init(connection: *ConnectionH1) TransportReader {
+        return .{ .connection = connection };
+    }
+
+    /// Reads bytes from the active transport.
+    pub fn read(self: *TransportReader, dest: []u8) TransportReader.Error!usize {
+        if (self.connection.tls_stream) |tls_stream| {
+            return tls_stream.reader().readSliceShort(dest);
+        }
+        return self.connection.stream.?.read(dest);
+    }
+};
+
+/// Writer wrapper that abstracts over raw and TLS-backed streams.
+const TransportWriter = struct {
+    /// Connection owning the active transport.
+    connection: *ConnectionH1,
+
+    /// Error set returned by transport writes.
+    pub const Error = std.net.Stream.WriteError || std.Io.Writer.Error;
+
+    /// Initializes a writer for the provided connection.
+    pub fn init(connection: *ConnectionH1) TransportWriter {
+        return .{ .connection = connection };
+    }
+
+    /// Writes all bytes to the active transport.
+    pub fn writeAll(self: *TransportWriter, bytes: []const u8) TransportWriter.Error!void {
+        if (self.connection.tls_stream) |tls_stream| {
+            try tls_stream.writer().writeAll(bytes);
+            return;
+        }
+        try self.connection.stream.?.writeAll(bytes);
+    }
+
+    /// Writes a single byte to the active transport.
+    pub fn writeByte(self: *TransportWriter, byte: u8) TransportWriter.Error!void {
+        if (self.connection.tls_stream) |tls_stream| {
+            try tls_stream.writer().writeByte(byte);
+            return;
+        }
+
+        var buf: [1]u8 = .{byte};
+        try self.connection.stream.?.writeAll(&buf);
+    }
+};
+
 /// HTTP/1.1 connection implementation backed by a dedicated thread.
 pub const ConnectionH1 = struct {
     /// Allocator used for per-request allocations.
@@ -209,8 +269,12 @@ pub const ConnectionH1 = struct {
     thread: ?std.Thread,
     /// Active TCP stream or null when disconnected.
     stream: ?std.net.Stream,
+    /// Active TLS stream layered over the TCP stream.
+    tls_stream: ?*tls_client.ClientStream,
     /// Indicates whether a CONNECT tunnel is established.
     tunnel_established: bool,
+    /// Negotiated application protocol for the current transport.
+    negotiated_protocol: types.NegotiatedProtocol,
 
     /// Initializes a connection without starting the background thread.
     pub fn init(allocator: std.mem.Allocator, origin: Origin, options: Options) ConnectionH1 {
@@ -221,7 +285,9 @@ pub const ConnectionH1 = struct {
             .mailbox = Mailbox.init(allocator),
             .thread = null,
             .stream = null,
+            .tls_stream = null,
             .tunnel_established = false,
+            .negotiated_protocol = .http_1_1,
         };
     }
 
@@ -459,9 +525,19 @@ pub const ConnectionH1 = struct {
 
     /// Ensures a TCP connection is established.
     fn ensureConnected(self: *ConnectionH1, request_start: i128) Error!void {
+        if (self.tls_stream != null) {
+            return;
+        }
+
         if (self.stream != null) {
             if (self.origin.tunnel != null and !self.tunnel_established) {
                 self.establishTunnel(request_start) catch |err| {
+                    self.closeStream();
+                    return err;
+                };
+            }
+            if (self.options.tls_config != null) {
+                self.establishTls() catch |err| {
                     self.closeStream();
                     return err;
                 };
@@ -491,6 +567,12 @@ pub const ConnectionH1 = struct {
         self.stream = stream;
         if (self.origin.tunnel != null) {
             self.establishTunnel(request_start) catch |err| {
+                self.closeStream();
+                return err;
+            };
+        }
+        if (self.options.tls_config != null) {
+            self.establishTls() catch |err| {
                 self.closeStream();
                 return err;
             };
@@ -660,13 +742,69 @@ pub const ConnectionH1 = struct {
         };
     }
 
+    /// Attaches a TLS session to the connected stream when HTTPS is enabled.
+    fn establishTls(self: *ConnectionH1) Error!void {
+        if (self.tls_stream != null) {
+            return;
+        }
+
+        const tls_config = self.options.tls_config orelse return;
+        if (self.options.expected_protocol != .http_1_1) {
+            return error.Protocol;
+        }
+
+        const stream = self.stream orelse return error.Transport;
+        self.stream = null;
+
+        const tls_stream = tls_client.establish(
+            self.allocator,
+            stream,
+            self.buildTlsUri(),
+            tls_config,
+            &http_1_1_protocols,
+        ) catch |err| return mapTlsError(err);
+
+        self.tls_stream = tls_stream;
+        self.negotiated_protocol = tls_stream.negotiatedProtocol();
+        if (self.negotiated_protocol != self.options.expected_protocol) {
+            return error.Protocol;
+        }
+    }
+
+    /// Builds the URI view used for HTTPS handshake planning.
+    fn buildTlsUri(self: *const ConnectionH1) types.Uri {
+        if (self.origin.tunnel) |tunnel| {
+            return types.Uri.init(.https, tunnel.host, tunnel.port, "/", null, null);
+        }
+        return types.Uri.init(.https, self.origin.host, self.origin.port, "/", null, null);
+    }
+
+    /// Maps TLS handshake failures into connection errors.
+    fn mapTlsError(err: tls_client.Error) Error {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.MissingServerName => error.InvalidUri,
+            error.NoSharedProtocol => error.Protocol,
+            error.InvalidRootStore,
+            error.RootStoreUnavailable,
+            error.HostnameMismatch,
+            error.PeerVerificationFailed,
+            error.TlsHandshakeFailed,
+            error.TransportFailure,
+            => error.Transport,
+            error.MissingExplicitRoots,
+            error.IncompleteIdentity,
+            error.MissingAlpnProtocols,
+            => error.Protocol,
+        };
+    }
+
     /// Writes the request to the socket.
     fn sendRequest(self: *ConnectionH1, request: *const types.Request, request_start: i128) Error!void {
         try self.checkRequestTimeout(request_start);
 
-        var stream = self.stream.?;
-        var writer = StreamWriter.init(&stream);
-        var encoder = request_encoder.RequestEncoder(StreamWriter).init(&writer);
+        var writer = TransportWriter.init(self);
+        var encoder = request_encoder.RequestEncoder(TransportWriter).init(&writer);
 
         var body_writer = encoder.writeRequest(request, self.origin.target_mode) catch |err| return mapEncoderError(err);
 
@@ -688,15 +826,13 @@ pub const ConnectionH1 = struct {
     /// Reads and parses the response from the socket.
     fn readResponse(self: *ConnectionH1, request_start: i128) Error!ResponseInfo {
         try self.checkRequestTimeout(request_start);
-
-        var stream = self.stream.?;
         const limits = self.buildParserLimits();
 
         const buffer = self.allocator.alloc(u8, self.options.io_buffer_bytes) catch |err| return mapAllocatorError(err);
         defer self.allocator.free(buffer);
 
-        var reader = StreamReader.init(&stream);
-        var parser = response_parser.ResponseParser(StreamReader).init(
+        var reader = TransportReader.init(self);
+        var parser = response_parser.ResponseParser(TransportReader).init(
             self.allocator,
             &reader,
             buffer,
@@ -788,11 +924,15 @@ pub const ConnectionH1 = struct {
 
     /// Closes the active stream if present.
     fn closeStream(self: *ConnectionH1) void {
-        if (self.stream) |stream| {
+        if (self.tls_stream) |tls_stream| {
+            tls_stream.deinit();
+            self.tls_stream = null;
+        } else if (self.stream) |stream| {
             stream.close();
             self.stream = null;
         }
         self.tunnel_established = false;
+        self.negotiated_protocol = .http_1_1;
     }
 
     /// Maps allocator errors into connection errors.
@@ -809,7 +949,7 @@ pub const ConnectionH1 = struct {
     }
 
     /// Maps request encoder errors into connection errors.
-    fn mapEncoderError(err: request_encoder.RequestEncoder(StreamWriter).Error) Error {
+    fn mapEncoderError(err: request_encoder.RequestEncoder(TransportWriter).Error) Error {
         return switch (err) {
             error.InvalidRequestTarget => error.InvalidUri,
             error.BodyTooLarge => error.LimitExceeded,
@@ -832,7 +972,7 @@ pub const ConnectionH1 = struct {
     }
 
     /// Maps response parser errors into connection errors.
-    fn mapParserError(err: response_parser.ResponseParser(StreamReader).Error) Error {
+    fn mapParserError(err: response_parser.ResponseParser(TransportReader).Error) Error {
         return switch (err) {
             error.HeaderTooLarge,
             error.HeaderCountExceeded,
@@ -842,6 +982,7 @@ pub const ConnectionH1 = struct {
             error.ConnectionTimedOut,
             error.WouldBlock,
             => error.Timeout,
+            error.ReadFailed => error.Transport,
             error.UnexpectedEof,
             error.ConnectionResetByPeer,
             => error.Transport,
