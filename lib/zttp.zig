@@ -69,9 +69,11 @@ test {
     _ = @import("http2/hpack.zig");
     _ = @import("http2/connection.zig");
     _ = @import("http2/connection_test.zig");
+    _ = @import("server/server_test.zig");
     _ = @import("cookies/cookie_jar.zig");
     _ = @import("redirects/redirects.zig");
     _ = @import("proxy/proxy_env.zig");
     _ = @import("testing/client_interop_test.zig");
+    _ = @import("testing/server_interop_test.zig");
     _ = testing;
 }

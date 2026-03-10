@@ -631,6 +631,59 @@ const Cli = struct {
     }
 };
 
+test "cli help advertises request and server entrypoints" {
+    try std.testing.expect(std.mem.containsAtLeast(u8, help_text, 1, "request"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, help_text, 1, "server"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, server_help, 1, "zttp server"));
+}
+
+test "smoke scenarios keep a runnable server command" {
+    const scenarios = zttp.Testing.SmokeRunner.defaultScenarios();
+
+    var found = false;
+    for (scenarios) |scenario| {
+        if (!std.mem.eql(u8, scenario.name, "server")) {
+            continue;
+        }
+
+        found = true;
+        try std.testing.expectEqualStrings("Verify the server CLI can bind and answer health probes", scenario.summary);
+        try std.testing.expectEqual(@as(usize, 9), scenario.command.argv.len);
+        try std.testing.expectEqualStrings("zig", scenario.command.argv[0]);
+        try std.testing.expectEqualStrings("build", scenario.command.argv[1]);
+        try std.testing.expectEqualStrings("run", scenario.command.argv[2]);
+        try std.testing.expectEqualStrings("--", scenario.command.argv[3]);
+        try std.testing.expectEqualStrings("server", scenario.command.argv[4]);
+        try std.testing.expectEqualStrings("--listen", scenario.command.argv[5]);
+        try std.testing.expectEqualStrings("127.0.0.1", scenario.command.argv[6]);
+        try std.testing.expectEqualStrings("--port", scenario.command.argv[7]);
+        try std.testing.expectEqualStrings("8080", scenario.command.argv[8]);
+        try std.testing.expectEqual(zttp.Testing.InteropHarness.RouteId.health, scenario.route.?);
+    }
+
+    try std.testing.expect(found);
+}
+
+test "smoke scenarios retain client and server cross-check coverage" {
+    const scenarios = zttp.Testing.SmokeRunner.defaultScenarios();
+
+    var request_http_found = false;
+    var server_found = false;
+    for (scenarios) |scenario| {
+        if (std.mem.eql(u8, scenario.name, "request-http")) {
+            request_http_found = true;
+            try std.testing.expectEqual(zttp.Testing.InteropHarness.RouteId.echo_get, scenario.route.?);
+        }
+        if (std.mem.eql(u8, scenario.name, "server")) {
+            server_found = true;
+            try std.testing.expectEqual(zttp.Testing.InteropHarness.RouteId.health, scenario.route.?);
+        }
+    }
+
+    try std.testing.expect(request_http_found);
+    try std.testing.expect(server_found);
+}
+
 pub fn main() void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
