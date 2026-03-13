@@ -137,7 +137,91 @@ pub const Http3DatagramScenario = struct {
     datagram_budget: usize,
 };
 
+/// Host platform classification for release-readiness scenarios.
+pub const ReadinessPlatform = enum {
+    /// Microsoft Windows hosts.
+    windows,
+    /// Linux hosts.
+    linux,
+    /// macOS or Darwin hosts.
+    macos,
+};
+
+/// Stable identifier for a release-readiness scenario.
+pub const ReadinessScenarioId = enum {
+    /// Windows loopback `server` + `request` reproduction path.
+    windows_loopback_cli_roundtrip,
+};
+
+/// Shell command attached to a readiness scenario.
+pub const ReadinessCommand = struct {
+    /// Stable label for reporting.
+    name: []const u8,
+    /// Argument vector used to invoke the command.
+    argv: []const []const u8,
+};
+
+/// Release-readiness scenario shared across docs, smoke checks, and regression tests.
+pub const ReadinessScenario = struct {
+    /// Stable scenario identifier.
+    id: ReadinessScenarioId,
+    /// Human-readable scenario name.
+    name: []const u8,
+    /// Short summary of the readiness contract.
+    summary: []const u8,
+    /// Platforms targeted by the scenario.
+    platforms: []const ReadinessPlatform,
+    /// Harness route validated by the scenario.
+    route: RouteId,
+    /// Endpoint expected by the documented workflow.
+    endpoint: Endpoint,
+    /// Long-running server command started before the probe.
+    server_command: ReadinessCommand,
+    /// Probe command executed against the loopback server.
+    request_command: ReadinessCommand,
+    /// Expected success status from the request.
+    expected_status: types.Status,
+    /// Expected substring in the response body or diagnostics.
+    expected_body_substring: []const u8,
+    /// Whether the scenario blocks default release-readiness claims.
+    blocking: bool,
+    /// Whether the scenario is experimental.
+    experimental: bool,
+    /// Known failure signature captured before the fix lands, if any.
+    known_failure_signature: ?[]const u8,
+
+    /// Returns true when the scenario targets the provided platform.
+    pub fn supportsPlatform(self: ReadinessScenario, platform: ReadinessPlatform) bool {
+        for (self.platforms) |candidate| {
+            if (candidate == platform) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
 const route_protocols = [_]types.NegotiatedProtocol{ .http_1_1, .h2, .h3 };
+const windows_only_platforms = [_]ReadinessPlatform{.windows};
+const windows_loopback_server_command = [_][]const u8{
+    "zig",
+    "build",
+    "run",
+    "--",
+    "server",
+    "--listen",
+    "127.0.0.1",
+    "--port",
+    "18080",
+};
+const windows_loopback_request_command = [_][]const u8{
+    "zig",
+    "build",
+    "run",
+    "--",
+    "request",
+    "http://127.0.0.1:18080/health",
+};
 
 const default_scenarios = [_]Scenario{
     .{
@@ -230,6 +314,35 @@ const default_scenarios = [_]Scenario{
     },
 };
 
+const default_readiness_scenarios = [_]ReadinessScenario{
+    .{
+        .id = .windows_loopback_cli_roundtrip,
+        .name = "windows-loopback-cli-roundtrip",
+        .summary = "Verify the documented Windows loopback /health round-trip through `zttp server` and `zttp request`.",
+        .platforms = &windows_only_platforms,
+        .route = .health,
+        .endpoint = .{
+            .host = "127.0.0.1",
+            .port = types.Port.init(18080),
+            .transport = .tcp,
+            .protocol = .http_1_1,
+        },
+        .server_command = .{
+            .name = "server",
+            .argv = &windows_loopback_server_command,
+        },
+        .request_command = .{
+            .name = "request",
+            .argv = &windows_loopback_request_command,
+        },
+        .expected_status = .ok,
+        .expected_body_substring = "\"status\":\"ok\",\"protocol\":\"http/1.1\"",
+        .blocking = true,
+        .experimental = false,
+        .known_failure_signature = "GetLastError(87) surfaced from std.net.Stream.read",
+    },
+};
+
 const default_http3_datagram_scenarios = [_]Http3DatagramScenario{
     .{
         .route = .health,
@@ -286,6 +399,21 @@ pub fn defaultScenarios() []const Scenario {
 pub fn scenarioForRoute(route: RouteId) ?Scenario {
     for (default_scenarios) |scenario| {
         if (scenario.route == route) {
+            return scenario;
+        }
+    }
+    return null;
+}
+
+/// Returns the default release-readiness scenarios.
+pub fn defaultReadinessScenarios() []const ReadinessScenario {
+    return &default_readiness_scenarios;
+}
+
+/// Returns the release-readiness scenario for the provided identifier, if any.
+pub fn readinessScenarioForId(id: ReadinessScenarioId) ?ReadinessScenario {
+    for (default_readiness_scenarios) |scenario| {
+        if (scenario.id == id) {
             return scenario;
         }
     }
@@ -550,4 +678,20 @@ test "udp http3 scenarios advertise local health and echo coverage" {
     try std.testing.expectEqual(Transport.udp, scenarios[0].endpoint.transport);
     try std.testing.expectEqual(types.NegotiatedProtocol.h3, scenarios[1].endpoint.protocol);
     try std.testing.expectEqual(@as(usize, 64 * 1024), http3DatagramScenarioForRoute(.echo_post).?.datagram_budget);
+}
+
+test "readiness catalog includes the dedicated windows loopback scenario" {
+    const readiness = readinessScenarioForId(.windows_loopback_cli_roundtrip).?;
+
+    try std.testing.expectEqual(RouteId.health, readiness.route);
+    try std.testing.expect(readiness.supportsPlatform(.windows));
+    try std.testing.expect(!readiness.supportsPlatform(.linux));
+    try std.testing.expectEqual(types.Status.ok, readiness.expected_status);
+    try std.testing.expectEqual(Transport.tcp, readiness.endpoint.transport);
+    try std.testing.expectEqual(types.Port.init(18080).toInt(), readiness.endpoint.port.toInt());
+    try std.testing.expectEqualStrings("server", readiness.server_command.name);
+    try std.testing.expectEqualStrings("request", readiness.request_command.name);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080/health", readiness.request_command.argv[5]);
+    try std.testing.expect(std.mem.containsAtLeast(u8, readiness.expected_body_substring, 1, "\"protocol\":\"http/1.1\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, readiness.known_failure_signature.?, 1, "GetLastError(87)"));
 }
