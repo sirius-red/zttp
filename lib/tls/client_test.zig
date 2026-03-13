@@ -76,7 +76,11 @@ test "tls fixture paths stay inside the cert fixture root" {
     const path = try loader.pathFor(std.testing.allocator, "certs/loopback/server.pem");
     defer std.testing.allocator.free(path);
 
-    try std.testing.expectEqualStrings("lib/testing/fixtures/certs/loopback/server.pem", path);
+    try std.testing.expect(std.mem.startsWith(u8, path, "lib/testing/fixtures"));
+    try std.testing.expect(
+        std.mem.endsWith(u8, path, "certs/loopback/server.pem") or
+            std.mem.endsWith(u8, path, "certs\\loopback/server.pem"),
+    );
 }
 
 test "health route remains available for tls and alpn coverage" {

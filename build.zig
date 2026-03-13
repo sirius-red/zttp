@@ -63,6 +63,19 @@ pub fn build(b: *std.Build) void {
     lib.addImport("zttp_http3", http3);
     lib.addImport("zttp_testing", testing);
 
+    const readiness_smoke = b.addExecutable(.{
+        .name = "zttp-readiness-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/testing/readiness_smoke_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zttp", .module = lib },
+                .{ .name = "zttp_build_options", .module = zttp_build_options_module },
+            },
+        }),
+    });
+
     const cli = b.addExecutable(.{
         .name = "zttp",
         .root_module = b.createModule(.{
@@ -100,13 +113,20 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const lib_tests = b.addTest(.{ .root_module = lib });
+    const run_lib_tests = b.addRunArtifact(lib_tests);
     const cli_tests = b.addTest(.{ .root_module = cli.root_module });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+    const run_readiness_smoke = b.addRunArtifact(readiness_smoke);
 
     const test_step = b.step("test", "Run all tests");
-    test_step.dependOn(&lib_tests.step);
-    test_step.dependOn(&cli_tests.step);
+    test_step.dependOn(&run_lib_tests.step);
+    test_step.dependOn(&run_cli_tests.step);
+
+    const smoke_step = b.step("smoke", "Run the readiness smoke scenario");
+    run_readiness_smoke.step.dependOn(b.getInstallStep());
+    smoke_step.dependOn(&run_readiness_smoke.step);
 
     const test_http3_step = b.step("test-http3", "Run the HTTP/3-enabled test suite when built with -Dhttp3=true");
-    test_http3_step.dependOn(&lib_tests.step);
-    test_http3_step.dependOn(&cli_tests.step);
+    test_http3_step.dependOn(&run_lib_tests.step);
+    test_http3_step.dependOn(&run_cli_tests.step);
 }

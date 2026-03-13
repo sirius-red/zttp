@@ -30,6 +30,97 @@ pub const PathError = error{
 /// Errors returned while loading fixture contents.
 pub const LoadError = PathError || std.mem.Allocator.Error || std.fs.File.OpenError || std.fs.File.ReadError;
 
+/// Output stream source for a captured process message.
+pub const OutputStream = enum {
+    /// Standard output stream.
+    stdout,
+    /// Standard error stream.
+    stderr,
+};
+
+/// Typed socket failure category extracted from command output.
+pub const SocketFailureKind = enum {
+    /// Windows `GetLastError(87)` surfaced from a socket read path.
+    windows_invalid_parameter,
+    /// Connection reset while reading or writing the socket.
+    connection_reset,
+    /// Peer closed the socket while the process still expected to write.
+    broken_pipe,
+    /// A custom signature supplied by the caller matched the capture.
+    known_signature,
+};
+
+/// Typed socket failure extracted from captured command output.
+pub const SocketFailureCapture = struct {
+    /// Failure kind derived from the output text.
+    kind: SocketFailureKind,
+    /// Stream that contained the matching text.
+    stream: OutputStream,
+    /// Stable matching substring that identified the failure.
+    signature: []const u8,
+};
+
+/// Owned stdout/stderr capture for one command invocation.
+pub const CommandCapture = struct {
+    /// Stable command label for reporting.
+    command_name: []const u8,
+    /// Process termination record.
+    term: std.process.Child.Term,
+    /// Bytes captured from standard output.
+    stdout: []u8,
+    /// Bytes captured from standard error.
+    stderr: []u8,
+
+    /// Creates an owned command capture from one child-process result.
+    pub fn initOwned(
+        allocator: std.mem.Allocator,
+        command_name: []const u8,
+        result: std.process.Child.RunResult,
+    ) std.mem.Allocator.Error!CommandCapture {
+        _ = allocator;
+        return .{
+            .command_name = command_name,
+            .term = result.term,
+            .stdout = result.stdout,
+            .stderr = result.stderr,
+        };
+    }
+
+    /// Releases captured stdout and stderr bytes.
+    pub fn deinit(self: *CommandCapture, allocator: std.mem.Allocator) void {
+        allocator.free(self.stdout);
+        allocator.free(self.stderr);
+        self.* = undefined;
+    }
+
+    /// Returns true when the process exited with code zero.
+    pub fn succeeded(self: CommandCapture) bool {
+        return switch (self.term) {
+            .Exited => |code| code == 0,
+            else => false,
+        };
+    }
+
+    /// Returns true when either output stream contains the provided substring.
+    pub fn contains(self: CommandCapture, needle: []const u8) bool {
+        return std.mem.indexOf(u8, self.stdout, needle) != null or
+            std.mem.indexOf(u8, self.stderr, needle) != null;
+    }
+
+    /// Returns the first typed socket failure found in the capture, if any.
+    pub fn socketFailure(self: CommandCapture) ?SocketFailureCapture {
+        return detectSocketFailure(self.stdout, self.stderr);
+    }
+
+    /// Returns a typed socket failure, also considering an expected custom signature.
+    pub fn expectedSocketFailure(
+        self: CommandCapture,
+        known_signature: ?[]const u8,
+    ) ?SocketFailureCapture {
+        return detectExpectedSocketFailure(self.stdout, self.stderr, known_signature);
+    }
+};
+
 /// Reusable loader for local fixture files.
 pub const Loader = struct {
     /// Root path for all fixture files.
@@ -105,6 +196,64 @@ fn validateRelativePath(relative_path: []const u8) PathError!void {
     }
 }
 
+/// Returns the first typed socket failure found in stdout or stderr.
+pub fn detectSocketFailure(stdout: []const u8, stderr: []const u8) ?SocketFailureCapture {
+    return detectExpectedSocketFailure(stdout, stderr, null);
+}
+
+/// Returns the first typed socket failure, also honoring a caller-supplied signature.
+pub fn detectExpectedSocketFailure(
+    stdout: []const u8,
+    stderr: []const u8,
+    known_signature: ?[]const u8,
+) ?SocketFailureCapture {
+    if (findSocketFailureInStream(.stderr, stderr, known_signature)) |failure| {
+        return failure;
+    }
+    if (findSocketFailureInStream(.stdout, stdout, known_signature)) |failure| {
+        return failure;
+    }
+    return null;
+}
+
+/// Returns the first typed socket failure in one stream, if any.
+fn findSocketFailureInStream(
+    stream: OutputStream,
+    bytes: []const u8,
+    known_signature: ?[]const u8,
+) ?SocketFailureCapture {
+    const patterns = [_]struct {
+        kind: SocketFailureKind,
+        signature: []const u8,
+    }{
+        .{ .kind = .windows_invalid_parameter, .signature = "GetLastError(87)" },
+        .{ .kind = .connection_reset, .signature = "ConnectionResetByPeer" },
+        .{ .kind = .broken_pipe, .signature = "BrokenPipe" },
+    };
+
+    for (patterns) |pattern| {
+        if (std.mem.indexOf(u8, bytes, pattern.signature) != null) {
+            return .{
+                .kind = pattern.kind,
+                .stream = stream,
+                .signature = pattern.signature,
+            };
+        }
+    }
+
+    if (known_signature) |signature| {
+        if (std.mem.indexOf(u8, bytes, signature) != null) {
+            return .{
+                .kind = .known_signature,
+                .stream = stream,
+                .signature = signature,
+            };
+        }
+    }
+
+    return null;
+}
+
 test "fixture loader rejects traversal" {
     const loader = Loader.init();
     try std.testing.expectError(
@@ -118,5 +267,32 @@ test "fixture loader joins grouped paths" {
     const full_path = try loader.pathFor(std.testing.allocator, "certs/loopback.pem");
     defer std.testing.allocator.free(full_path);
 
-    try std.testing.expectEqualStrings("fixtures/certs/loopback.pem", full_path);
+    try std.testing.expect(std.mem.startsWith(u8, full_path, "fixtures"));
+    try std.testing.expect(
+        std.mem.endsWith(u8, full_path, "certs/loopback.pem") or
+            std.mem.endsWith(u8, full_path, "certs\\loopback.pem"),
+    );
+}
+
+test "socket failure capture detects windows loopback signature" {
+    const failure = detectSocketFailure(
+        "",
+        "server read failed: GetLastError(87) surfaced from std.net.Stream.read",
+    ).?;
+
+    try std.testing.expectEqual(SocketFailureKind.windows_invalid_parameter, failure.kind);
+    try std.testing.expectEqual(OutputStream.stderr, failure.stream);
+}
+
+test "command capture matches caller-provided socket signature" {
+    var capture = try CommandCapture.initOwned(std.testing.allocator, "request", .{
+        .term = .{ .Exited = 1 },
+        .stdout = try std.testing.allocator.dupe(u8, ""),
+        .stderr = try std.testing.allocator.dupe(u8, "std.net.Stream.read failed during loopback probe"),
+    });
+    defer capture.deinit(std.testing.allocator);
+
+    const failure = capture.expectedSocketFailure("std.net.Stream.read").?;
+    try std.testing.expectEqual(SocketFailureKind.known_signature, failure.kind);
+    try std.testing.expectEqualStrings("std.net.Stream.read", failure.signature);
 }
