@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const core = @import("../types.zig");
+const socket_io = @import("../util/socket_io.zig");
 const server_types = @import("types.zig");
 
 /// Error set returned while parsing an HTTP/1.1 request.
@@ -41,7 +42,7 @@ pub fn readRequest(
     var buffer: [1024]u8 = undefined;
     var header_end: ?usize = null;
     while (header_end == null) {
-        const read_len = try stream.read(&buffer);
+        const read_len = try socket_io.read(stream, &buffer);
         if (read_len == 0) {
             return error.UnexpectedEof;
         }
@@ -242,7 +243,7 @@ const RequestBodyState = struct {
         }
 
         const to_read = @min(dest.len, self.remaining);
-        const read_len = try self.stream.read(dest[0..to_read]);
+        const read_len = try socket_io.read(self.stream, dest[0..to_read]);
         self.remaining -= read_len;
         return read_len;
     }

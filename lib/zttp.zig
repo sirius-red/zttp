@@ -72,6 +72,7 @@ test {
     _ = @import("http1/request_encoder.zig");
     _ = @import("http1/response_parser.zig");
     _ = @import("http1/connection_h1.zig");
+    _ = @import("http1/connection_h1_test.zig");
     _ = @import("tls/config.zig");
     _ = @import("tls/client.zig");
     _ = @import("tls/client_test.zig");

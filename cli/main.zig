@@ -194,10 +194,16 @@ const Cli = struct {
         var client = zttp.Client.init(self.allocator, client_options);
         defer client.deinit();
 
-        var handle = try client.request(&request);
+        var handle = client.request(&request) catch |err| {
+            try self.reportRequestFailure(parsed, err);
+            return err;
+        };
         defer handle.deinit();
 
-        var response = try handle.wait();
+        var response = handle.wait() catch |err| {
+            try self.reportRequestFailure(parsed, err);
+            return err;
+        };
         defer response.deinit();
         defer if (response.body) |body_reader| body_reader.close();
         try self.printResponse(&response);
@@ -272,6 +278,16 @@ const Cli = struct {
         if (response.body) |body_reader| {
             try self.writeBody(body_reader);
         }
+    }
+
+    /// Writes a targeted loopback hint for local request failures.
+    fn reportRequestFailure(self: *Cli, parsed: ParsedUrl, err: anyerror) !void {
+        const hint = requestFailureHint(parsed, err) orelse return;
+        const port = (parsed.port orelse parsed.scheme.defaultPort()).toInt();
+        try self.printErr(
+            "zttp request: {s} ({s}:{d}{s})\n",
+            .{ hint, parsed.host, port, parsed.path },
+        );
     }
 
     /// Returns true when any argument is a help flag.
@@ -404,6 +420,25 @@ const Cli = struct {
             .path = path,
             .query = query,
         };
+    }
+
+    /// Returns a targeted message for loopback request failures, if applicable.
+    fn requestFailureHint(parsed: ParsedUrl, err: anyerror) ?[]const u8 {
+        if (!isLoopbackHost(parsed.host)) {
+            return null;
+        }
+        return switch (err) {
+            error.Transport,
+            error.Protocol,
+            error.Timeout,
+            => "loopback request failed before the response body completed; verify the local server is running and the socket path is healthy",
+            else => null,
+        };
+    }
+
+    /// Returns true when the host is one of the local loopback aliases supported by the CLI.
+    fn isLoopbackHost(host: []const u8) bool {
+        return std.mem.eql(u8, host, "127.0.0.1") or std.ascii.eqlIgnoreCase(host, "localhost");
     }
 
     /// Adds the required Host header to the request.
@@ -933,6 +968,34 @@ test "server args parser accepts bind and tls flags" {
     try std.testing.expectEqualStrings("server.pem", args.tls_cert.?);
     try std.testing.expectEqualStrings("server.key", args.tls_key.?);
     try std.testing.expect(args.http2);
+}
+
+test "request failure hint targets loopback transport regressions" {
+    const parsed = Cli.ParsedUrl{
+        .scheme = .http,
+        .host = "127.0.0.1",
+        .port = zttp.Port.init(18080),
+        .path = "/health",
+        .query = null,
+    };
+
+    try std.testing.expectEqualStrings(
+        "loopback request failed before the response body completed; verify the local server is running and the socket path is healthy",
+        Cli.requestFailureHint(parsed, error.Transport).?,
+    );
+    try std.testing.expect(Cli.requestFailureHint(parsed, error.InvalidArguments) == null);
+}
+
+test "request failure hint ignores non-loopback hosts" {
+    const parsed = Cli.ParsedUrl{
+        .scheme = .https,
+        .host = "example.com",
+        .port = null,
+        .path = "/health",
+        .query = null,
+    };
+
+    try std.testing.expect(Cli.requestFailureHint(parsed, error.Transport) == null);
 }
 
 test "request args parser accepts http3 in http3-enabled builds" {

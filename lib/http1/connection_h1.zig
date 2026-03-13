@@ -6,6 +6,7 @@ const types = @import("../types.zig");
 const mailbox = @import("../util/mailbox.zig");
 const future = @import("../util/future.zig");
 const body_pipe = @import("../util/body_pipe.zig");
+const socket_io = @import("../util/socket_io.zig");
 const request_encoder = @import("request_encoder.zig");
 const response_parser = @import("response_parser.zig");
 const tls_client = @import("../tls/client.zig");
@@ -140,6 +141,30 @@ const ResponseInfo = struct {
     body: ?types.BodyReader,
 };
 
+/// Body reader wrapper that keeps the parser buffer alive after `readResponse`.
+const OwnedResponseBody = struct {
+    /// Allocator used to release the wrapper state.
+    allocator: std.mem.Allocator,
+    /// Parser buffer retained for the inner body reader.
+    buffer: []u8,
+    /// Inner body reader returned by the response parser.
+    inner: types.BodyReader,
+
+    /// Reads bytes from the wrapped body reader.
+    fn read(ctx: ?*anyopaque, dest: []u8) anyerror!usize {
+        const self: *OwnedResponseBody = @ptrCast(@alignCast(ctx.?));
+        return self.inner.read(dest);
+    }
+
+    /// Closes the wrapped reader and releases the retained parser buffer.
+    fn close(ctx: ?*anyopaque) void {
+        const self: *OwnedResponseBody = @ptrCast(@alignCast(ctx.?));
+        self.inner.close();
+        self.allocator.free(self.buffer);
+        self.allocator.destroy(self);
+    }
+};
+
 /// Error set returned while parsing CONNECT responses.
 const ConnectResponseError = StreamReader.Error || std.mem.Allocator.Error || error{
     UnexpectedEof,
@@ -170,7 +195,7 @@ const StreamReader = struct {
 
     /// Reads bytes from the underlying stream.
     pub fn read(self: *StreamReader, dest: []u8) StreamReader.Error!usize {
-        return self.stream.read(dest);
+        return socket_io.read(self.stream.*, dest);
     }
 };
 
@@ -217,7 +242,7 @@ const TransportReader = struct {
         if (self.connection.tls_stream) |tls_stream| {
             return tls_stream.reader().readSliceShort(dest);
         }
-        return self.connection.stream.?.read(dest);
+        return socket_io.read(self.connection.stream.?, dest);
     }
 };
 
@@ -271,6 +296,8 @@ pub const ConnectionH1 = struct {
     stream: ?std.net.Stream,
     /// Active TLS stream layered over the TCP stream.
     tls_stream: ?*tls_client.ClientStream,
+    /// Reader state retained for parser-owned body readers.
+    transport_reader: ?TransportReader,
     /// Indicates whether a CONNECT tunnel is established.
     tunnel_established: bool,
     /// Negotiated application protocol for the current transport.
@@ -286,6 +313,7 @@ pub const ConnectionH1 = struct {
             .thread = null,
             .stream = null,
             .tls_stream = null,
+            .transport_reader = null,
             .tunnel_established = false,
             .negotiated_protocol = .http_1_1,
         };
@@ -669,13 +697,13 @@ pub const ConnectionH1 = struct {
         buffer.clearRetainingCapacity();
         while (true) {
             var byte_buf: [1]u8 = undefined;
-            const read_len = try stream.read(&byte_buf);
+            const read_len = try socket_io.read(stream.*, &byte_buf);
             if (read_len == 0) {
                 return error.UnexpectedEof;
             }
             const byte = byte_buf[0];
             if (byte == '\r') {
-                const lf_len = try stream.read(&byte_buf);
+                const lf_len = try socket_io.read(stream.*, &byte_buf);
                 if (lf_len == 0) {
                     return error.UnexpectedEof;
                 }
@@ -829,19 +857,29 @@ pub const ConnectionH1 = struct {
         const limits = self.buildParserLimits();
 
         const buffer = self.allocator.alloc(u8, self.options.io_buffer_bytes) catch |err| return mapAllocatorError(err);
-        defer self.allocator.free(buffer);
+        errdefer self.allocator.free(buffer);
 
-        var reader = TransportReader.init(self);
+        self.transport_reader = TransportReader.init(self);
         var parser = response_parser.ResponseParser(TransportReader).init(
             self.allocator,
-            &reader,
+            &self.transport_reader.?,
             buffer,
             limits,
         );
 
         var response = parser.readResponse() catch |err| return mapParserError(err);
-        const body_reader = response.body;
+        const body_reader = if (response.body) |reader|
+            self.wrapResponseBody(reader, buffer) catch |err| {
+                reader.close();
+                self.allocator.free(buffer);
+                return err;
+            }
+        else
+            null;
         response.body = null;
+        if (body_reader == null) {
+            self.allocator.free(buffer);
+        }
 
         return .{
             .response = response,
@@ -851,13 +889,13 @@ pub const ConnectionH1 = struct {
 
     /// Forwards the response body into the provided pipe.
     fn forwardBody(self: *ConnectionH1, body_reader: types.BodyReader, pipe: *body_pipe.BodyPipe) void {
-        _ = self;
         defer body_reader.close();
 
         var buffer: [8192]u8 = undefined;
         while (true) {
             const read_len = body_reader.read(&buffer) catch |err| {
                 pipe.closeWriter(mapBodyReadError(err));
+                self.closeStream();
                 return;
             };
             if (read_len == 0) {
@@ -866,6 +904,7 @@ pub const ConnectionH1 = struct {
             }
             pipe.writeAll(buffer[0..read_len]) catch {
                 pipe.closeWriter(error.Canceled);
+                self.closeStream();
                 return;
             };
         }
@@ -940,6 +979,21 @@ pub const ConnectionH1 = struct {
         return error.OutOfMemory;
     }
 
+    /// Wraps a parser-owned body reader so its backing buffer survives until close.
+    fn wrapResponseBody(self: *ConnectionH1, body_reader: types.BodyReader, buffer: []u8) Error!types.BodyReader {
+        const state = self.allocator.create(OwnedResponseBody) catch return error.OutOfMemory;
+        state.* = .{
+            .allocator = self.allocator,
+            .buffer = buffer,
+            .inner = body_reader,
+        };
+        return .{
+            .ctx = state,
+            .read_fn = OwnedResponseBody.read,
+            .close_fn = OwnedResponseBody.close,
+        };
+    }
+
     /// Maps pipe initialization errors into connection errors.
     fn mapPipeInitError(err: body_pipe.InitError) Error {
         return switch (err) {
@@ -982,7 +1036,18 @@ pub const ConnectionH1 = struct {
             error.ConnectionTimedOut,
             error.WouldBlock,
             => error.Timeout,
-            error.ReadFailed => error.Transport,
+            error.InputOutput,
+            error.SystemResources,
+            error.IsDir,
+            error.OperationAborted,
+            error.BrokenPipe,
+            error.SocketNotConnected,
+            error.SocketNotBound,
+            error.MessageTooBig,
+            error.NetworkSubsystemFailed,
+            error.Unexpected,
+            error.ReadFailed,
+            => error.Transport,
             error.UnexpectedEof,
             error.ConnectionResetByPeer,
             => error.Transport,
@@ -1003,6 +1068,17 @@ pub const ConnectionH1 = struct {
             error.ConnectionTimedOut,
             error.WouldBlock,
             => error.Timeout,
+            error.InputOutput,
+            error.SystemResources,
+            error.IsDir,
+            error.OperationAborted,
+            error.BrokenPipe,
+            error.SocketNotConnected,
+            error.SocketNotBound,
+            error.MessageTooBig,
+            error.NetworkSubsystemFailed,
+            error.Unexpected,
+            => error.Transport,
             else => error.Transport,
         };
     }

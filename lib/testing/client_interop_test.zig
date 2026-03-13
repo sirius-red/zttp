@@ -42,3 +42,20 @@ test "smoke scenarios retain request coverage for http and https" {
     try std.testing.expect(scenarios[2].route != null);
     try std.testing.expect(scenarios[3].route != null);
 }
+
+test "client interop preserves the windows loopback readiness probe contract" {
+    const readiness = interop_harness.readinessScenarioForId(.windows_loopback_cli_roundtrip).?;
+
+    try std.testing.expectEqualStrings("windows-loopback-cli-roundtrip", readiness.name);
+    try std.testing.expectEqual(interop_harness.RouteId.health, readiness.route);
+    try std.testing.expectEqualStrings("request", readiness.request_command.name);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080/health", readiness.request_command.argv[5]);
+    try std.testing.expect(readiness.blocking);
+    try std.testing.expect(!readiness.experimental);
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        readiness.expected_body_substring,
+        1,
+        "\"protocol\":\"http/1.1\"",
+    ));
+}

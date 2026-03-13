@@ -1021,6 +1021,7 @@ const RequestState = struct {
                 .pool = self.pool,
                 .lease = lease,
                 .inner = body_reader,
+                .failed = false,
                 .closed = false,
             };
 
@@ -1265,13 +1266,18 @@ const ResponseBody = struct {
     lease: Lease,
     /// Inner body reader provided by the connection.
     inner: types.BodyReader,
+    /// Indicates whether a read failure made the lease unsafe to reuse.
+    failed: bool,
     /// Indicates whether the wrapper has been closed.
     closed: bool,
 
     /// Reads bytes from the inner body reader.
     fn read(ctx: ?*anyopaque, dest: []u8) anyerror!usize {
         const self: *ResponseBody = @ptrCast(@alignCast(ctx.?));
-        return self.inner.read(dest);
+        return self.inner.read(dest) catch |err| {
+            self.failed = true;
+            return err;
+        };
     }
 
     /// Closes the body reader and releases connection resources.
@@ -1282,7 +1288,11 @@ const ResponseBody = struct {
         }
         self.closed = true;
         self.inner.close();
-        self.pool.release(self.lease);
+        if (self.failed) {
+            self.pool.discard(self.lease);
+        } else {
+            self.pool.release(self.lease);
+        }
         self.allocator.destroy(self);
     }
 };

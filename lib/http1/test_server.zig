@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const types = @import("../types.zig");
+const socket_io = @import("../util/socket_io.zig");
 
 /// Header name/value pair for response construction.
 pub const Header = struct {
@@ -201,7 +202,7 @@ pub const TestServer = struct {
         var found = expect_contains == null;
 
         while (true) {
-            const read_len = try stream.read(&buffer);
+            const read_len = try socket_io.read(stream, &buffer);
             if (read_len == 0) {
                 return error.EndOfStream;
             }
@@ -329,13 +330,20 @@ test "test server emits canned response" {
 
     try stream.writeAll("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
 
+    var response = std.ArrayList(u8).empty;
+    defer response.deinit(std.testing.allocator);
     var buffer: [256]u8 = undefined;
-    const read_len = try stream.read(&buffer);
-    const response = buffer[0..read_len];
+    while (true) {
+        const read_len = try socket_io.read(stream, &buffer);
+        if (read_len == 0) {
+            break;
+        }
+        try response.appendSlice(std.testing.allocator, buffer[0..read_len]);
+    }
 
-    try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "HTTP/1.1 200 OK\r\n"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "Content-Length: 5\r\n"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "\r\nhello"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, response.items, 1, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, response.items, 1, "Content-Length: 5\r\n"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, response.items, 1, "\r\nhello"));
 }
 
 test "test server emits raw response" {
@@ -358,7 +366,15 @@ test "test server emits raw response" {
     var stream = try std.net.tcpConnectToAddress(server.address());
     defer stream.close();
 
+    var response = std.ArrayList(u8).empty;
+    defer response.deinit(std.testing.allocator);
     var buffer: [64]u8 = undefined;
-    const read_len = try stream.read(&buffer);
-    try std.testing.expectEqualStrings(raw_response, buffer[0..read_len]);
+    while (true) {
+        const read_len = try socket_io.read(stream, &buffer);
+        if (read_len == 0) {
+            break;
+        }
+        try response.appendSlice(std.testing.allocator, buffer[0..read_len]);
+    }
+    try std.testing.expectEqualStrings(raw_response, response.items);
 }
