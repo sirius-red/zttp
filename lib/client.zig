@@ -2100,7 +2100,7 @@ test "request options can disable manual proxy" {
         },
     };
 
-    const resolved = try client.resolveProxy(uri, request_options);
+    var resolved = try client.resolveProxy(uri, request_options);
     if (resolved) |*value| {
         value.deinit();
     }
@@ -2563,8 +2563,8 @@ test "client reads chunked response body" {
     defer response.deinit();
     defer if (response.body) |body| body.close();
 
-    var collected = std.ArrayList(u8).init(std.testing.allocator);
-    defer collected.deinit();
+    var collected = std.ArrayList(u8).empty;
+    defer collected.deinit(std.testing.allocator);
 
     var buffer: [16]u8 = undefined;
     while (true) {
@@ -2572,7 +2572,7 @@ test "client reads chunked response body" {
         if (read_len == 0) {
             break;
         }
-        try collected.appendSlice(buffer[0..read_len]);
+        try collected.appendSlice(std.testing.allocator, buffer[0..read_len]);
     }
 
     try std.testing.expectEqualStrings("Wikipedia", collected.items);

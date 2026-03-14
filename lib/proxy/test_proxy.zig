@@ -187,8 +187,8 @@ pub const TestProxy = struct {
         max_bytes: usize,
         expect_contains: ?[]const u8,
     ) ReadConnectError!ConnectRequest {
-        var buffer = std.ArrayList(u8).init(allocator);
-        defer buffer.deinit();
+        var buffer = std.ArrayList(u8).empty;
+        defer buffer.deinit(allocator);
 
         var temp: [1024]u8 = undefined;
         var header_end: ?usize = null;
@@ -198,7 +198,7 @@ pub const TestProxy = struct {
             if (read_len == 0) {
                 return error.EndOfStream;
             }
-            try buffer.appendSlice(temp[0..read_len]);
+            try buffer.appendSlice(allocator, temp[0..read_len]);
             if (buffer.items.len > max_bytes) {
                 return error.LimitExceeded;
             }

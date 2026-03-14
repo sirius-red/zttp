@@ -67,7 +67,11 @@ pub const Server = struct {
                 }
                 return err;
             };
-            self.handleConnection(connection) catch {};
+            if (self.stop_requested.load(.seq_cst)) {
+                connection.stream.close();
+                return;
+            }
+            try self.serveAcceptedConnection(connection);
         }
     }
 
@@ -81,12 +85,17 @@ pub const Server = struct {
         return self.address().getPort();
     }
 
-    /// Requests the accept loop to stop and closes the listener.
+    /// Requests the accept loop to stop and wakes a blocked listener, if needed.
     pub fn requestStop(self: *Server) void {
-        self.stop_requested.store(true, .seq_cst);
-        if (self.listener) |*listener| {
-            listener.deinit();
-            self.listener = null;
+        if (self.stop_requested.swap(true, .seq_cst)) {
+            return;
+        }
+
+        if (self.listener) |listener| {
+            var wake_stream = std.net.tcpConnectToAddress(listener.listen_address) catch null;
+            if (wake_stream) |*stream| {
+                stream.close();
+            }
         }
     }
 
@@ -97,11 +106,24 @@ pub const Server = struct {
             thread.join();
             self.thread = null;
         }
+        if (self.listener) |*listener| {
+            listener.deinit();
+            self.listener = null;
+        }
     }
 
     /// Entry point for the background serve loop.
     fn run(self: *Server) void {
         self.serve() catch {};
+    }
+
+    /// Runs one accepted connection without letting request-scoped failures kill the listener.
+    fn serveAcceptedConnection(self: *Server, connection: std.net.Server.Connection) Error!void {
+        self.handleConnection(connection) catch |err| {
+            if (err == error.OutOfMemory) {
+                return err;
+            }
+        };
     }
 
     /// Handles one accepted connection.

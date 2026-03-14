@@ -221,11 +221,6 @@ const Cli = struct {
             return error.InvalidArguments;
         };
 
-        var config = zttp.ServerConfig.init(zttp.Testing.InteropHarness.handleServerRequest);
-        config.listen_host = server_args.listen;
-        config.port = zttp.Port.init(server_args.port);
-        config.http2_enabled = server_args.http2;
-
         if (server_args.http3) {
             if (!BuildOptions.http3) {
                 return error.InvalidArguments;
@@ -243,6 +238,24 @@ const Cli = struct {
             return;
         }
 
+        const config = try buildServerConfig(server_args);
+        var server = try zttp.ServerRuntime.init(self.allocator, config);
+        defer server.deinit();
+
+        try self.printErr("listening on {s}:{d}\n", .{
+            server_args.listen,
+            server.port(),
+        });
+        try server.serve();
+    }
+
+    /// Builds the loopback runtime configuration used by the server command.
+    fn buildServerConfig(server_args: ServerArgs) !zttp.ServerConfig {
+        var config = zttp.ServerConfig.init(zttp.Testing.InteropHarness.handleServerRequest);
+        config.listen_host = server_args.listen;
+        config.port = zttp.Port.init(server_args.port);
+        config.http2_enabled = server_args.http2;
+
         if (server_args.tls_cert != null or server_args.tls_key != null) {
             var tls = zttp.TlsConfig.default();
             tls.verify = .insecure;
@@ -254,14 +267,7 @@ const Cli = struct {
             _ = listener_plan;
         }
 
-        var server = try zttp.ServerRuntime.init(self.allocator, config);
-        defer server.deinit();
-
-        try self.printErr("listening on {s}:{d}\n", .{
-            server_args.listen,
-            server.port(),
-        });
-        try server.serve();
+        return config;
     }
 
     /// Writes a formatted message to standard error.
@@ -968,6 +974,24 @@ test "server args parser accepts bind and tls flags" {
     try std.testing.expectEqualStrings("server.pem", args.tls_cert.?);
     try std.testing.expectEqualStrings("server.key", args.tls_key.?);
     try std.testing.expect(args.http2);
+}
+
+test "server command builds the interop-harness runtime config" {
+    const config = try Cli.buildServerConfig(.{
+        .listen = "127.0.0.1",
+        .port = 9090,
+        .tls_cert = "server.pem",
+        .tls_key = "server.key",
+        .http2 = true,
+        .http3 = false,
+    });
+
+    try std.testing.expectEqualStrings("127.0.0.1", config.listen_host);
+    try std.testing.expectEqual(@as(u16, 9090), config.port.toInt());
+    try std.testing.expect(config.handler == zttp.Testing.InteropHarness.handleServerRequest);
+    try std.testing.expect(config.http2_enabled);
+    try std.testing.expectEqualStrings("server.pem", config.tls.?.certificate_chain_path.?);
+    try std.testing.expectEqualStrings("server.key", config.tls.?.private_key_path.?);
 }
 
 test "request failure hint targets loopback transport regressions" {

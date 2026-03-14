@@ -10,6 +10,7 @@ Thumbs.db
 *.tmp
 *.swp
 .idea/
+*.log
 
 ### Docs build ###
 /procz.o

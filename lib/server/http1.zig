@@ -229,6 +229,9 @@ const RequestBodyState = struct {
     /// Reads request body bytes into the destination buffer.
     fn read(ctx: ?*anyopaque, dest: []u8) anyerror!usize {
         const self: *RequestBodyState = @ptrCast(@alignCast(ctx.?));
+        if (dest.len == 0) {
+            return 0;
+        }
 
         if (self.prefix_offset < self.prefix.len) {
             const available = self.prefix.len - self.prefix_offset;
@@ -244,6 +247,9 @@ const RequestBodyState = struct {
 
         const to_read = @min(dest.len, self.remaining);
         const read_len = try socket_io.read(self.stream, dest[0..to_read]);
+        if (read_len == 0) {
+            return error.UnexpectedEof;
+        }
         self.remaining -= read_len;
         return read_len;
     }
@@ -409,8 +415,8 @@ fn reasonPhrase(status: core.Status) []const u8 {
 }
 
 test "http1 response writer emits chunked response bodies" {
-    var bytes = std.ArrayList(u8).init(std.testing.allocator);
-    defer bytes.deinit();
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(std.testing.allocator);
 
     const FakeState = struct {
         bytes: *std.ArrayList(u8),
@@ -418,21 +424,21 @@ test "http1 response writer emits chunked response bodies" {
 
         fn write(ctx: ?*anyopaque, payload: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            try self.bytes.appendSlice(payload);
+            try self.bytes.appendSlice(std.testing.allocator, payload);
         }
 
         fn begin(ctx: ?*anyopaque, writer: *server_types.ServerResponseWriter) !void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             _ = writer;
             self.chunked = true;
-            try self.bytes.appendSlice("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            try self.bytes.appendSlice(std.testing.allocator, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
         }
 
         fn finish(ctx: ?*anyopaque, writer: *server_types.ServerResponseWriter) !void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             _ = writer;
             if (self.chunked) {
-                try self.bytes.appendSlice("0\r\n\r\n");
+                try self.bytes.appendSlice(std.testing.allocator, "0\r\n\r\n");
             }
         }
     };

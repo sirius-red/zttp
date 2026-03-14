@@ -1,7 +1,9 @@
 //! Server interop regression coverage tied to the shared harness contract.
 
 const std = @import("std");
+const server = @import("../server/server.zig");
 const types = @import("../types.zig");
+const socket_io = @import("../util/socket_io.zig");
 const interop_harness = @import("interop_harness.zig");
 
 /// Declarative expectation for one server interop route.
@@ -77,6 +79,33 @@ const required_routes = [_]RouteExpectation{
     },
 };
 
+/// Sends one raw HTTP request to the loopback server and returns the full response bytes.
+fn runRawExchange(
+    allocator: std.mem.Allocator,
+    port: u16,
+    request_bytes: []const u8,
+) ![]u8 {
+    const address = try std.net.Address.parseIp("127.0.0.1", port);
+    var stream = try std.net.tcpConnectToAddress(address);
+    defer stream.close();
+
+    try stream.writeAll(request_bytes);
+
+    var response = std.ArrayListUnmanaged(u8){};
+    errdefer response.deinit(allocator);
+
+    var buffer: [1024]u8 = undefined;
+    while (true) {
+        const read_len = try socket_io.read(stream, &buffer);
+        if (read_len == 0) {
+            break;
+        }
+        try response.appendSlice(allocator, buffer[0..read_len]);
+    }
+
+    return response.toOwnedSlice(allocator);
+}
+
 test "server interop catalog covers required contract routes" {
     try std.testing.expectEqual(@as(usize, 8), required_routes.len);
 
@@ -107,4 +136,34 @@ test "server interop catalog retains cookie and streaming semantics" {
     try std.testing.expectEqual(.json, cookie_read.response_mode);
     try std.testing.expectEqual(.text_stream, chunked.response_mode);
     try std.testing.expectEqual(.binary_stream, large.response_mode);
+}
+
+test "server interop preserves the windows loopback readiness round trip" {
+    const readiness = interop_harness.readinessScenarioForId(.windows_loopback_cli_roundtrip).?;
+    const route = interop_harness.scenarioForRoute(readiness.route).?;
+
+    var config = server.ServerConfig.init(interop_harness.handleServerRequest);
+    config.listen_host = readiness.endpoint.host;
+    config.port = types.Port.init(0);
+
+    var runtime = try server.Server.init(std.testing.allocator, config);
+    defer runtime.deinit();
+    try runtime.start();
+
+    const request_bytes = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s} {s} HTTP/1.1\r\nHost: {s}\r\n\r\n",
+        .{
+            route.method.asBytes(),
+            route.path_template,
+            readiness.endpoint.host,
+        },
+    );
+    defer std.testing.allocator.free(request_bytes);
+
+    const response = try runRawExchange(std.testing.allocator, runtime.port(), request_bytes);
+    defer std.testing.allocator.free(response);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "HTTP/1.1 200 OK"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, readiness.expected_body_substring));
 }

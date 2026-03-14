@@ -1,8 +1,11 @@
 //! Regression coverage scaffolding for future HTTP/1.1 server work.
 
 const std = @import("std");
+const server_types = @import("types.zig");
 const types = @import("../types.zig");
 const interop_harness = @import("../testing/interop_harness.zig");
+const runtime = @import("runtime.zig");
+const socket_io = @import("../util/socket_io.zig");
 
 /// HTTP/1.1 server behavior class covered by a regression scenario.
 pub const RegressionEvent = enum {
@@ -77,6 +80,62 @@ const regression_cases = [_]RegressionCase{
     },
 };
 
+/// Initializes the shared interop-harness server on an ephemeral loopback port.
+fn initInteropServer() !runtime.Server {
+    var config = server_types.ServerConfig.init(interop_harness.handleServerRequest);
+    config.port = types.Port.init(0);
+
+    return runtime.Server.init(std.testing.allocator, config);
+}
+
+/// Disables Nagle on the loopback test client so split request chunks flush promptly.
+fn configureClientStream(stream: std.net.Stream) !void {
+    try std.posix.setsockopt(
+        stream.handle,
+        std.posix.IPPROTO.TCP,
+        std.posix.TCP.NODELAY,
+        &std.mem.toBytes(@as(c_int, 1)),
+    );
+}
+
+/// Sends ordered raw request chunks to the loopback server and returns the full response.
+fn runRawExchange(
+    allocator: std.mem.Allocator,
+    port: u16,
+    chunks: []const []const u8,
+) ![]u8 {
+    const address = try std.net.Address.parseIp("127.0.0.1", port);
+    var stream = try std.net.tcpConnectToAddress(address);
+    defer stream.close();
+    try configureClientStream(stream);
+
+    for (chunks, 0..) |chunk, index| {
+        try stream.writeAll(chunk);
+        if (index + 1 < chunks.len) {
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+    }
+
+    try std.posix.shutdown(stream.handle, .send);
+
+    var response = std.ArrayListUnmanaged(u8){};
+    errdefer response.deinit(allocator);
+
+    var buffer: [1024]u8 = undefined;
+    while (true) {
+        const read_len = socket_io.read(stream, &buffer) catch |err| switch (err) {
+            error.ConnectionResetByPeer => break,
+            else => return err,
+        };
+        if (read_len == 0) {
+            break;
+        }
+        try response.appendSlice(allocator, buffer[0..read_len]);
+    }
+
+    return response.toOwnedSlice(allocator);
+}
+
 test "server regression matrix covers request parsing cases" {
     try std.testing.expectEqual(@as(usize, 5), regression_cases.len);
     try std.testing.expectEqual(RegressionEvent.request_line, regression_cases[0].event);
@@ -109,4 +168,46 @@ test "interop routes preserve http1 server coverage" {
     try std.testing.expectEqual(.text_stream, chunked.response_mode);
     try std.testing.expect(large.supportsProtocol(.http_1_1));
     try std.testing.expectEqual(.binary_stream, large.response_mode);
+}
+
+test "server runtime accepts a request head split across socket reads" {
+    var server = try initInteropServer();
+    defer server.deinit();
+    try server.start();
+
+    const response = try runRawExchange(
+        std.testing.allocator,
+        server.port(),
+        &.{
+            "GET /health HTTP/1.1\r\nHost: 127.0.0.1",
+            "\r\n\r\n",
+        },
+    );
+    defer std.testing.allocator.free(response);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "HTTP/1.1 200 OK"));
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        response,
+        1,
+        "{\"status\":\"ok\",\"protocol\":\"http/1.1\"}",
+    ));
+}
+
+test "server runtime rejects truncated request bodies" {
+    var server = try initInteropServer();
+    defer server.deinit();
+    try server.start();
+
+    const response = try runRawExchange(
+        std.testing.allocator,
+        server.port(),
+        &.{
+            "POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\n\r\nabc",
+        },
+    );
+    defer std.testing.allocator.free(response);
+
+    try std.testing.expect(!std.mem.containsAtLeast(u8, response, 1, "HTTP/1.1 200 OK"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, response, 1, "\"body_size\":3"));
 }
