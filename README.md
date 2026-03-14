@@ -11,14 +11,24 @@ local-first protocol tests, and a thin `zttp` CLI.
 - Experimental HTTP/3 client/server harnesses backed by in-repo QUIC and QPACK
 - Shared local harnesses for redirects, cookies, streaming, and protocol checks
 
-HTTP/3 remains opt-in behind `-Dhttp3=true`.
+HTTP/3 remains opt-in behind `-Dhttp3=true` and is not part of the default
+release-readiness gate.
 
 ## Build And Test
+
+Default readiness path:
 
 ```powershell
 zig build
 zig build test
+```
+
+Experimental HTTP/3 path:
+
+```powershell
+zig build -Dhttp3=true
 zig build test -Dhttp3=true
+zig build run -Dhttp3=true -- request --http3 https://127.0.0.1:4433/health
 ```
 
 ## CLI
@@ -72,6 +82,9 @@ zig-out\\bin\\zttp-client-get https://127.0.0.1:8443/health
 The authoritative local verification steps live in
 `.specify/specs/main/quickstart.md`. The short version is:
 
-1. Run `zig build` and `zig build test`.
-2. Start `zttp server` on loopback and issue a local `zttp request`.
-3. Run `zig build test -Dhttp3=true` for the experimental transport path.
+1. Standard release-readiness requires `zig build`, `zig build test`, and the
+   documented loopback `zttp server` + `zttp request` workflow.
+2. HTTP/3 validation is separate, remains experimental, and only runs when you
+   opt in with `-Dhttp3=true`.
+3. Passing the HTTP/3 commands does not change the default support promise if
+   the standard readiness flow is failing on a supported host.
