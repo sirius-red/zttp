@@ -1,4 +1,4 @@
-//! Experimental HTTP/3 client request flow for local harness interoperability.
+//! HTTP/3 client request flow for local harness interoperability.
 
 const std = @import("std");
 const types = @import("../types.zig");
@@ -37,7 +37,7 @@ pub const RequestPlan = struct {
     }
 };
 
-/// Prepares an HTTP/3 request for the experimental local harness flow.
+/// Prepares an HTTP/3 request for the local harness flow.
 pub fn prepareRequest(
     allocator: std.mem.Allocator,
     connection: *quic.Connection,
@@ -114,7 +114,7 @@ pub fn encodeRequest(allocator: std.mem.Allocator, plan: RequestPlan) Error![]u8
     return bytes.toOwnedSlice(allocator);
 }
 
-/// Executes one local harness request over the experimental QUIC scaffolding.
+/// Executes one local harness request over the QUIC scaffolding.
 pub fn executeHarnessRequest(
     allocator: std.mem.Allocator,
     request: *const types.Request,

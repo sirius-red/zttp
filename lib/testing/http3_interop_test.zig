@@ -1,4 +1,4 @@
-//! Opt-in HTTP/3 interop regression coverage tied to the shared harness contract.
+//! HTTP/3 interop regression coverage tied to the shared harness contract.
 
 const std = @import("std");
 const http3 = @import("../http3/http3.zig");
@@ -39,7 +39,7 @@ const required_routes = [_]RouteExpectation{
     },
 };
 
-test "http3 interop coverage is opt-in" {
+test "http3 interop coverage is enabled by default" {
     try std.testing.expect(http3.enabled);
     try std.testing.expectEqual(@as(usize, 3), required_routes.len);
 }
@@ -76,40 +76,36 @@ test "http3 smoke scenario points at the health route" {
     try std.testing.expectEqualStrings("http3", all[5].name);
     try std.testing.expectEqual(interop_harness.RouteId.health, all[5].route.?);
     try std.testing.expectEqualStrings("zig", all[5].command.argv[0]);
-    try std.testing.expectEqualStrings("test", all[5].command.argv[2]);
-    try std.testing.expectEqualStrings("-Dhttp3=true", all[5].command.argv[3]);
+    try std.testing.expectEqualStrings("run", all[5].command.argv[2]);
+    try std.testing.expectEqualStrings("request", all[5].command.argv[4]);
+    try std.testing.expectEqualStrings("--http3", all[5].command.argv[5]);
 }
 
-test "http3 readiness stays outside the default release gate" {
+test "http3 smoke scenario uses the default build path" {
     const readiness_scenarios = interop_harness.defaultReadinessScenarios();
     try std.testing.expect(readiness_scenarios.len > 0);
 
     for (readiness_scenarios) |scenario| {
-        try std.testing.expect(!scenario.experimental);
         try std.testing.expect(scenario.blocking);
         try std.testing.expectEqual(.tcp, scenario.endpoint.transport);
         for (scenario.server_command.argv) |arg| {
             try std.testing.expect(!std.mem.eql(u8, arg, "-Dhttp3=true"));
-            try std.testing.expect(!std.mem.eql(u8, arg, "--http3"));
         }
         for (scenario.request_command.argv) |arg| {
             try std.testing.expect(!std.mem.eql(u8, arg, "-Dhttp3=true"));
-            try std.testing.expect(!std.mem.eql(u8, arg, "--http3"));
         }
     }
 
     const smoke_scenarios = smoke_runner.defaultScenarios();
     try std.testing.expect(smoke_scenarios.len >= 6);
 
-    for (smoke_scenarios[0 .. smoke_scenarios.len - 1]) |scenario| {
-        try std.testing.expect(!std.mem.eql(u8, scenario.name, "http3"));
+    for (smoke_scenarios) |scenario| {
         for (scenario.command.argv) |arg| {
             try std.testing.expect(!std.mem.eql(u8, arg, "-Dhttp3=true"));
-            try std.testing.expect(!std.mem.eql(u8, arg, "--http3"));
         }
     }
 
-    const experimental = smoke_scenarios[smoke_scenarios.len - 1];
-    try std.testing.expectEqualStrings("http3", experimental.name);
-    try std.testing.expectEqualStrings("-Dhttp3=true", experimental.command.argv[3]);
+    const http3_scenario = smoke_scenarios[smoke_scenarios.len - 1];
+    try std.testing.expectEqualStrings("http3", http3_scenario.name);
+    try std.testing.expectEqualStrings("--http3", http3_scenario.command.argv[5]);
 }

@@ -62,7 +62,7 @@ pub const ServerRequest = server.ServerRequest;
 pub const ServerResponseWriter = server.ServerResponseWriter;
 /// Bound server runtime type.
 pub const ServerRuntime = server.Server;
-/// Experimental HTTP/3 module entrypoint.
+/// HTTP/3 module entrypoint.
 pub const Http3 = http3;
 /// Shared testing module entrypoint.
 pub const Testing = testing;

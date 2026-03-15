@@ -1,7 +1,5 @@
 //! Entry point for shared local test harness support.
 
-/// Build-time feature flags visible to the testing module family.
-pub const BuildOptions = @import("zttp_build_options");
 /// Semantic interop harness route catalog.
 pub const InteropHarness = @import("interop_harness.zig");
 /// Local fixture loading helpers.
@@ -32,15 +30,12 @@ pub const Readiness = struct {
 };
 
 test {
-    _ = BuildOptions;
     _ = InteropHarness;
     _ = FixtureLoader;
     _ = SmokeRunner;
     _ = Readiness;
     _ = @import("malformed_input_test.zig");
-    if (BuildOptions.http3) {
-        _ = @import("http3_interop_test.zig");
-    }
+    _ = @import("http3_interop_test.zig");
 }
 
 test "readiness entrypoint exposes the windows loopback scenario" {

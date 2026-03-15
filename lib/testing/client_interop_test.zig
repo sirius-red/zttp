@@ -51,7 +51,6 @@ test "client interop preserves the windows loopback readiness probe contract" {
     try std.testing.expectEqualStrings("request", readiness.request_command.name);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080/health", readiness.request_command.argv[5]);
     try std.testing.expect(readiness.blocking);
-    try std.testing.expect(!readiness.experimental);
     try std.testing.expect(std.mem.containsAtLeast(
         u8,
         readiness.expected_body_substring,

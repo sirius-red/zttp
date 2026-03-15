@@ -7,7 +7,7 @@ tests.
 
 - `certs/`: loopback certificates, keys, and trust roots for TLS and ALPN tests
 - `http/`: raw request and response payload fixtures for HTTP/1.1 and HTTP/2
-- `http3/`: UDP or QUIC payload samples used by opt-in HTTP/3 harness tests
+- `http3/`: UDP or QUIC payload samples used by HTTP/3 harness tests
 
 ## Rules
 

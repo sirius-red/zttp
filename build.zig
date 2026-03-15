@@ -3,10 +3,9 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const http3_enabled = b.option(bool, "http3", "Enable experimental HTTP/3 support") orelse false;
 
     const zttp_build_options = b.addOptions();
-    zttp_build_options.addOption(bool, "http3", http3_enabled);
+    zttp_build_options.addOption(bool, "http3", true);
     const zttp_build_options_module = zttp_build_options.createModule();
 
     const lib = b.addModule("zttp", .{
@@ -126,7 +125,7 @@ pub fn build(b: *std.Build) void {
     run_readiness_smoke.step.dependOn(b.getInstallStep());
     smoke_step.dependOn(&run_readiness_smoke.step);
 
-    const test_http3_step = b.step("test-http3", "Run the HTTP/3-enabled test suite when built with -Dhttp3=true");
+    const test_http3_step = b.step("test-http3", "Run the full test suite including the default HTTP/3 coverage");
     test_http3_step.dependOn(&run_lib_tests.step);
     test_http3_step.dependOn(&run_cli_tests.step);
 }

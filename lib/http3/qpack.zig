@@ -1,4 +1,4 @@
-//! Minimal QPACK and HTTP/3 frame helpers for local experimental interop.
+//! Minimal QPACK and HTTP/3 frame helpers for local interop.
 
 const std = @import("std");
 

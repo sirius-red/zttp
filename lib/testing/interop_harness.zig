@@ -185,8 +185,6 @@ pub const ReadinessScenario = struct {
     expected_body_substring: []const u8,
     /// Whether the scenario blocks default release-readiness claims.
     blocking: bool,
-    /// Whether the scenario is experimental.
-    experimental: bool,
     /// Known failure signature captured before the fix lands, if any.
     known_failure_signature: ?[]const u8,
 
@@ -338,7 +336,6 @@ const default_readiness_scenarios = [_]ReadinessScenario{
         .expected_status = .ok,
         .expected_body_substring = "\"status\":\"ok\",\"protocol\":\"http/1.1\"",
         .blocking = true,
-        .experimental = false,
         .known_failure_signature = "GetLastError(87) surfaced from std.net.Stream.read",
     },
 };

@@ -1,4 +1,4 @@
-//! Minimal QUIC transport scaffolding for the experimental HTTP/3 path.
+//! Minimal QUIC transport scaffolding for the HTTP/3 path.
 
 const std = @import("std");
 

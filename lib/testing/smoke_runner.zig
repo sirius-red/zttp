@@ -405,8 +405,8 @@ const default_scenarios = [_]Scenario{
     },
     .{
         .name = "http3",
-        .summary = "Run the opt-in HTTP/3 smoke validation path",
-        .command = .{ .argv = &.{ "zig", "build", "test", "-Dhttp3=true" } },
+        .summary = "Verify the HTTP/3 request path through the default build",
+        .command = .{ .argv = &.{ "zig", "build", "run", "--", "request", "--http3", "https://127.0.0.1:4433/health" } },
         .route = .health,
     },
 };

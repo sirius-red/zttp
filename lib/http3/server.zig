@@ -1,4 +1,4 @@
-//! Experimental in-memory HTTP/3 server and harness flow.
+//! In-memory HTTP/3 server and harness flow.
 
 const std = @import("std");
 const types = @import("../types.zig");
