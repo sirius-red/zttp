@@ -504,7 +504,7 @@ test "prepared handshake owns copied plan data without roots in insecure mode" {
 test "prepared handshake rejects a missing explicit root store" {
     var tls_config = types.TlsConfig.default();
     tls_config.root_store_mode = .explicit;
-    tls_config.explicit_roots_path = "lib/testing/fixtures/certs/roots.pem";
+    tls_config.explicit_roots_path = "src/lib/testing/fixtures/certs/roots.pem";
 
     try std.testing.expectError(
         error.InvalidRootStore,

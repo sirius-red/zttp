@@ -2,7 +2,7 @@
 
 const std = @import("std");
 
-/// Logical fixture groups under `lib/testing/fixtures/`.
+/// Logical fixture groups under `src/lib/testing/fixtures/`.
 pub const FixtureGroup = enum {
     /// Root certificate bundles and keys.
     certs,
@@ -128,7 +128,7 @@ pub const Loader = struct {
 
     /// Creates a loader rooted at the repository fixture directory.
     pub fn init() Loader {
-        return .{ .base_path = "lib/testing/fixtures" };
+        return .{ .base_path = "src/lib/testing/fixtures" };
     }
 
     /// Creates a loader rooted at the provided base path.

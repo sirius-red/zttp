@@ -9,14 +9,14 @@ pub fn build(b: *std.Build) void {
     const zttp_build_options_module = zttp_build_options.createModule();
 
     const lib = b.addModule("zttp", .{
-        .root_source_file = b.path("lib/zttp.zig"),
+        .root_source_file = b.path("src/lib/zttp.zig"),
         .target = target,
         .optimize = optimize,
     });
     lib.addImport("zttp_build_options", zttp_build_options_module);
 
     const tls = b.addModule("zttp_tls", .{
-        .root_source_file = b.path("lib/tls/tls.zig"),
+        .root_source_file = b.path("src/lib/tls/tls.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const http2 = b.addModule("zttp_http2", .{
-        .root_source_file = b.path("lib/http2/http2.zig"),
+        .root_source_file = b.path("src/lib/http2/http2.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -32,7 +32,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const server = b.addModule("zttp_server", .{
-        .root_source_file = b.path("lib/server/server.zig"),
+        .root_source_file = b.path("src/lib/server/server.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -40,7 +40,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const http3 = b.addModule("zttp_http3", .{
-        .root_source_file = b.path("lib/http3/http3.zig"),
+        .root_source_file = b.path("src/lib/http3/http3.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -48,7 +48,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const testing = b.addModule("zttp_testing", .{
-        .root_source_file = b.path("lib/testing/testing.zig"),
+        .root_source_file = b.path("src/lib/testing/testing.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -65,7 +65,7 @@ pub fn build(b: *std.Build) void {
     const readiness_smoke = b.addExecutable(.{
         .name = "zttp-readiness-smoke",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("lib/testing/readiness_smoke_main.zig"),
+            .root_source_file = b.path("src/lib/testing/readiness_smoke_main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -78,7 +78,7 @@ pub fn build(b: *std.Build) void {
     const cli = b.addExecutable(.{
         .name = "zttp",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("cli/main.zig"),
+            .root_source_file = b.path("src/cli/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{

@@ -97,7 +97,7 @@ test "http3 fixture paths stay inside the dedicated fixture group" {
     const path = try loader.pathFor(std.testing.allocator, "http3/quic/initial-client.bin");
     defer std.testing.allocator.free(path);
 
-    try std.testing.expect(std.mem.startsWith(u8, path, "lib/testing/fixtures"));
+    try std.testing.expect(std.mem.startsWith(u8, path, "src/lib/testing/fixtures"));
     try std.testing.expect(
         std.mem.endsWith(u8, path, "http3/quic/initial-client.bin") or
             std.mem.endsWith(u8, path, "http3\\quic\\initial-client.bin"),

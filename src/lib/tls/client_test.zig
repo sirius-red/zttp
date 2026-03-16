@@ -17,7 +17,7 @@ pub const HandshakeExpectation = union(enum) {
 pub const HandshakeCase = struct {
     /// Stable scenario name used in test output.
     name: []const u8,
-    /// Fixture path under `lib/testing/fixtures/certs/`.
+    /// Fixture path under `src/lib/testing/fixtures/certs/`.
     certificate_fixture: []const u8,
     /// Hostname used for validation.
     server_name: []const u8,
@@ -61,7 +61,7 @@ test "tls config identity changes with verification and alpn policy" {
 
     var explicit_roots = types.TlsConfig.default();
     explicit_roots.root_store_mode = .explicit;
-    explicit_roots.explicit_roots_path = "lib/testing/fixtures/certs/roots.pem";
+    explicit_roots.explicit_roots_path = "src/lib/testing/fixtures/certs/roots.pem";
 
     var h1_only = types.TlsConfig.default();
     h1_only.alpn_protocols = &.{.http_1_1};
@@ -76,7 +76,7 @@ test "tls fixture paths stay inside the cert fixture root" {
     const path = try loader.pathFor(std.testing.allocator, "certs/loopback/server.pem");
     defer std.testing.allocator.free(path);
 
-    try std.testing.expect(std.mem.startsWith(u8, path, "lib/testing/fixtures"));
+    try std.testing.expect(std.mem.startsWith(u8, path, "src/lib/testing/fixtures"));
     try std.testing.expect(
         std.mem.endsWith(u8, path, "certs/loopback/server.pem") or
             std.mem.endsWith(u8, path, "certs\\loopback/server.pem"),
