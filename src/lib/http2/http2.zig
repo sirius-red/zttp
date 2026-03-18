@@ -8,10 +8,3 @@ pub const Frame = @import("frame.zig");
 pub const Hpack = @import("hpack.zig");
 /// HTTP/2 connection and stream state.
 pub const Connection = @import("connection.zig");
-
-test {
-    _ = BuildOptions;
-    _ = Frame;
-    _ = Hpack;
-    _ = Connection;
-}

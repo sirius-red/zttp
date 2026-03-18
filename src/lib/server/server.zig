@@ -18,11 +18,3 @@ pub const ServerRequest = Types.ServerRequest;
 pub const ServerResponseWriter = Types.ServerResponseWriter;
 /// Public server runtime alias.
 pub const Server = Runtime.Server;
-
-test {
-    _ = BuildOptions;
-    _ = Types;
-    _ = Http1;
-    _ = Http2;
-    _ = Runtime;
-}

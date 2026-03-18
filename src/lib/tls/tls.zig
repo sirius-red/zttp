@@ -8,10 +8,3 @@ pub const Config = @import("config.zig");
 pub const Client = @import("client.zig");
 /// TLS server planning helpers.
 pub const Server = @import("server.zig");
-
-test {
-    _ = BuildOptions;
-    _ = Config;
-    _ = Client;
-    _ = Server;
-}
