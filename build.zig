@@ -4,62 +4,42 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const zttp_build_options = b.addOptions();
-    zttp_build_options.addOption(bool, "http3", true);
-    const zttp_build_options_module = zttp_build_options.createModule();
-
     const lib = b.addModule("zttp", .{
         .root_source_file = b.path("src/lib/zttp.zig"),
         .target = target,
         .optimize = optimize,
     });
-    lib.addImport("zttp_build_options", zttp_build_options_module);
 
     const tls = b.addModule("zttp_tls", .{
         .root_source_file = b.path("src/lib/tls/tls.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "zttp_build_options", .module = zttp_build_options_module },
-        },
     });
     const http2 = b.addModule("zttp_http2", .{
         .root_source_file = b.path("src/lib/http2/http2.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "zttp_build_options", .module = zttp_build_options_module },
-        },
-    });
-    const server = b.addModule("zttp_server", .{
-        .root_source_file = b.path("src/lib/server/server.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "zttp_build_options", .module = zttp_build_options_module },
-        },
     });
     const http3 = b.addModule("zttp_http3", .{
         .root_source_file = b.path("src/lib/http3/http3.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "zttp_build_options", .module = zttp_build_options_module },
-        },
+    });
+    const server = b.addModule("zttp_server", .{
+        .root_source_file = b.path("src/lib/server/server.zig"),
+        .target = target,
+        .optimize = optimize,
     });
     const testing = b.addModule("zttp_testing", .{
         .root_source_file = b.path("src/lib/testing/testing.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "zttp_build_options", .module = zttp_build_options_module },
-        },
     });
 
     lib.addImport("zttp_tls", tls);
     lib.addImport("zttp_http2", http2);
-    lib.addImport("zttp_server", server);
     lib.addImport("zttp_http3", http3);
+    lib.addImport("zttp_server", server);
     lib.addImport("zttp_testing", testing);
 
     const readiness_smoke = b.addExecutable(.{
@@ -70,7 +50,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zttp", .module = lib },
-                .{ .name = "zttp_build_options", .module = zttp_build_options_module },
             },
         }),
     });
@@ -83,7 +62,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zttp", .module = lib },
-                .{ .name = "zttp_build_options", .module = zttp_build_options_module },
             },
         }),
     });
@@ -97,7 +75,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zttp", .module = lib },
-                .{ .name = "zttp_build_options", .module = zttp_build_options_module },
             },
         }),
     });

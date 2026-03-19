@@ -1,7 +1,5 @@
 //! Entry point for server support.
 
-/// Build-time feature flags visible to the server module family.
-pub const BuildOptions = @import("zttp_build_options");
 /// Server-side public configuration and message types.
 pub const Types = @import("types.zig");
 /// HTTP/1.1 request parsing and response writing helpers.

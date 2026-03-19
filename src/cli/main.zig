@@ -2,7 +2,6 @@
 
 const std = @import("std");
 const zttp = @import("zttp");
-const BuildOptions = @import("zttp_build_options");
 
 /// General help text for the CLI.
 const help_text =
@@ -112,17 +111,13 @@ const Cli = struct {
     /// Prints the help text for the request subcommand.
     fn printRequestHelp(self: *Cli) !void {
         try self.out.writeAll(request_help);
-        if (BuildOptions.http3) {
-            try self.out.writeAll(request_help_http3);
-        }
+        try self.out.writeAll(request_help_http3);
     }
 
     /// Prints the help text for the server subcommand.
     fn printServerHelp(self: *Cli) !void {
         try self.out.writeAll(server_help);
-        if (BuildOptions.http3) {
-            try self.out.writeAll(server_help_http3);
-        }
+        try self.out.writeAll(server_help_http3);
     }
 
     /// Handles the request subcommand.
@@ -180,10 +175,6 @@ const Cli = struct {
         }
 
         if (request_args.http3) {
-            if (!BuildOptions.http3) {
-                return error.InvalidArguments;
-            }
-
             var response = try zttp.Http3.Client.executeHarnessRequest(self.allocator, &request);
             defer response.deinit();
             defer if (response.body) |body_reader| body_reader.close();
@@ -222,10 +213,6 @@ const Cli = struct {
         };
 
         if (server_args.http3) {
-            if (!BuildOptions.http3) {
-                return error.InvalidArguments;
-            }
-
             const http3_server = zttp.Http3.Server.init(self.allocator, .{
                 .host = server_args.listen,
                 .port = zttp.Port.init(server_args.port),
@@ -610,9 +597,6 @@ const Cli = struct {
                 continue;
             }
             if (std.mem.eql(u8, arg, "--http3")) {
-                if (!BuildOptions.http3) {
-                    return error.UnknownFlag;
-                }
                 if (http3) {
                     return error.DuplicateHttp3;
                 }
@@ -737,9 +721,6 @@ const Cli = struct {
                 continue;
             }
             if (std.mem.eql(u8, arg, "--http3")) {
-                if (!BuildOptions.http3) {
-                    return error.UnknownFlag;
-                }
                 if (http3) {
                     return error.DuplicateHttp3;
                 }
@@ -1022,11 +1003,7 @@ test "request failure hint ignores non-loopback hosts" {
     try std.testing.expect(Cli.requestFailureHint(parsed, error.Transport) == null);
 }
 
-test "request args parser accepts http3 in http3-enabled builds" {
-    if (!BuildOptions.http3) {
-        return;
-    }
-
+test "request args parser accepts http3" {
     var cli = Cli{
         .allocator = std.testing.allocator,
         .out = std.fs.File.stdout(),
@@ -1042,11 +1019,7 @@ test "request args parser accepts http3 in http3-enabled builds" {
     try std.testing.expect(args.http3);
 }
 
-test "server args parser accepts http3 in http3-enabled builds" {
-    if (!BuildOptions.http3) {
-        return;
-    }
-
+test "server args parser accepts http3" {
     var cli = Cli{
         .allocator = std.testing.allocator,
         .out = std.fs.File.stdout(),
