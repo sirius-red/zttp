@@ -377,7 +377,7 @@ pub const Runner = struct {
 const default_scenarios = [_]Scenario{
     .{
         .name = "build",
-        .summary = "Build the library, CLI, and examples",
+        .summary = "Build the library and CLI",
         .command = .{ .argv = &.{ "zig", "build" } },
     },
     .{
