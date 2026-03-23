@@ -80,6 +80,32 @@ pub fn main() !void {
 }
 ```
 
+## Roadmap
+
+ZTTP is progressing in phases. The short version is: the HTTP/1.1 client path is the most mature part of the project today, server support exists in basic form, and HTTP/2 and HTTP/3 are still moving toward full end-to-end support.
+
+Current progress:
+
+- [X] Core library structure, public API, examples, tests, and CLI entrypoints are in place.
+- [X] HTTP/1.1 client support is working, including streaming request/response bodies.
+- [X] Redirects, cookies, proxy support, pooling, timeouts, and cancellation are already part of the client path.
+- [X] A basic HTTP/1.1 server runtime exists and is already useful as a local integration harness.
+- [X] Internal groundwork for HTTP/2 and HTTP/3 already exists, including HPACK, QPACK, QUIC, and local harness coverage.
+
+What is next:
+
+- [ ] Finish the remaining TLS and ALPN behavior needed for the client path to be considered complete end to end.
+- [ ] Deliver full public HTTP/2 client support, not just low-level protocol pieces.
+- [ ] Expand server support with real TLS listener support and minimal end-to-end HTTP/2 serving.
+- [ ] Move HTTP/3 beyond local harness flows into real networked runtime support where practical.
+
+Longer-term goals:
+
+- [ ] Add higher-level server features on top of the core runtime, including routing, middleware, static files, and compression.
+- [ ] Add higher-level client conveniences such as multipart/form-data helpers, retries, caching, and automatic decompression.
+- [ ] Add WebSocket support.
+- [ ] Bring HTTP/2 and HTTP/3 interoperability and production hardening closer to the maturity of the current HTTP/1.1 path.
+
 ## Build and Test
 
 ```shell
