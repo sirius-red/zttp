@@ -73,6 +73,39 @@ fn initSecureHarnessRequest(
     return request;
 }
 
+/// Body reader state that proves secure-harness negotiation failure happens before body reads.
+const RejectBeforeWriteBody = struct {
+    /// Payload bytes.
+    data: []const u8,
+    /// Current read offset.
+    offset: usize,
+    /// Number of read attempts observed by the body reader.
+    read_calls: usize,
+    /// Whether the body reader was closed by the caller.
+    closed: bool,
+
+    /// Reads bytes from the payload buffer.
+    fn read(ctx: ?*anyopaque, dest: []u8) anyerror!usize {
+        const self: *RejectBeforeWriteBody = @ptrCast(@alignCast(ctx.?));
+        self.read_calls += 1;
+        if (self.offset >= self.data.len) {
+            return 0;
+        }
+
+        const remaining = self.data.len - self.offset;
+        const to_copy = @min(dest.len, remaining);
+        std.mem.copyForwards(u8, dest[0..to_copy], self.data[self.offset .. self.offset + to_copy]);
+        self.offset += to_copy;
+        return to_copy;
+    }
+
+    /// Marks the body reader as closed.
+    fn close(ctx: ?*anyopaque) void {
+        const self: *RejectBeforeWriteBody = @ptrCast(@alignCast(ctx.?));
+        self.closed = true;
+    }
+};
+
 test "connection completes the loopback health response" {
     const scenarios = [_]test_server.Scenario{
         .{
@@ -220,4 +253,40 @@ test "connection falls back to http/1.1 when the secure harness omits alpn" {
 
     try std.testing.expectEqual(types.Version.http_1_1, response.version);
     try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, conn.negotiatedProtocol());
+}
+
+test "connection rejects unsupported secure harness negotiation before reading request body" {
+    const peer = interop_harness.alpnPeerProfileForId(.unsupported_protocol).?;
+
+    var conn = initSecureHarnessConnectionForPeer(.unsupported_protocol, .http_1_1);
+    defer conn.deinit();
+    try conn.start();
+
+    var request = types.Request.init(
+        std.testing.allocator,
+        .post,
+        types.Uri.init(.https, peer.host, peer.port, "/echo", null, null),
+    );
+    defer request.deinit();
+    try request.headers.append("Host", peer.host);
+    try request.headers.append("Content-Length", "7");
+
+    var body_state = RejectBeforeWriteBody{
+        .data = "payload",
+        .offset = 0,
+        .read_calls = 0,
+        .closed = false,
+    };
+    request.body = .{
+        .ctx = &body_state,
+        .read_fn = RejectBeforeWriteBody.read,
+        .close_fn = RejectBeforeWriteBody.close,
+    };
+
+    var response_future = connection_h1.ResponseFuture.init();
+    try conn.submit(&request, response_future.completion());
+
+    try std.testing.expectError(error.NegotiationFailed, response_future.wait());
+    try std.testing.expectEqual(@as(usize, 0), body_state.read_calls);
+    try std.testing.expect(!body_state.closed);
 }

@@ -20,6 +20,8 @@ pub const Error = error{
     InvalidConfig,
     /// Proxy CONNECT request failed.
     ProxyConnectFailed,
+    /// ALPN negotiation failed before request routing could begin.
+    NegotiationFailed,
     /// Redirect limit was exceeded.
     RedirectLimitExceeded,
     /// Redirect loop was detected.
@@ -1336,6 +1338,7 @@ fn mapConnectionWaitError(err: connection_h1.ResponseFuture.WaitError) ResponseF
         error.InvalidUri => error.InvalidUri,
         error.Transport => error.Transport,
         error.ProxyConnectFailed => error.ProxyConnectFailed,
+        error.NegotiationFailed => error.NegotiationFailed,
         error.Protocol => error.Protocol,
         error.LimitExceeded => error.LimitExceeded,
         error.Canceled => error.Canceled,
@@ -2460,6 +2463,33 @@ test "client routes dual-alpn loopback https requests over http2 automatically" 
     var body: [128]u8 = undefined;
     const read_len = try response.body.?.read(&body);
     try std.testing.expect(std.mem.containsAtLeast(u8, body[0..read_len], 1, "\"protocol\":\"h2\""));
+}
+
+test "client surfaces unsupported secure negotiation as a distinct error" {
+    const peer = interop_harness.alpnPeerProfileForId(.unsupported_protocol).?;
+    const failure = interop_harness.failureDiagnosticForPeerProfile(.unsupported_protocol).?;
+
+    var client = Client.init(std.testing.allocator, Options.default());
+    defer client.deinit();
+
+    const uri = types.Uri.init(.https, peer.host, peer.port, "/health", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", peer.host);
+
+    try std.testing.expectEqual(
+        interop_harness.AlpnClientFailure.negotiation_failed,
+        failure.client_failure,
+    );
+    try std.testing.expectEqual(
+        interop_harness.AlpnFailurePhase.protocol_routing_before_http,
+        failure.phase,
+    );
+
+    var handle = try client.request(&request);
+    defer handle.deinit();
+
+    try std.testing.expectError(error.NegotiationFailed, handle.wait());
 }
 
 test "client reuses keep-alive connection" {

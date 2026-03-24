@@ -155,6 +155,14 @@ pub const AlpnFailurePhase = enum {
     protocol_routing_before_http,
 };
 
+/// Expected client-visible error category for an ALPN persona.
+pub const AlpnClientFailure = enum {
+    /// No failure is expected.
+    none,
+    /// Negotiation must fail before any HTTP request bytes are written.
+    negotiation_failed,
+};
+
 /// Declarative ALPN persona used by local loopback verification.
 pub const AlpnPeerProfile = struct {
     /// Stable persona identifier.
@@ -173,6 +181,8 @@ pub const AlpnPeerProfile = struct {
     expected_outcome: AlpnExpectedOutcome,
     /// Expected failure phase for negative personas.
     expected_failure_phase: AlpnFailurePhase,
+    /// Expected client-visible failure for negative personas.
+    expected_client_failure: AlpnClientFailure,
     /// Whether the persona is valid for TLS loopback verification.
     tls_supported: bool,
 };
@@ -185,6 +195,16 @@ pub const AlpnSuccessDiagnostic = struct {
     negotiated_protocol: types.NegotiatedProtocol,
     /// HTTP version label expected on the local verification surface.
     response_version: types.Version,
+};
+
+/// Expected local diagnostic emitted for a failed ALPN persona.
+pub const AlpnFailureDiagnostic = struct {
+    /// Peer persona that produced the failure.
+    peer_profile: AlpnPeerProfileId,
+    /// Failure phase expected from the local harness flow.
+    phase: AlpnFailurePhase,
+    /// Client-visible failure category expected from the request path.
+    client_failure: AlpnClientFailure,
 };
 
 /// UDP-focused HTTP/3 scenario metadata.
@@ -296,6 +316,7 @@ const default_alpn_peer_profiles = [_]AlpnPeerProfile{
         .selected_protocol_token = "h2",
         .expected_outcome = .h2,
         .expected_failure_phase = .none,
+        .expected_client_failure = .none,
         .tls_supported = true,
     },
     .{
@@ -307,6 +328,7 @@ const default_alpn_peer_profiles = [_]AlpnPeerProfile{
         .selected_protocol_token = "http/1.1",
         .expected_outcome = .http_1_1,
         .expected_failure_phase = .none,
+        .expected_client_failure = .none,
         .tls_supported = true,
     },
     .{
@@ -318,6 +340,7 @@ const default_alpn_peer_profiles = [_]AlpnPeerProfile{
         .selected_protocol_token = null,
         .expected_outcome = .http_1_1,
         .expected_failure_phase = .none,
+        .expected_client_failure = .none,
         .tls_supported = true,
     },
     .{
@@ -329,6 +352,7 @@ const default_alpn_peer_profiles = [_]AlpnPeerProfile{
         .selected_protocol_token = "spdy/3",
         .expected_outcome = .reject_before_http,
         .expected_failure_phase = .protocol_routing_before_http,
+        .expected_client_failure = .negotiation_failed,
         .tls_supported = true,
     },
 };
@@ -547,6 +571,20 @@ pub fn successDiagnosticForPeerProfile(id: AlpnPeerProfileId) ?AlpnSuccessDiagno
             .response_version = .http_1_1,
         },
         .reject_before_http => null,
+    };
+}
+
+/// Returns the expected failure diagnostic for a peer profile, if any.
+pub fn failureDiagnosticForPeerProfile(id: AlpnPeerProfileId) ?AlpnFailureDiagnostic {
+    const profile = alpnPeerProfileForId(id) orelse return null;
+    if (profile.expected_client_failure == .none) {
+        return null;
+    }
+
+    return .{
+        .peer_profile = profile.id,
+        .phase = profile.expected_failure_phase,
+        .client_failure = profile.expected_client_failure,
     };
 }
 
@@ -817,6 +855,7 @@ test "ALPN peer profiles stay aligned with local contract metadata" {
     try std.testing.expectEqual(@as(u16, 21443), unsupported.port.toInt());
     try std.testing.expectEqual(AlpnExpectedOutcome.reject_before_http, unsupported.expected_outcome);
     try std.testing.expectEqual(AlpnFailurePhase.protocol_routing_before_http, unsupported.expected_failure_phase);
+    try std.testing.expectEqual(AlpnClientFailure.negotiation_failed, unsupported.expected_client_failure);
     try std.testing.expectEqualStrings("spdy/3", unsupported.selected_protocol_token.?);
 }
 
@@ -835,6 +874,15 @@ test "ALPN diagnostics expose successful negotiated protocol expectations" {
     try std.testing.expectEqual(types.Version.http_1_1, omits_alpn.response_version);
 
     try std.testing.expect(successDiagnosticForPeerProfile(.unsupported_protocol) == null);
+}
+
+test "ALPN diagnostics expose failed negotiated protocol expectations" {
+    const unsupported = failureDiagnosticForPeerProfile(.unsupported_protocol).?;
+    try std.testing.expectEqual(AlpnPeerProfileId.unsupported_protocol, unsupported.peer_profile);
+    try std.testing.expectEqual(AlpnFailurePhase.protocol_routing_before_http, unsupported.phase);
+    try std.testing.expectEqual(AlpnClientFailure.negotiation_failed, unsupported.client_failure);
+
+    try std.testing.expect(failureDiagnosticForPeerProfile(.dual_alpn) == null);
 }
 
 test "ALPN peer profiles resolve by loopback endpoint" {

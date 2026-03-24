@@ -124,3 +124,13 @@ test "omitted alpn peer profile falls back to http/1.1 during tls negotiation" {
     try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, result.protocol);
     try std.testing.expect(result.verified);
 }
+
+test "tls negotiation rejects unsupported peer-selected protocols" {
+    try std.testing.expectError(
+        error.NoSharedProtocol,
+        @import("client.zig").negotiateProtocol(
+            types.TlsConfig.default(),
+            &.{.h3},
+        ),
+    );
+}

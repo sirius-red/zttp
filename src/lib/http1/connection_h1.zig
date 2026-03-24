@@ -23,6 +23,8 @@ pub const Error = error{
     Transport,
     /// Proxy CONNECT request failed.
     ProxyConnectFailed,
+    /// ALPN negotiation failed before any HTTP bytes were written.
+    NegotiationFailed,
     /// Protocol violation or malformed data.
     Protocol,
     /// Configured limit was exceeded.
@@ -858,7 +860,7 @@ pub const ConnectionH1 = struct {
         self.tls_stream = tls_stream;
         self.negotiated_protocol = tls_stream.negotiatedProtocol();
         if (self.negotiated_protocol != self.options.expected_protocol) {
-            return error.Protocol;
+            return error.NegotiationFailed;
         }
     }
 
@@ -875,7 +877,7 @@ pub const ConnectionH1 = struct {
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.MissingServerName => error.InvalidUri,
-            error.NoSharedProtocol => error.Protocol,
+            error.NoSharedProtocol => error.NegotiationFailed,
             error.InvalidRootStore,
             error.RootStoreUnavailable,
             error.HostnameMismatch,
@@ -904,7 +906,7 @@ pub const ConnectionH1 = struct {
         self.secure_harness_profile = profile;
         self.negotiated_protocol = try self.negotiateSecureHarnessProtocol(profile);
         if (self.negotiated_protocol != self.options.expected_protocol) {
-            return error.Protocol;
+            return error.NegotiationFailed;
         }
 
         if (self.negotiated_protocol == .h2 and self.http2_session == null) {
@@ -924,22 +926,22 @@ pub const ConnectionH1 = struct {
         const tls_config = self.options.tls_config orelse return error.Protocol;
 
         if (profile.selected_protocol_token) |token| {
-            const protocol = parseProtocolToken(token) catch return error.Protocol;
+            const protocol = parseProtocolToken(token) catch return error.NegotiationFailed;
             if (!tls_config.supportsProtocol(protocol)) {
-                return error.Protocol;
+                return error.NegotiationFailed;
             }
             return protocol;
         }
 
         if (profile.omits_alpn) {
             if (!tls_config.supportsProtocol(.http_1_1)) {
-                return error.Protocol;
+                return error.NegotiationFailed;
             }
             return .http_1_1;
         }
 
         const negotiation = tls_client.negotiateProtocol(tls_config, profile.advertised_protocols) catch {
-            return error.Protocol;
+            return error.NegotiationFailed;
         };
         return negotiation.protocol;
     }
