@@ -510,8 +510,16 @@ const ConnectionPool = struct {
         const now = std.time.nanoTimestamp();
         self.pruneIdle(entry.value_ptr, now);
 
-        if (entry.value_ptr.idle.items.len > 0) {
+        while (entry.value_ptr.idle.items.len > 0) {
             const idle = entry.value_ptr.idle.pop().?;
+            if (!isIdleConnectionCompatible(idle.connection, options)) {
+                if (entry.value_ptr.total > 0) {
+                    entry.value_ptr.total -= 1;
+                }
+                idle.connection.deinit();
+                self.allocator.destroy(idle.connection);
+                continue;
+            }
             const lease = Lease{
                 .origin = entry.key_ptr.*,
                 .connection = idle.connection,
@@ -732,6 +740,17 @@ const ConnectionPool = struct {
         }
     }
 };
+
+/// Returns true when an idle pooled connection can safely satisfy the next request.
+fn isIdleConnectionCompatible(
+    connection: *connection_h1.ConnectionH1,
+    options: connection_h1.Options,
+) bool {
+    if (options.tls_config == null) {
+        return true;
+    }
+    return connection.negotiatedProtocol() == options.expected_protocol;
+}
 
 /// Internal state for an in-flight request.
 const RequestState = struct {
@@ -1790,6 +1809,11 @@ fn buildProtocolPlanForRequest(self: *const Client, request_value: *const types.
         };
     }
 
+    return http1CompatibilityProtocolPlan();
+}
+
+/// Returns the compatibility protocol plan for routes that cannot safely advertise `h2`.
+fn http1CompatibilityProtocolPlan() types.ProtocolPlan {
     return .{
         .expected_protocol = .http_1_1,
         .offered_protocols = &http_1_1_only_protocols,
@@ -2395,6 +2419,23 @@ test "https connection options prefer h2 for the dual-alpn loopback peer" {
     try std.testing.expectEqual(types.NegotiatedProtocol.h2, connection_options.expected_protocol);
 }
 
+test "https connection options keep the compatibility path for omitted alpn peers" {
+    var client = Client.init(std.testing.allocator, Options.default());
+    defer client.deinit();
+
+    const peer = interop_harness.alpnPeerProfileForId(.omits_alpn).?;
+    const uri = types.Uri.init(.https, peer.host, peer.port, "/health", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", peer.host);
+
+    const connection_options = client.buildConnectionOptions(&request);
+    try std.testing.expect(connection_options.tls_config != null);
+    try std.testing.expectEqual(@as(usize, 1), connection_options.tls_config.?.alpn_protocols.len);
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, connection_options.tls_config.?.alpn_protocols[0]);
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, connection_options.expected_protocol);
+}
+
 test "client routes dual-alpn loopback https requests over http2 automatically" {
     const peer = interop_harness.alpnPeerProfileForId(.dual_alpn).?;
 
@@ -2498,6 +2539,64 @@ test "client reuses keep-alive connection" {
         const eof = try response.body.?.read(&buffer);
         try std.testing.expectEqual(@as(usize, 0), eof);
     }
+}
+
+test "client reuses the secure compatibility connection for omitted alpn peers" {
+    const peer = interop_harness.alpnPeerProfileForId(.omits_alpn).?;
+
+    var options = Options.default();
+    options.pool.max_connections = ConnectionCount.init(1);
+    options.pool.idle_timeout = Duration.fromSeconds(2);
+
+    var client = Client.init(std.testing.allocator, options);
+    defer client.deinit();
+
+    const uri = types.Uri.init(.https, peer.host, peer.port, "/health", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", peer.host);
+
+    const origin = try client.buildOriginKey(&request, null, null);
+
+    {
+        var handle = try client.request(&request);
+        defer handle.deinit();
+
+        var response = try handle.wait();
+        defer response.deinit();
+        defer if (response.body) |body| body.close();
+
+        try std.testing.expectEqual(types.Version.http_1_1, response.version);
+
+        var body: [128]u8 = undefined;
+        const read_len = try response.body.?.read(&body);
+        try std.testing.expect(std.mem.containsAtLeast(u8, body[0..read_len], 1, "\"protocol\":\"http/1.1\""));
+    }
+
+    const first_entry = client.pool.origins.getEntryContext(origin, OriginKeyContext{}).?;
+    try std.testing.expectEqual(@as(usize, 1), first_entry.value_ptr.total);
+    try std.testing.expectEqual(@as(usize, 1), first_entry.value_ptr.idle.items.len);
+    const reused_connection = first_entry.value_ptr.idle.items[0].connection;
+
+    {
+        var handle = try client.request(&request);
+        defer handle.deinit();
+
+        var response = try handle.wait();
+        defer response.deinit();
+        defer if (response.body) |body| body.close();
+
+        try std.testing.expectEqual(types.Version.http_1_1, response.version);
+
+        var body: [128]u8 = undefined;
+        const read_len = try response.body.?.read(&body);
+        try std.testing.expect(std.mem.containsAtLeast(u8, body[0..read_len], 1, "\"protocol\":\"http/1.1\""));
+    }
+
+    const second_entry = client.pool.origins.getEntryContext(origin, OriginKeyContext{}).?;
+    try std.testing.expectEqual(@as(usize, 1), second_entry.value_ptr.total);
+    try std.testing.expectEqual(@as(usize, 1), second_entry.value_ptr.idle.items.len);
+    try std.testing.expectEqual(reused_connection, second_entry.value_ptr.idle.items[0].connection);
 }
 
 test "client expires idle connection after timeout" {

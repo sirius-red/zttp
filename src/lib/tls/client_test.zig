@@ -100,3 +100,27 @@ test "dual-alpn peer profile prefers h2 during tls negotiation" {
     try std.testing.expectEqual(types.NegotiatedProtocol.h2, result.protocol);
     try std.testing.expect(result.verified);
 }
+
+test "http/1.1-only peer profile negotiates http/1.1 during tls negotiation" {
+    const peer = interop_harness.alpnPeerProfileForId(.http1_only).?;
+
+    const result = try @import("client.zig").negotiateProtocol(
+        types.TlsConfig.default(),
+        peer.advertised_protocols,
+    );
+
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, result.protocol);
+    try std.testing.expect(result.verified);
+}
+
+test "omitted alpn peer profile falls back to http/1.1 during tls negotiation" {
+    const peer = interop_harness.alpnPeerProfileForId(.omits_alpn).?;
+
+    const result = try @import("client.zig").negotiateProtocol(
+        types.TlsConfig.default().withAlpnProtocols(&.{.http_1_1}),
+        peer.advertised_protocols,
+    );
+
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, result.protocol);
+    try std.testing.expect(result.verified);
+}

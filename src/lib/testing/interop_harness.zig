@@ -830,6 +830,10 @@ test "ALPN diagnostics expose successful negotiated protocol expectations" {
     try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, http1_only.negotiated_protocol);
     try std.testing.expectEqual(types.Version.http_1_1, http1_only.response_version);
 
+    const omits_alpn = successDiagnosticForPeerProfile(.omits_alpn).?;
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, omits_alpn.negotiated_protocol);
+    try std.testing.expectEqual(types.Version.http_1_1, omits_alpn.response_version);
+
     try std.testing.expect(successDiagnosticForPeerProfile(.unsupported_protocol) == null);
 }
 

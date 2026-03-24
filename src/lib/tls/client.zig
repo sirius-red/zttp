@@ -247,13 +247,11 @@ pub fn negotiateProtocol(
         }
     }
 
-    if (tls_config.supportsProtocol(.http_1_1)) {
-        if (offered_protocols.len == 0 or containsProtocol(offered_protocols, .http_1_1)) {
-            return .{
-                .protocol = .http_1_1,
-                .verified = tls_config.verify == .verify,
-            };
-        }
+    if (canFallbackToHttp1ForOmittedAlpn(tls_config, offered_protocols)) {
+        return .{
+            .protocol = .http_1_1,
+            .verified = tls_config.verify == .verify,
+        };
     }
 
     return error.NoSharedProtocol;
@@ -365,6 +363,17 @@ fn containsProtocol(
         }
     }
     return false;
+}
+
+/// Returns true when an omitted-ALPN handshake may safely fall back to `http/1.1`.
+fn canFallbackToHttp1ForOmittedAlpn(
+    tls_config: types.TlsConfig,
+    offered_protocols: []const types.NegotiatedProtocol,
+) bool {
+    if (!tls_config.supportsProtocol(.http_1_1)) {
+        return false;
+    }
+    return offered_protocols.len == 0 or containsProtocol(offered_protocols, .http_1_1);
 }
 
 /// Clones borrowed handshake-plan slices into allocator-owned storage.
