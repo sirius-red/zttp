@@ -370,6 +370,13 @@ pub const TlsConfig = struct {
         return TlsIdentityToken.init(hasher.final());
     }
 
+    /// Returns a copy of the TLS config constrained to the provided ALPN offers.
+    pub fn withAlpnProtocols(self: TlsConfig, protocols: []const NegotiatedProtocol) TlsConfig {
+        var copy = self;
+        copy.alpn_protocols = protocols;
+        return copy;
+    }
+
     /// Returns the default TLS configuration.
     pub fn default() TlsConfig {
         return .{
@@ -381,6 +388,29 @@ pub const TlsConfig = struct {
             .alpn_protocols = &default_alpn_protocols,
             .identity_token = null,
         };
+    }
+};
+
+/// Planned transport protocol and ALPN offer set for one request route.
+pub const ProtocolPlan = struct {
+    /// Application protocol the selected transport path must handle.
+    expected_protocol: NegotiatedProtocol,
+    /// Ordered ALPN protocols the client may advertise on this route.
+    offered_protocols: []const NegotiatedProtocol,
+
+    /// Returns true when the route advertises the provided protocol.
+    pub fn supportsOfferedProtocol(self: ProtocolPlan, protocol: NegotiatedProtocol) bool {
+        for (self.offered_protocols) |candidate| {
+            if (candidate == protocol) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Applies the route's ALPN offer set to a shared TLS configuration.
+    pub fn routedTlsConfig(self: ProtocolPlan, tls_config: TlsConfig) TlsConfig {
+        return tls_config.withAlpnProtocols(self.offered_protocols);
     }
 };
 
@@ -626,6 +656,20 @@ test "tls config default identity is stable" {
     try std.testing.expect(config.supportsProtocol(.h2));
     try std.testing.expect(config.supportsProtocol(.http_1_1));
     try std.testing.expectEqual(config.identity().toInt(), TlsConfig.default().identity().toInt());
+}
+
+test "protocol plan narrows routed tls identity to the offered alpn set" {
+    const routed = ProtocolPlan{
+        .expected_protocol = .http_1_1,
+        .offered_protocols = &.{.http_1_1},
+    };
+    const tls_config = routed.routedTlsConfig(TlsConfig.default());
+
+    try std.testing.expectEqual(@as(usize, 1), tls_config.alpn_protocols.len);
+    try std.testing.expectEqual(NegotiatedProtocol.http_1_1, tls_config.alpn_protocols[0]);
+    try std.testing.expect(routed.supportsOfferedProtocol(.http_1_1));
+    try std.testing.expect(!routed.supportsOfferedProtocol(.h2));
+    try std.testing.expect(tls_config.identity().toInt() != TlsConfig.default().identity().toInt());
 }
 
 test "negotiated protocol exposes ALPN token" {

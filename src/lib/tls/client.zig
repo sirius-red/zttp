@@ -202,6 +202,17 @@ pub const ClientStream = struct {
 
 /// Builds a static TLS handshake plan from the request URI and config.
 pub fn buildHandshakePlan(uri: types.Uri, tls_config: types.TlsConfig) Error!HandshakePlan {
+    return buildHandshakePlanForOfferedProtocols(uri, tls_config, tls_config.alpn_protocols);
+}
+
+/// Builds a TLS handshake plan constrained to a routed ALPN offer set.
+pub fn buildHandshakePlanForOfferedProtocols(
+    uri: types.Uri,
+    tls_config: types.TlsConfig,
+    offered_protocols: []const types.NegotiatedProtocol,
+) Error!HandshakePlan {
+    const routed_tls_config = tls_config.withAlpnProtocols(offered_protocols);
+    try config.validate(routed_tls_config);
     try config.validate(tls_config);
     if (uri.host.len == 0) {
         return error.MissingServerName;
@@ -210,11 +221,11 @@ pub fn buildHandshakePlan(uri: types.Uri, tls_config: types.TlsConfig) Error!Han
     return .{
         .server_name = uri.host,
         .port = uri.effectivePort(),
-        .verify_mode = tls_config.verify,
-        .alpn_protocols = tls_config.alpn_protocols,
-        .explicit_roots_path = tls_config.explicit_roots_path,
-        .identity_token = tls_config.identity(),
-        .peer_verification_required = tls_config.verify == .verify,
+        .verify_mode = routed_tls_config.verify,
+        .alpn_protocols = routed_tls_config.alpn_protocols,
+        .explicit_roots_path = routed_tls_config.explicit_roots_path,
+        .identity_token = routed_tls_config.identity(),
+        .peer_verification_required = routed_tls_config.verify == .verify,
     };
 }
 
@@ -255,11 +266,33 @@ pub fn prepare(
     tls_config: types.TlsConfig,
     offered_protocols: []const types.NegotiatedProtocol,
 ) Error!PreparedHandshake {
-    var plan = try clonePlan(allocator, try buildHandshakePlan(uri, tls_config));
+    return prepareForOfferedProtocols(
+        allocator,
+        uri,
+        tls_config,
+        tls_config.alpn_protocols,
+        offered_protocols,
+    );
+}
+
+/// Prepares TLS state using an explicit routed ALPN offer set.
+pub fn prepareForOfferedProtocols(
+    allocator: std.mem.Allocator,
+    uri: types.Uri,
+    tls_config: types.TlsConfig,
+    routable_offered_protocols: []const types.NegotiatedProtocol,
+    peer_offered_protocols: []const types.NegotiatedProtocol,
+) Error!PreparedHandshake {
+    const routed_tls_config = tls_config.withAlpnProtocols(routable_offered_protocols);
+    var plan = try clonePlan(allocator, try buildHandshakePlanForOfferedProtocols(
+        uri,
+        tls_config,
+        routable_offered_protocols,
+    ));
     errdefer freeOwnedPlan(allocator, &plan);
 
-    const negotiation = try negotiateProtocol(tls_config, offered_protocols);
-    var ca_bundle = try loadCaBundle(allocator, tls_config);
+    const negotiation = try negotiateProtocol(routed_tls_config, peer_offered_protocols);
+    var ca_bundle = try loadCaBundle(allocator, routed_tls_config);
     errdefer if (ca_bundle) |*bundle| bundle.deinit(allocator);
 
     const tls_read_buffer = allocator.alloc(u8, default_plaintext_buffer_bytes) catch return error.OutOfMemory;
@@ -291,7 +324,32 @@ pub fn establish(
     tls_config: types.TlsConfig,
     offered_protocols: []const types.NegotiatedProtocol,
 ) Error!*ClientStream {
-    var prepared = try prepare(allocator, uri, tls_config, offered_protocols);
+    return establishForOfferedProtocols(
+        allocator,
+        stream,
+        uri,
+        tls_config,
+        tls_config.alpn_protocols,
+        offered_protocols,
+    );
+}
+
+/// Establishes a TLS client using an explicit routed ALPN offer set.
+pub fn establishForOfferedProtocols(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    uri: types.Uri,
+    tls_config: types.TlsConfig,
+    routable_offered_protocols: []const types.NegotiatedProtocol,
+    peer_offered_protocols: []const types.NegotiatedProtocol,
+) Error!*ClientStream {
+    var prepared = try prepareForOfferedProtocols(
+        allocator,
+        uri,
+        tls_config,
+        routable_offered_protocols,
+        peer_offered_protocols,
+    );
     errdefer prepared.deinit();
     return prepared.attach(stream);
 }
@@ -462,6 +520,22 @@ test "tls handshake planning preserves host, port, and verification policy" {
     try std.testing.expect(plan.peer_verification_required);
     try std.testing.expectEqual(
         types.TlsConfig.default().identity().toInt(),
+        plan.identity_token.toInt(),
+    );
+}
+
+test "tls handshake planning accepts an explicit routed offer set" {
+    const uri = types.Uri.init(.https, "example.com", null, "/", null, null);
+    const plan = try buildHandshakePlanForOfferedProtocols(
+        uri,
+        types.TlsConfig.default(),
+        &.{.http_1_1},
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), plan.alpn_protocols.len);
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, plan.alpn_protocols[0]);
+    try std.testing.expectEqual(
+        types.TlsConfig.default().withAlpnProtocols(&.{.http_1_1}).identity().toInt(),
         plan.identity_token.toInt(),
     );
 }

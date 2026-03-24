@@ -68,6 +68,8 @@ const OriginKey = types.OriginKey;
 
 /// ALPN list pinned to the HTTP/1.1 transport path.
 const http_1_1_only_protocols = [_]types.NegotiatedProtocol{.http_1_1};
+/// ALPN list preferred when the HTTP/2 transport path is routable.
+const http_2_preferred_protocols = [_]types.NegotiatedProtocol{ .h2, .http_1_1 };
 
 /// Cancellation token shared across operations.
 pub const CancellationToken = struct {
@@ -1482,7 +1484,7 @@ pub const Client = struct {
             return error.InvalidUri;
         }
 
-        const planned_protocol = plannedProtocolForRequest(request_value);
+        const protocol_plan = buildProtocolPlanForRequest(self, request_value);
         const tls_id = self.tlsIdentityForRequest(request_value);
 
         if (proxy_endpoint) |proxy_value| {
@@ -1495,7 +1497,7 @@ pub const Client = struct {
                     .host = proxy_value.host,
                     .port = proxy_value.port,
                     .tls_id = tls_id,
-                    .negotiated_protocol = planned_protocol,
+                    .negotiated_protocol = protocol_plan.expected_protocol,
                     .target_mode = .absolute_form,
                     .tunnel = null,
                     .proxy_authorization = null,
@@ -1514,7 +1516,7 @@ pub const Client = struct {
                 .host = proxy_value.host,
                 .port = proxy_value.port,
                 .tls_id = tls_id,
-                .negotiated_protocol = planned_protocol,
+                .negotiated_protocol = protocol_plan.expected_protocol,
                 .target_mode = .origin_form,
                 .tunnel = .{
                     .host = tunnel_host,
@@ -1533,7 +1535,7 @@ pub const Client = struct {
             .host = request_value.uri.host,
             .port = port,
             .tls_id = tls_id,
-            .negotiated_protocol = planned_protocol,
+            .negotiated_protocol = protocol_plan.expected_protocol,
             .target_mode = .origin_form,
             .tunnel = null,
             .proxy_authorization = null,
@@ -1709,7 +1711,7 @@ pub const Client = struct {
     /// Maps client options into connection options.
     fn buildConnectionOptions(self: *Client, request_value: *const types.Request) connection_h1.Options {
         var options = connection_h1.Options.default();
-        const planned_protocol = plannedProtocolForRequest(request_value);
+        const protocol_plan = buildProtocolPlanForRequest(self, request_value);
         options.connect_timeout_ns = if (self.options.timeouts.connect) |timeout|
             timeout.toNanos()
         else
@@ -1730,7 +1732,7 @@ pub const Client = struct {
         options.max_header_count = self.options.limits.max_header_count.toInt();
         options.max_status_line_bytes = self.options.limits.max_response_line_bytes.toInt();
         options.tls_config = self.effectiveTlsConfigForRequest(request_value);
-        options.expected_protocol = planned_protocol;
+        options.expected_protocol = protocol_plan.expected_protocol;
         return options;
     }
 
@@ -1742,7 +1744,8 @@ pub const Client = struct {
         if (request_value.uri.scheme != .https) {
             return null;
         }
-        return effectiveTlsConfigForProtocol(self.options.tls, plannedProtocolForRequest(request_value));
+        const protocol_plan = buildProtocolPlanForRequest(self, request_value);
+        return protocol_plan.routedTlsConfig(self.options.tls);
     }
 
     /// Validates client options before issuing requests.
@@ -1777,25 +1780,26 @@ fn mapConnectionTargetMode(mode: types.ConnectionTargetMode) request_encoder.Req
     };
 }
 
-/// Returns the effective TLS config for the selected application protocol.
-fn effectiveTlsConfigForProtocol(
-    base: types.TlsConfig,
-    protocol: types.NegotiatedProtocol,
-) types.TlsConfig {
-    var tls_config_value = base;
-    switch (protocol) {
-        .http_1_1 => tls_config_value.alpn_protocols = &http_1_1_only_protocols,
-        .h2,
-        .h3,
-        => {},
+/// Builds the currently routable transport and ALPN offer plan for a request.
+fn buildProtocolPlanForRequest(self: *const Client, request_value: *const types.Request) types.ProtocolPlan {
+    if (request_value.uri.scheme == .https and isHttp2TransportRoutable(self, request_value)) {
+        return .{
+            .expected_protocol = .h2,
+            .offered_protocols = &http_2_preferred_protocols,
+        };
     }
-    return tls_config_value;
+
+    return .{
+        .expected_protocol = .http_1_1,
+        .offered_protocols = &http_1_1_only_protocols,
+    };
 }
 
-/// Returns the currently planned application protocol for a request.
-fn plannedProtocolForRequest(request_value: *const types.Request) types.NegotiatedProtocol {
+/// Returns true when the client can route the request through the HTTP/2 transport path.
+fn isHttp2TransportRoutable(self: *const Client, request_value: *const types.Request) bool {
+    _ = self;
     _ = request_value;
-    return .http_1_1;
+    return false;
 }
 
 /// Builds a request copy with optional Cookie and Proxy-Authorization headers.
@@ -2347,6 +2351,21 @@ test "https connection options pin http/1.1 alpn for the http1 transport path" {
     try std.testing.expectEqual(@as(usize, 1), connection_options.tls_config.?.alpn_protocols.len);
     try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, connection_options.tls_config.?.alpn_protocols[0]);
     try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, connection_options.expected_protocol);
+}
+
+test "https protocol planning narrows offers until the http2 route is available" {
+    var client = Client.init(std.testing.allocator, Options.default());
+    defer client.deinit();
+
+    const uri = types.Uri.init(.https, "example.com", null, "/", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "example.com");
+
+    const plan = buildProtocolPlanForRequest(&client, &request);
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, plan.expected_protocol);
+    try std.testing.expectEqual(@as(usize, 1), plan.offered_protocols.len);
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, plan.offered_protocols[0]);
 }
 
 test "client reuses keep-alive connection" {
