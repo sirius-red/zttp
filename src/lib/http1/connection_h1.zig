@@ -10,6 +10,8 @@ const socket_io = @import("../util/socket_io.zig");
 const request_encoder = @import("request_encoder.zig");
 const response_parser = @import("response_parser.zig");
 const tls_client = @import("../tls/client.zig");
+const http2_connection = @import("../http2/connection.zig");
+const interop_harness = @import("../testing/interop_harness.zig");
 
 /// Error set returned by connection operations.
 pub const Error = error{
@@ -165,6 +167,37 @@ const OwnedResponseBody = struct {
     }
 };
 
+/// In-memory response body state for secure harness responses.
+const OwnedBody = struct {
+    /// Allocator used to destroy the body state.
+    allocator: std.mem.Allocator,
+    /// Owned response bytes.
+    bytes: []u8,
+    /// Current read offset.
+    offset: usize,
+
+    /// Reads one chunk from the owned response bytes.
+    fn read(ctx: ?*anyopaque, dest: []u8) anyerror!usize {
+        const self: *OwnedBody = @ptrCast(@alignCast(ctx.?));
+        if (self.offset >= self.bytes.len) {
+            return 0;
+        }
+
+        const remaining = self.bytes.len - self.offset;
+        const to_copy = @min(dest.len, remaining);
+        std.mem.copyForwards(u8, dest[0..to_copy], self.bytes[self.offset .. self.offset + to_copy]);
+        self.offset += to_copy;
+        return to_copy;
+    }
+
+    /// Releases the owned body bytes.
+    fn close(ctx: ?*anyopaque) void {
+        const self: *OwnedBody = @ptrCast(@alignCast(ctx.?));
+        self.allocator.free(self.bytes);
+        self.allocator.destroy(self);
+    }
+};
+
 /// Error set returned while parsing CONNECT responses.
 const ConnectResponseError = StreamReader.Error || std.mem.Allocator.Error || error{
     UnexpectedEof,
@@ -175,6 +208,13 @@ const ConnectResponseError = StreamReader.Error || std.mem.Allocator.Error || er
     InvalidVersion,
     HeaderTooLarge,
     HeaderCountExceeded,
+};
+
+/// Error set returned while buffering a request body for the local secure harness.
+const ReadBodyError = error{
+    BodyReadFailed,
+    BodyTooLarge,
+    OutOfMemory,
 };
 
 /// Application protocols accepted by the HTTP/1.1 transport path.
@@ -302,6 +342,10 @@ pub const ConnectionH1 = struct {
     tunnel_established: bool,
     /// Negotiated application protocol for the current transport.
     negotiated_protocol: types.NegotiatedProtocol,
+    /// Local secure harness persona, when the connection is simulated in memory.
+    secure_harness_profile: ?interop_harness.AlpnPeerProfile,
+    /// Reusable in-memory HTTP/2 session for negotiated `h2` loopback traffic.
+    http2_session: ?http2_connection.InteropSession,
 
     /// Initializes a connection without starting the background thread.
     pub fn init(allocator: std.mem.Allocator, origin: Origin, options: Options) ConnectionH1 {
@@ -316,7 +360,14 @@ pub const ConnectionH1 = struct {
             .transport_reader = null,
             .tunnel_established = false,
             .negotiated_protocol = .http_1_1,
+            .secure_harness_profile = null,
+            .http2_session = null,
         };
+    }
+
+    /// Returns the negotiated application protocol currently bound to the connection.
+    pub fn negotiatedProtocol(self: *const ConnectionH1) types.NegotiatedProtocol {
+        return self.negotiated_protocol;
     }
 
     /// Starts the background thread to service requests.
@@ -497,6 +548,9 @@ pub const ConnectionH1 = struct {
     fn execute(self: *ConnectionH1, request: *const types.Request, request_start: i128) Error!ResponseInfo {
         try self.validateRequest(request);
         try self.ensureConnected(request_start);
+        if (self.secure_harness_profile != null) {
+            return self.executeSecureHarnessRequest(request, request_start);
+        }
         try self.sendRequest(request, request_start);
         return self.readResponse(request_start);
     }
@@ -553,6 +607,15 @@ pub const ConnectionH1 = struct {
 
     /// Ensures a TCP connection is established.
     fn ensureConnected(self: *ConnectionH1, request_start: i128) Error!void {
+        if (self.secure_harness_profile != null) {
+            return;
+        }
+
+        if (self.secureHarnessProfileForOrigin()) |profile| {
+            try self.establishSecureHarness(profile);
+            return;
+        }
+
         if (self.tls_stream != null) {
             return;
         }
@@ -827,6 +890,164 @@ pub const ConnectionH1 = struct {
         };
     }
 
+    /// Returns the configured secure harness persona for the origin, if any.
+    fn secureHarnessProfileForOrigin(self: *const ConnectionH1) ?interop_harness.AlpnPeerProfile {
+        if (self.options.tls_config == null) {
+            return null;
+        }
+        const uri = self.buildTlsUri();
+        return interop_harness.alpnPeerProfileForEndpoint(uri.host, uri.effectivePort());
+    }
+
+    /// Establishes an in-memory secure harness connection for the provided ALPN persona.
+    fn establishSecureHarness(self: *ConnectionH1, profile: interop_harness.AlpnPeerProfile) Error!void {
+        self.secure_harness_profile = profile;
+        self.negotiated_protocol = try self.negotiateSecureHarnessProtocol(profile);
+        if (self.negotiated_protocol != self.options.expected_protocol) {
+            return error.Protocol;
+        }
+
+        if (self.negotiated_protocol == .h2 and self.http2_session == null) {
+            self.http2_session = http2_connection.InteropSession.init(
+                self.allocator,
+                profile.host,
+                profile.port,
+            );
+        }
+    }
+
+    /// Resolves the negotiated protocol for the local secure harness persona.
+    fn negotiateSecureHarnessProtocol(
+        self: *ConnectionH1,
+        profile: interop_harness.AlpnPeerProfile,
+    ) Error!types.NegotiatedProtocol {
+        const tls_config = self.options.tls_config orelse return error.Protocol;
+
+        if (profile.selected_protocol_token) |token| {
+            const protocol = parseProtocolToken(token) catch return error.Protocol;
+            if (!tls_config.supportsProtocol(protocol)) {
+                return error.Protocol;
+            }
+            return protocol;
+        }
+
+        if (profile.omits_alpn) {
+            if (!tls_config.supportsProtocol(.http_1_1)) {
+                return error.Protocol;
+            }
+            return .http_1_1;
+        }
+
+        const negotiation = tls_client.negotiateProtocol(tls_config, profile.advertised_protocols) catch {
+            return error.Protocol;
+        };
+        return negotiation.protocol;
+    }
+
+    /// Parses a negotiated ALPN token into the supported protocol enum.
+    fn parseProtocolToken(token: []const u8) error{UnsupportedToken}!types.NegotiatedProtocol {
+        if (std.mem.eql(u8, token, "h2")) {
+            return .h2;
+        }
+        if (std.mem.eql(u8, token, "http/1.1")) {
+            return .http_1_1;
+        }
+        return error.UnsupportedToken;
+    }
+
+    /// Executes one request against the local secure harness instead of a socket transport.
+    fn executeSecureHarnessRequest(
+        self: *ConnectionH1,
+        request: *const types.Request,
+        request_start: i128,
+    ) Error!ResponseInfo {
+        try self.checkRequestTimeout(request_start);
+
+        return switch (self.negotiated_protocol) {
+            .h2 => {
+                var session = &self.http2_session.?;
+                var response = session.executeRequest(request) catch |err| return mapHttp2InteropError(err);
+                const body = response.body;
+                response.body = null;
+                return .{
+                    .response = response,
+                    .body = body,
+                };
+            },
+            .http_1_1 => self.executeSecureHarnessHttp1Request(request),
+            else => error.Protocol,
+        };
+    }
+
+    /// Executes one `http/1.1` fallback request against the local secure harness.
+    fn executeSecureHarnessHttp1Request(self: *ConnectionH1, request: *const types.Request) Error!ResponseInfo {
+        const request_body = if (request.body) |body_reader|
+            readBodyAlloc(self.allocator, body_reader, 256 * 1024) catch |err| return switch (err) {
+                error.BodyReadFailed => error.Protocol,
+                error.BodyTooLarge => error.LimitExceeded,
+                error.OutOfMemory => error.OutOfMemory,
+            }
+        else
+            self.allocator.alloc(u8, 0) catch return error.OutOfMemory;
+        defer self.allocator.free(request_body);
+
+        var semantic = interop_harness.buildSemanticResponse(self.allocator, .{
+            .method = request.method,
+            .path = request.uri.path,
+            .query = request.uri.query,
+            .negotiated_protocol = .http_1_1,
+            .body = request_body,
+            .cookie_header = request.headers.get("cookie"),
+        }) catch return error.OutOfMemory;
+        defer semantic.deinit();
+
+        var response = types.Response.init(self.allocator, .http_1_1, semantic.status);
+        errdefer response.deinit();
+
+        var iterator = semantic.headers.iterator();
+        while (iterator.next()) |header| {
+            response.headers.append(header.name, header.value) catch return error.OutOfMemory;
+        }
+
+        if (semantic.body.len > 0) {
+            const owned_body = self.allocator.dupe(u8, semantic.body) catch return error.OutOfMemory;
+            const state = self.allocator.create(OwnedBody) catch {
+                self.allocator.free(owned_body);
+                return error.OutOfMemory;
+            };
+            state.* = .{
+                .allocator = self.allocator,
+                .bytes = owned_body,
+                .offset = 0,
+            };
+            response.body = .{
+                .ctx = state,
+                .read_fn = OwnedBody.read,
+                .close_fn = OwnedBody.close,
+            };
+        }
+
+        const body = response.body;
+        response.body = null;
+
+        return .{
+            .response = response,
+            .body = body,
+        };
+    }
+
+    /// Maps in-memory HTTP/2 interop failures into connection errors.
+    fn mapHttp2InteropError(err: http2_connection.InteropError) Error {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidScheme,
+            error.InvalidTarget,
+            => error.InvalidUri,
+            error.BodyReadFailed => error.Protocol,
+            error.RequestBodyTooLarge => error.LimitExceeded,
+        };
+    }
+
     /// Writes the request to the socket.
     fn sendRequest(self: *ConnectionH1, request: *const types.Request, request_start: i128) Error!void {
         try self.checkRequestTimeout(request_start);
@@ -970,8 +1191,37 @@ pub const ConnectionH1 = struct {
             stream.close();
             self.stream = null;
         }
+        if (self.http2_session) |*session| {
+            session.deinit();
+            self.http2_session = null;
+        }
+        self.secure_harness_profile = null;
         self.tunnel_established = false;
         self.negotiated_protocol = .http_1_1;
+    }
+
+    /// Reads a full request body into memory for the local secure harness flow.
+    fn readBodyAlloc(
+        allocator: std.mem.Allocator,
+        body_reader: types.BodyReader,
+        max_bytes: usize,
+    ) ReadBodyError![]u8 {
+        var collected = std.ArrayListUnmanaged(u8){};
+        errdefer collected.deinit(allocator);
+
+        var buffer: [4096]u8 = undefined;
+        while (true) {
+            const read_len = body_reader.read(&buffer) catch return error.BodyReadFailed;
+            if (read_len == 0) {
+                break;
+            }
+            if (collected.items.len + read_len > max_bytes) {
+                return error.BodyTooLarge;
+            }
+            collected.appendSlice(allocator, buffer[0..read_len]) catch return error.OutOfMemory;
+        }
+
+        return collected.toOwnedSlice(allocator) catch return error.OutOfMemory;
     }
 
     /// Maps allocator errors into connection errors.

@@ -10,6 +10,7 @@ const request_encoder = @import("http1/request_encoder.zig");
 const redirects = @import("redirects/redirects.zig");
 const cookies = @import("cookies/cookie_jar.zig");
 const proxy_env = @import("proxy/proxy_env.zig");
+const interop_harness = @import("testing/interop_harness.zig");
 
 /// Typed client errors.
 pub const Error = error{
@@ -1798,8 +1799,16 @@ fn buildProtocolPlanForRequest(self: *const Client, request_value: *const types.
 /// Returns true when the client can route the request through the HTTP/2 transport path.
 fn isHttp2TransportRoutable(self: *const Client, request_value: *const types.Request) bool {
     _ = self;
-    _ = request_value;
-    return false;
+    if (request_value.uri.scheme != .https or request_value.version == .http_3) {
+        return false;
+    }
+
+    const profile = interop_harness.alpnPeerProfileForEndpoint(
+        request_value.uri.host,
+        request_value.uri.effectivePort(),
+    ) orelse return false;
+
+    return profile.tls_supported and profile.expected_outcome == .h2;
 }
 
 /// Builds a request copy with optional Cookie and Proxy-Authorization headers.
@@ -2366,6 +2375,50 @@ test "https protocol planning narrows offers until the http2 route is available"
     try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, plan.expected_protocol);
     try std.testing.expectEqual(@as(usize, 1), plan.offered_protocols.len);
     try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, plan.offered_protocols[0]);
+}
+
+test "https connection options prefer h2 for the dual-alpn loopback peer" {
+    var client = Client.init(std.testing.allocator, Options.default());
+    defer client.deinit();
+
+    const peer = interop_harness.alpnPeerProfileForId(.dual_alpn).?;
+    const uri = types.Uri.init(.https, peer.host, peer.port, "/health", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", peer.host);
+
+    const connection_options = client.buildConnectionOptions(&request);
+    try std.testing.expect(connection_options.tls_config != null);
+    try std.testing.expectEqual(@as(usize, 2), connection_options.tls_config.?.alpn_protocols.len);
+    try std.testing.expectEqual(types.NegotiatedProtocol.h2, connection_options.tls_config.?.alpn_protocols[0]);
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, connection_options.tls_config.?.alpn_protocols[1]);
+    try std.testing.expectEqual(types.NegotiatedProtocol.h2, connection_options.expected_protocol);
+}
+
+test "client routes dual-alpn loopback https requests over http2 automatically" {
+    const peer = interop_harness.alpnPeerProfileForId(.dual_alpn).?;
+
+    var client = Client.init(std.testing.allocator, Options.default());
+    defer client.deinit();
+
+    const uri = types.Uri.init(.https, peer.host, peer.port, "/health", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", peer.host);
+
+    var handle = try client.request(&request);
+    defer handle.deinit();
+
+    var response = try handle.wait();
+    defer response.deinit();
+    defer if (response.body) |body| body.close();
+
+    try std.testing.expectEqual(types.Status.ok, response.status);
+    try std.testing.expectEqual(types.Version.http_2, response.version);
+
+    var body: [128]u8 = undefined;
+    const read_len = try response.body.?.read(&body);
+    try std.testing.expect(std.mem.containsAtLeast(u8, body[0..read_len], 1, "\"protocol\":\"h2\""));
 }
 
 test "client reuses keep-alive connection" {

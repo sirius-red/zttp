@@ -88,3 +88,15 @@ test "health route remains available for tls and alpn coverage" {
     try std.testing.expect(health.tls_supported);
     try std.testing.expect(health.supportsProtocol(.h2));
 }
+
+test "dual-alpn peer profile prefers h2 during tls negotiation" {
+    const peer = interop_harness.alpnPeerProfileForId(.dual_alpn).?;
+
+    const result = try @import("client.zig").negotiateProtocol(
+        types.TlsConfig.default(),
+        peer.advertised_protocols,
+    );
+
+    try std.testing.expectEqual(types.NegotiatedProtocol.h2, result.protocol);
+    try std.testing.expect(result.verified);
+}

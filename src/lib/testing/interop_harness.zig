@@ -177,6 +177,16 @@ pub const AlpnPeerProfile = struct {
     tls_supported: bool,
 };
 
+/// Expected local diagnostic emitted for a successful ALPN persona.
+pub const AlpnSuccessDiagnostic = struct {
+    /// Peer persona that produced the diagnostic.
+    peer_profile: AlpnPeerProfileId,
+    /// Negotiated protocol surfaced by the client path.
+    negotiated_protocol: types.NegotiatedProtocol,
+    /// HTTP version label expected on the local verification surface.
+    response_version: types.Version,
+};
+
 /// UDP-focused HTTP/3 scenario metadata.
 pub const Http3DatagramScenario = struct {
     /// Route served by the datagram scenario.
@@ -509,6 +519,37 @@ pub fn alpnPeerProfileForId(id: AlpnPeerProfileId) ?AlpnPeerProfile {
     return null;
 }
 
+/// Returns the ALPN peer profile for the provided loopback endpoint, or null if absent.
+pub fn alpnPeerProfileForEndpoint(host: []const u8, port: types.Port) ?AlpnPeerProfile {
+    for (default_alpn_peer_profiles) |profile| {
+        if (profile.port.toInt() != port.toInt()) {
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(profile.host, host)) {
+            return profile;
+        }
+    }
+    return null;
+}
+
+/// Returns the expected successful protocol diagnostic for a peer profile, if any.
+pub fn successDiagnosticForPeerProfile(id: AlpnPeerProfileId) ?AlpnSuccessDiagnostic {
+    const profile = alpnPeerProfileForId(id) orelse return null;
+    return switch (profile.expected_outcome) {
+        .h2 => .{
+            .peer_profile = profile.id,
+            .negotiated_protocol = .h2,
+            .response_version = .http_2,
+        },
+        .http_1_1 => .{
+            .peer_profile = profile.id,
+            .negotiated_protocol = .http_1_1,
+            .response_version = .http_1_1,
+        },
+        .reject_before_http => null,
+    };
+}
+
 /// Returns the route definition for the provided identifier, or null if absent.
 pub fn scenarioForRoute(route: RouteId) ?Scenario {
     for (default_scenarios) |scenario| {
@@ -777,6 +818,29 @@ test "ALPN peer profiles stay aligned with local contract metadata" {
     try std.testing.expectEqual(AlpnExpectedOutcome.reject_before_http, unsupported.expected_outcome);
     try std.testing.expectEqual(AlpnFailurePhase.protocol_routing_before_http, unsupported.expected_failure_phase);
     try std.testing.expectEqualStrings("spdy/3", unsupported.selected_protocol_token.?);
+}
+
+test "ALPN diagnostics expose successful negotiated protocol expectations" {
+    const dual_alpn = successDiagnosticForPeerProfile(.dual_alpn).?;
+    try std.testing.expectEqual(AlpnPeerProfileId.dual_alpn, dual_alpn.peer_profile);
+    try std.testing.expectEqual(types.NegotiatedProtocol.h2, dual_alpn.negotiated_protocol);
+    try std.testing.expectEqual(types.Version.http_2, dual_alpn.response_version);
+
+    const http1_only = successDiagnosticForPeerProfile(.http1_only).?;
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, http1_only.negotiated_protocol);
+    try std.testing.expectEqual(types.Version.http_1_1, http1_only.response_version);
+
+    try std.testing.expect(successDiagnosticForPeerProfile(.unsupported_protocol) == null);
+}
+
+test "ALPN peer profiles resolve by loopback endpoint" {
+    const dual_alpn = alpnPeerProfileForEndpoint("127.0.0.1", types.Port.init(18443)).?;
+    try std.testing.expectEqual(AlpnPeerProfileId.dual_alpn, dual_alpn.id);
+
+    const http1_only = alpnPeerProfileForEndpoint("127.0.0.1", types.Port.init(19443)).?;
+    try std.testing.expectEqual(AlpnPeerProfileId.http1_only, http1_only.id);
+
+    try std.testing.expect(alpnPeerProfileForEndpoint("127.0.0.1", types.Port.init(9999)) == null);
 }
 
 test "route matcher resolves contract endpoints" {

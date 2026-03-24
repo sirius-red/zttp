@@ -30,6 +30,27 @@ fn initLoopbackConnection(port: u16) !connection_h1.ConnectionH1 {
     );
 }
 
+/// Creates a secure loopback connection that targets the dual-ALPN harness persona.
+fn initSecureHarnessConnection() connection_h1.ConnectionH1 {
+    const peer = @import("../testing/interop_harness.zig").alpnPeerProfileForId(.dual_alpn).?;
+    var options = connection_h1.Options.default();
+    options.tls_config = types.TlsConfig.default();
+    options.expected_protocol = .h2;
+
+    return connection_h1.ConnectionH1.init(
+        std.testing.allocator,
+        .{
+            .scheme = .https,
+            .host = peer.host,
+            .port = peer.port,
+            .target_mode = .origin_form,
+            .tunnel = null,
+            .proxy_authorization = null,
+        },
+        options,
+    );
+}
+
 test "connection completes the loopback health response" {
     const scenarios = [_]test_server.Scenario{
         .{
@@ -113,4 +134,30 @@ test "connection translates a loopback socket close into transport" {
     try conn.submit(&request, response_future.completion());
 
     try std.testing.expectError(error.Transport, response_future.wait());
+}
+
+test "connection preserves negotiated h2 protocol for the secure harness session" {
+    const peer = @import("../testing/interop_harness.zig").alpnPeerProfileForId(.dual_alpn).?;
+
+    var conn = initSecureHarnessConnection();
+    defer conn.deinit();
+    try conn.start();
+
+    var request = types.Request.init(
+        std.testing.allocator,
+        .get,
+        types.Uri.init(.https, peer.host, peer.port, "/health", null, null),
+    );
+    defer request.deinit();
+    try request.headers.append("Host", peer.host);
+
+    var response_future = connection_h1.ResponseFuture.init();
+    try conn.submit(&request, response_future.completion());
+
+    var response = try response_future.wait();
+    defer response.deinit();
+    defer if (response.body) |body| body.close();
+
+    try std.testing.expectEqual(types.Version.http_2, response.version);
+    try std.testing.expectEqual(types.NegotiatedProtocol.h2, conn.negotiatedProtocol());
 }
