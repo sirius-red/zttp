@@ -125,6 +125,58 @@ pub const SemanticResponse = struct {
     }
 };
 
+/// Stable identifier for a local ALPN peer profile used by feature tests.
+pub const AlpnPeerProfileId = enum {
+    /// Peer advertises both `h2` and `http/1.1` and should select `h2`.
+    dual_alpn,
+    /// Peer advertises only `http/1.1`.
+    http1_only,
+    /// Peer omits ALPN from the final handshake outcome.
+    omits_alpn,
+    /// Peer returns a selected ALPN token outside the supported set.
+    unsupported_protocol,
+};
+
+/// Expected client-visible result for an ALPN peer profile.
+pub const AlpnExpectedOutcome = enum {
+    /// Successful HTTP/2 routing.
+    h2,
+    /// Successful HTTP/1.1 routing.
+    http_1_1,
+    /// Reject the connection before HTTP handling begins.
+    reject_before_http,
+};
+
+/// Failure phase expected from a local ALPN peer profile.
+pub const AlpnFailurePhase = enum {
+    /// No failure is expected.
+    none,
+    /// Failure occurs after ALPN but before HTTP request handling.
+    protocol_routing_before_http,
+};
+
+/// Declarative ALPN persona used by local loopback verification.
+pub const AlpnPeerProfile = struct {
+    /// Stable persona identifier.
+    id: AlpnPeerProfileId,
+    /// Loopback host used by the persona.
+    host: []const u8,
+    /// Loopback port used by the persona.
+    port: types.Port,
+    /// ALPN protocols advertised by the peer during negotiation.
+    advertised_protocols: []const types.NegotiatedProtocol,
+    /// Whether the peer omits ALPN from the final handshake result.
+    omits_alpn: bool,
+    /// Raw ALPN token selected by the peer, when one is returned.
+    selected_protocol_token: ?[]const u8,
+    /// Expected client-visible outcome.
+    expected_outcome: AlpnExpectedOutcome,
+    /// Expected failure phase for negative personas.
+    expected_failure_phase: AlpnFailurePhase,
+    /// Whether the persona is valid for TLS loopback verification.
+    tls_supported: bool,
+};
+
 /// UDP-focused HTTP/3 scenario metadata.
 pub const Http3DatagramScenario = struct {
     /// Route served by the datagram scenario.
@@ -200,6 +252,9 @@ pub const ReadinessScenario = struct {
 };
 
 const route_protocols = [_]types.NegotiatedProtocol{ .http_1_1, .h2, .h3 };
+const alpn_dual_protocols = [_]types.NegotiatedProtocol{ .h2, .http_1_1 };
+const alpn_http1_only_protocols = [_]types.NegotiatedProtocol{.http_1_1};
+const alpn_no_protocols = [_]types.NegotiatedProtocol{};
 const windows_only_platforms = [_]ReadinessPlatform{.windows};
 const windows_loopback_server_command = [_][]const u8{
     "zig",
@@ -219,6 +274,53 @@ const windows_loopback_request_command = [_][]const u8{
     "--",
     "request",
     "http://127.0.0.1:18080/health",
+};
+
+const default_alpn_peer_profiles = [_]AlpnPeerProfile{
+    .{
+        .id = .dual_alpn,
+        .host = "127.0.0.1",
+        .port = types.Port.init(18443),
+        .advertised_protocols = &alpn_dual_protocols,
+        .omits_alpn = false,
+        .selected_protocol_token = "h2",
+        .expected_outcome = .h2,
+        .expected_failure_phase = .none,
+        .tls_supported = true,
+    },
+    .{
+        .id = .http1_only,
+        .host = "127.0.0.1",
+        .port = types.Port.init(19443),
+        .advertised_protocols = &alpn_http1_only_protocols,
+        .omits_alpn = false,
+        .selected_protocol_token = "http/1.1",
+        .expected_outcome = .http_1_1,
+        .expected_failure_phase = .none,
+        .tls_supported = true,
+    },
+    .{
+        .id = .omits_alpn,
+        .host = "127.0.0.1",
+        .port = types.Port.init(20443),
+        .advertised_protocols = &alpn_no_protocols,
+        .omits_alpn = true,
+        .selected_protocol_token = null,
+        .expected_outcome = .http_1_1,
+        .expected_failure_phase = .none,
+        .tls_supported = true,
+    },
+    .{
+        .id = .unsupported_protocol,
+        .host = "127.0.0.1",
+        .port = types.Port.init(21443),
+        .advertised_protocols = &alpn_dual_protocols,
+        .omits_alpn = false,
+        .selected_protocol_token = "spdy/3",
+        .expected_outcome = .reject_before_http,
+        .expected_failure_phase = .protocol_routing_before_http,
+        .tls_supported = true,
+    },
 };
 
 const default_scenarios = [_]Scenario{
@@ -390,6 +492,21 @@ const default_http3_datagram_scenarios = [_]Http3DatagramScenario{
 /// Returns the default interop route catalog.
 pub fn defaultScenarios() []const Scenario {
     return &default_scenarios;
+}
+
+/// Returns the default ALPN peer profile catalog for local loopback verification.
+pub fn defaultAlpnPeerProfiles() []const AlpnPeerProfile {
+    return &default_alpn_peer_profiles;
+}
+
+/// Returns the ALPN peer profile for the provided identifier, or null if absent.
+pub fn alpnPeerProfileForId(id: AlpnPeerProfileId) ?AlpnPeerProfile {
+    for (default_alpn_peer_profiles) |profile| {
+        if (profile.id == id) {
+            return profile;
+        }
+    }
+    return null;
 }
 
 /// Returns the route definition for the provided identifier, or null if absent.
@@ -631,6 +748,35 @@ test "route catalog includes contract endpoints" {
     const redirect = scenarioForRoute(.redirect_count).?;
     try std.testing.expectEqual(types.Status.found, redirect.success_status);
     try std.testing.expectEqual(ResponseMode.redirect, redirect.response_mode);
+}
+
+test "ALPN peer profiles stay aligned with local contract metadata" {
+    const dual_alpn = alpnPeerProfileForId(.dual_alpn).?;
+    try std.testing.expectEqualStrings("127.0.0.1", dual_alpn.host);
+    try std.testing.expectEqual(@as(u16, 18443), dual_alpn.port.toInt());
+    try std.testing.expectEqual(@as(usize, 2), dual_alpn.advertised_protocols.len);
+    try std.testing.expectEqual(types.NegotiatedProtocol.h2, dual_alpn.advertised_protocols[0]);
+    try std.testing.expectEqual(AlpnExpectedOutcome.h2, dual_alpn.expected_outcome);
+    try std.testing.expectEqualStrings("h2", dual_alpn.selected_protocol_token.?);
+
+    const http1_only = alpnPeerProfileForId(.http1_only).?;
+    try std.testing.expectEqual(@as(u16, 19443), http1_only.port.toInt());
+    try std.testing.expectEqual(@as(usize, 1), http1_only.advertised_protocols.len);
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, http1_only.advertised_protocols[0]);
+    try std.testing.expectEqual(AlpnExpectedOutcome.http_1_1, http1_only.expected_outcome);
+    try std.testing.expectEqualStrings("http/1.1", http1_only.selected_protocol_token.?);
+
+    const omits_alpn = alpnPeerProfileForId(.omits_alpn).?;
+    try std.testing.expect(omits_alpn.omits_alpn);
+    try std.testing.expectEqual(@as(usize, 0), omits_alpn.advertised_protocols.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), omits_alpn.selected_protocol_token);
+    try std.testing.expectEqual(AlpnExpectedOutcome.http_1_1, omits_alpn.expected_outcome);
+
+    const unsupported = alpnPeerProfileForId(.unsupported_protocol).?;
+    try std.testing.expectEqual(@as(u16, 21443), unsupported.port.toInt());
+    try std.testing.expectEqual(AlpnExpectedOutcome.reject_before_http, unsupported.expected_outcome);
+    try std.testing.expectEqual(AlpnFailurePhase.protocol_routing_before_http, unsupported.expected_failure_phase);
+    try std.testing.expectEqualStrings("spdy/3", unsupported.selected_protocol_token.?);
 }
 
 test "route matcher resolves contract endpoints" {
