@@ -80,6 +80,23 @@ pub fn main() !void {
 }
 ```
 
+## HTTPS ALPN Auto-Selection
+
+For HTTPS requests, `zttp` plans ALPN automatically instead of asking callers to
+pick `h2` or `http/1.1` per request.
+
+- `h2` is advertised only when the client can actually route the request onto
+  the current HTTP/2 path.
+- Peers that support only `http/1.1`, or omit ALPN entirely, stay on the
+  HTTP/1.1 compatibility path.
+- Peers that negotiate an unsupported protocol fail before HTTP request bytes
+  are written; the client surfaces this as a negotiation error instead of a
+  silent downgrade.
+- Verification for this feature is local-first: `zig build test` covers the
+  dual-ALPN, `http1_only`, omitted-ALPN, and unsupported-protocol personas in
+  `src/lib/testing/interop_harness.zig`, and `zig build smoke` remains an
+  optional CLI-oriented follow-up.
+
 ## Roadmap
 
 ZTTP is progressing in phases. The short version is: the HTTP/1.1 client path is the most mature part of the project today, server support exists in basic form, and HTTP/2 and HTTP/3 are still moving toward full end-to-end support.
@@ -94,7 +111,7 @@ Current progress:
 
 What is next:
 
-- [ ] Finish the remaining TLS and ALPN behavior needed for the client path to be considered complete end to end.
+- [ ] Continue hardening TLS and ALPN behavior around broader client and server interoperability edges.
 - [ ] Deliver full public HTTP/2 client support, not just low-level protocol pieces.
 - [ ] Expand server support with real TLS listener support and minimal end-to-end HTTP/2 serving.
 - [ ] Move HTTP/3 beyond local harness flows into real networked runtime support where practical.
