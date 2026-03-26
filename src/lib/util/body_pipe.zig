@@ -96,6 +96,46 @@ pub const BodyPipe = struct {
         }
     }
 
+    /// Writes as many bytes as fit without blocking and returns the count written.
+    pub fn writeSome(self: *BodyPipe, bytes: []const u8) WriteError!usize {
+        if (bytes.len == 0) {
+            return 0;
+        }
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.reader_closed) {
+            return error.ReaderClosed;
+        }
+
+        const available = self.buffer.len - self.len;
+        if (available == 0) {
+            return 0;
+        }
+
+        const to_write = @min(available, bytes.len);
+        const tail = (self.head + self.len) % self.buffer.len;
+        const first = @min(to_write, self.buffer.len - tail);
+
+        std.mem.copyForwards(u8, self.buffer[tail .. tail + first], bytes[0..first]);
+        if (first < to_write) {
+            const second = to_write - first;
+            std.mem.copyForwards(u8, self.buffer[0..second], bytes[first .. first + second]);
+        }
+
+        self.len += to_write;
+        self.cond.signal();
+        return to_write;
+    }
+
+    /// Returns the number of bytes that can be queued immediately without blocking.
+    pub fn availableCapacity(self: *BodyPipe) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.buffer.len - self.len;
+    }
+
     /// Closes the writer side, optionally providing an error for the reader.
     pub fn closeWriter(self: *BodyPipe, err: ?anyerror) void {
         var release = false;

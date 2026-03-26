@@ -10,7 +10,7 @@ const socket_io = @import("../util/socket_io.zig");
 const request_encoder = @import("request_encoder.zig");
 const response_parser = @import("response_parser.zig");
 const tls_client = @import("../tls/client.zig");
-const http2_connection = @import("../http2/connection.zig");
+const connection_h2 = @import("../http2/connection_h2.zig");
 const interop_harness = @import("../testing/interop_harness.zig");
 
 /// Error set returned by connection operations.
@@ -90,10 +90,17 @@ pub const Options = struct {
     tls_config: ?types.TlsConfig,
     /// Expected application protocol for this connection.
     expected_protocol: types.NegotiatedProtocol,
+    /// Maximum active streams permitted on the delegated HTTP/2 runtime.
+    h2_max_active_streams: usize,
+    /// Maximum buffered bytes retained for one HTTP/2 stream.
+    h2_max_stream_buffer_bytes: usize,
+    /// Maximum buffered bytes retained across the delegated HTTP/2 runtime.
+    h2_max_connection_buffer_bytes: usize,
 
     /// Returns default connection options.
     pub fn default() Options {
         const limits = response_parser.Limits.default();
+        const h2_defaults = connection_h2.Options.default();
         return .{
             .connect_timeout_ns = null,
             .write_timeout_ns = null,
@@ -108,6 +115,9 @@ pub const Options = struct {
             .body_buffer_bytes = 64 * 1024,
             .tls_config = null,
             .expected_protocol = .http_1_1,
+            .h2_max_active_streams = h2_defaults.max_active_streams.toInt(),
+            .h2_max_stream_buffer_bytes = h2_defaults.max_stream_buffer_bytes.toInt(),
+            .h2_max_connection_buffer_bytes = h2_defaults.max_connection_buffer_bytes.toInt(),
         };
     }
 };
@@ -346,8 +356,8 @@ pub const ConnectionH1 = struct {
     negotiated_protocol: types.NegotiatedProtocol,
     /// Local secure harness persona, when the connection is simulated in memory.
     secure_harness_profile: ?interop_harness.AlpnPeerProfile,
-    /// Reusable in-memory HTTP/2 session for negotiated `h2` loopback traffic.
-    http2_session: ?http2_connection.InteropSession,
+    /// Dedicated HTTP/2 runtime for negotiated `h2` loopback traffic.
+    http2_runtime: ?*connection_h2.ConnectionH2,
 
     /// Initializes a connection without starting the background thread.
     pub fn init(allocator: std.mem.Allocator, origin: Origin, options: Options) ConnectionH1 {
@@ -363,7 +373,7 @@ pub const ConnectionH1 = struct {
             .tunnel_established = false,
             .negotiated_protocol = .http_1_1,
             .secure_harness_profile = null,
-            .http2_session = null,
+            .http2_runtime = null,
         };
     }
 
@@ -423,6 +433,17 @@ pub const ConnectionH1 = struct {
         while (true) {
             const had_stream = self.stream != null;
             const response_info = self.execute(cmd.request, request_start) catch |err| {
+                if (self.negotiated_protocol == .h2 and self.secure_harness_profile != null) {
+                    _ = completion.finish(err);
+                    switch (err) {
+                        error.Transport,
+                        error.NegotiationFailed,
+                        error.Canceled,
+                        => self.closeStream(),
+                        else => {},
+                    }
+                    return;
+                }
                 if (attempts == 0 and had_stream and isRetryableRequest(cmd.request) and err == error.Transport) {
                     attempts += 1;
                     self.closeStream();
@@ -435,6 +456,23 @@ pub const ConnectionH1 = struct {
 
             var response = response_info.response;
             const keep_alive = shouldKeepAlive(cmd.request, response);
+            if (response.body != null) {
+                if (!completion.finish(response)) {
+                    if (response.body) |body_reader| {
+                        body_reader.close();
+                        response.body = null;
+                    }
+                    response.deinit();
+                    self.closeStream();
+                    return;
+                }
+
+                if (!keep_alive) {
+                    self.closeStream();
+                }
+                return;
+            }
+
             if (response_info.body) |body_reader| {
                 const pipe = body_pipe.BodyPipe.init(self.allocator, self.options.body_buffer_bytes) catch |err| {
                     response.deinit();
@@ -503,6 +541,9 @@ pub const ConnectionH1 = struct {
 
     /// Returns true when the connection should be kept alive after the response.
     fn shouldKeepAlive(request: *const types.Request, response: types.Response) bool {
+        if (response.version == .http_2) {
+            return true;
+        }
         if (response.version == .http_1_0) {
             return false;
         }
@@ -909,12 +950,23 @@ pub const ConnectionH1 = struct {
             return error.NegotiationFailed;
         }
 
-        if (self.negotiated_protocol == .h2 and self.http2_session == null) {
-            self.http2_session = http2_connection.InteropSession.init(
+        if (self.negotiated_protocol == .h2 and self.http2_runtime == null) {
+            const runtime = self.allocator.create(connection_h2.ConnectionH2) catch {
+                return error.OutOfMemory;
+            };
+            errdefer self.allocator.destroy(runtime);
+
+            runtime.* = connection_h2.ConnectionH2.init(
                 self.allocator,
                 profile.host,
                 profile.port,
+                buildH2RuntimeOptions(self.options),
             );
+            runtime.start() catch {
+                runtime.deinit();
+                return error.OutOfMemory;
+            };
+            self.http2_runtime = runtime;
         }
     }
 
@@ -967,13 +1019,16 @@ pub const ConnectionH1 = struct {
 
         return switch (self.negotiated_protocol) {
             .h2 => {
-                var session = &self.http2_session.?;
-                var response = session.executeRequest(request) catch |err| return mapHttp2InteropError(err);
-                const body = response.body;
-                response.body = null;
+                var runtime_future = connection_h2.ResponseFuture.init();
+                self.http2_runtime.?.submit(request, runtime_future.completion()) catch |err| return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.Closed,
+                    error.NotStarted,
+                    => error.Transport,
+                };
                 return .{
-                    .response = response,
-                    .body = body,
+                    .response = runtime_future.wait() catch |err| return mapHttp2RuntimeError(err),
+                    .body = null,
                 };
             },
             .http_1_1 => self.executeSecureHarnessHttp1Request(request),
@@ -1038,15 +1093,18 @@ pub const ConnectionH1 = struct {
         };
     }
 
-    /// Maps in-memory HTTP/2 interop failures into connection errors.
-    fn mapHttp2InteropError(err: http2_connection.InteropError) Error {
+    /// Maps dedicated HTTP/2 runtime failures into connection errors.
+    fn mapHttp2RuntimeError(err: connection_h2.ResponseFuture.WaitError) Error {
         return switch (err) {
+            error.Timeout => error.Timeout,
             error.OutOfMemory => error.OutOfMemory,
-            error.InvalidScheme,
-            error.InvalidTarget,
-            => error.InvalidUri,
-            error.BodyReadFailed => error.Protocol,
-            error.RequestBodyTooLarge => error.LimitExceeded,
+            error.InvalidUri => error.InvalidUri,
+            error.Transport => error.Transport,
+            error.ProxyConnectFailed => error.ProxyConnectFailed,
+            error.NegotiationFailed => error.NegotiationFailed,
+            error.Protocol => error.Protocol,
+            error.LimitExceeded => error.LimitExceeded,
+            error.Canceled => error.Canceled,
         };
     }
 
@@ -1193,13 +1251,23 @@ pub const ConnectionH1 = struct {
             stream.close();
             self.stream = null;
         }
-        if (self.http2_session) |*session| {
-            session.deinit();
-            self.http2_session = null;
+        if (self.http2_runtime) |runtime| {
+            runtime.deinit();
+            self.allocator.destroy(runtime);
+            self.http2_runtime = null;
         }
         self.secure_harness_profile = null;
         self.tunnel_established = false;
         self.negotiated_protocol = .http_1_1;
+    }
+
+    /// Builds runtime options for the delegated HTTP/2 connection thread.
+    fn buildH2RuntimeOptions(options: Options) connection_h2.Options {
+        return .{
+            .max_active_streams = connection_h2.ActiveStreamCount.init(options.h2_max_active_streams),
+            .max_stream_buffer_bytes = types.ByteSize.fromBytes(options.h2_max_stream_buffer_bytes),
+            .max_connection_buffer_bytes = types.ByteSize.fromBytes(options.h2_max_connection_buffer_bytes),
+        };
     }
 
     /// Reads a full request body into memory for the local secure harness flow.

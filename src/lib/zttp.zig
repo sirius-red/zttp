@@ -79,7 +79,10 @@ test {
     _ = @import("http2/frame.zig");
     _ = @import("http2/hpack.zig");
     _ = @import("http2/connection.zig");
+    _ = @import("http2/connection_h2.zig");
+    _ = @import("http2/connection_h2_test.zig");
     _ = @import("http2/connection_test.zig");
+    _ = @import("http2/test_peer.zig");
     _ = @import("server/server_test.zig");
     _ = @import("cookies/cookie_jar.zig");
     _ = @import("redirects/redirects.zig");

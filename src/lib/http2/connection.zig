@@ -1,25 +1,67 @@
-//! HTTP/2 connection and stream state scaffolding.
+//! Typed HTTP/2 connection and stream state bookkeeping.
 
 const std = @import("std");
 const frame = @import("frame.zig");
-const types = @import("../types.zig");
-const interop_harness = @import("../testing/interop_harness.zig");
+
+/// Error set returned while opening a new local stream.
+pub const OpenStreamError = std.mem.Allocator.Error || error{
+    /// The connection is draining or already closed.
+    Draining,
+    /// The peer-advertised concurrency limit has been reached.
+    StreamLimit,
+};
+
+/// Error set returned when a stream lookup fails.
+pub const StreamLookupError = error{
+    /// The requested stream identifier is not tracked by the connection.
+    StreamNotFound,
+};
+
+/// Scope of a currently blocked stream.
+pub const BlockedReason = enum {
+    /// The stream is not blocked.
+    none,
+    /// The stream hit its stream-local buffering limit.
+    stream_buffer,
+    /// The stream hit the shared connection buffering limit.
+    connection_buffer,
+    /// The stream can no longer admit new work because the connection is draining.
+    draining,
+};
 
 /// Stream state for one HTTP/2 stream.
 pub const StreamState = enum {
-    idle,
+    /// The stream is queued before headers are committed.
+    queued,
+    /// The stream is transitioning into the open state.
+    opening,
+    /// The stream is actively exchanging request and response bytes.
     open,
+    /// The local request body is complete but the response is still active.
     half_closed_local,
+    /// The remote response body is complete but local cleanup remains.
     half_closed_remote,
+    /// The stream is blocked on a stream-local limit.
+    blocked_stream,
+    /// The stream is blocked on a connection-wide limit.
+    blocked_connection,
+    /// The peer reset the stream.
+    reset,
+    /// The stream is fully closed.
     closed,
 };
 
 /// Connection state for one HTTP/2 session.
 pub const ConnectionState = enum {
+    /// No preface has been sent yet.
     idle,
+    /// The client preface has been sent.
     preface,
+    /// The connection can admit and service streams.
     active,
+    /// The connection is draining and must reject new admissions.
     draining,
+    /// The connection is permanently closed.
     closed,
 };
 
@@ -37,15 +79,36 @@ pub const Settings = struct {
 pub const Stream = struct {
     /// Stream identifier.
     id: u31,
-    /// Current state.
+    /// Current stream state.
     state: StreamState,
     /// Send-side flow-control window.
     send_window: i64,
     /// Receive-side flow-control window.
     recv_window: i64,
+    /// Buffered body bytes currently retained for the caller.
+    buffered_body_bytes: usize,
+    /// Current blocked reason for the stream.
+    blocked_reason: BlockedReason,
+
+    /// Returns true when the stream still counts against active-stream admission.
+    pub fn isActive(self: Stream) bool {
+        return switch (self.state) {
+            .queued,
+            .opening,
+            .open,
+            .half_closed_local,
+            .half_closed_remote,
+            .blocked_stream,
+            .blocked_connection,
+            => true,
+            .reset,
+            .closed,
+            => false,
+        };
+    }
 };
 
-/// Minimal HTTP/2 connection state holder.
+/// Minimal typed HTTP/2 connection state holder used by the runtime.
 pub const Connection = struct {
     /// Allocator used for stream bookkeeping.
     allocator: std.mem.Allocator,
@@ -58,8 +121,10 @@ pub const Connection = struct {
     /// Next locally initiated stream identifier.
     next_stream_id: u31,
     /// Connection-level send window.
-    connection_window: i64,
-    /// Active streams.
+    connection_send_window: i64,
+    /// Connection-level receive window.
+    connection_recv_window: i64,
+    /// Active and historical streams.
     streams: std.ArrayListUnmanaged(Stream),
     /// Last `GOAWAY` stream identifier, if any.
     goaway_last_stream_id: ?u31,
@@ -72,7 +137,8 @@ pub const Connection = struct {
             .settings_local = .{},
             .settings_remote = .{},
             .next_stream_id = 1,
-            .connection_window = 65535,
+            .connection_send_window = 65535,
+            .connection_recv_window = 65535,
             .streams = .{},
             .goaway_last_stream_id = null,
         };
@@ -91,15 +157,40 @@ pub const Connection = struct {
         }
     }
 
+    /// Returns the number of streams that still count as active.
+    pub fn activeStreamCount(self: *const Connection) usize {
+        var count: usize = 0;
+        for (self.streams.items) |stream| {
+            if (stream.isActive()) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    /// Returns true when the connection may still admit new local streams.
+    pub fn isReusable(self: *const Connection) bool {
+        return self.state == .preface or self.state == .active;
+    }
+
     /// Opens the next local stream and returns its identifier.
-    pub fn openLocalStream(self: *Connection) !u31 {
+    pub fn openLocalStream(self: *Connection) OpenStreamError!u31 {
+        if (self.state == .draining or self.state == .closed) {
+            return error.Draining;
+        }
+        if (self.activeStreamCount() >= self.settings_remote.max_concurrent_streams) {
+            return error.StreamLimit;
+        }
+
         const stream_id = self.next_stream_id;
         self.next_stream_id += 2;
         try self.streams.append(self.allocator, .{
             .id = stream_id,
-            .state = .open,
+            .state = .opening,
             .send_window = self.settings_remote.initial_window_size,
             .recv_window = self.settings_local.initial_window_size,
+            .buffered_body_bytes = 0,
+            .blocked_reason = .none,
         });
         self.state = .active;
         return stream_id;
@@ -117,228 +208,95 @@ pub const Connection = struct {
         }
     }
 
-    /// Updates a stream window by the provided delta.
-    pub fn updateStreamWindow(self: *Connection, stream_id: u31, delta: i32) bool {
-        for (self.streams.items) |*stream| {
-            if (stream.id == stream_id) {
-                stream.recv_window += delta;
-                return true;
-            }
-        }
-        return false;
+    /// Updates a stream receive window by the provided delta.
+    pub fn updateStreamWindow(self: *Connection, stream_id: u31, delta: i32) StreamLookupError!void {
+        const stream = try self.findStream(stream_id);
+        stream.recv_window += delta;
     }
 
-    /// Marks a stream as reset or closed by the peer.
-    pub fn resetStream(self: *Connection, stream_id: u31) bool {
-        for (self.streams.items) |*stream| {
-            if (stream.id == stream_id) {
-                stream.state = .closed;
-                return true;
-            }
+    /// Sets the state for a tracked stream.
+    pub fn setStreamState(
+        self: *Connection,
+        stream_id: u31,
+        state: StreamState,
+    ) StreamLookupError!void {
+        const stream = try self.findStream(stream_id);
+        stream.state = state;
+    }
+
+    /// Updates the buffered body bytes retained for the provided stream.
+    pub fn setBufferedBodyBytes(
+        self: *Connection,
+        stream_id: u31,
+        buffered_body_bytes: usize,
+    ) StreamLookupError!void {
+        const stream = try self.findStream(stream_id);
+        stream.buffered_body_bytes = buffered_body_bytes;
+    }
+
+    /// Marks the stream as blocked by the provided scope.
+    pub fn setBlockedReason(
+        self: *Connection,
+        stream_id: u31,
+        blocked_reason: BlockedReason,
+    ) StreamLookupError!void {
+        const stream = try self.findStream(stream_id);
+        stream.blocked_reason = blocked_reason;
+        stream.state = switch (blocked_reason) {
+            .none => .open,
+            .stream_buffer => .blocked_stream,
+            .connection_buffer => .blocked_connection,
+            .draining => .half_closed_remote,
+        };
+    }
+
+    /// Clears any blocked state and returns the stream to open processing.
+    pub fn clearBlockedReason(self: *Connection, stream_id: u31) StreamLookupError!void {
+        const stream = try self.findStream(stream_id);
+        stream.blocked_reason = .none;
+        if (stream.state == .blocked_stream or stream.state == .blocked_connection) {
+            stream.state = .open;
         }
-        return false;
+    }
+
+    /// Marks a stream as fully closed after a successful terminal transition.
+    pub fn finishStream(self: *Connection, stream_id: u31) StreamLookupError!void {
+        const stream = try self.findStream(stream_id);
+        stream.state = .closed;
+        stream.blocked_reason = .none;
+        stream.buffered_body_bytes = 0;
+    }
+
+    /// Marks a stream as reset by the peer.
+    pub fn resetStream(self: *Connection, stream_id: u31) StreamLookupError!void {
+        const stream = try self.findStream(stream_id);
+        stream.state = .reset;
+        stream.blocked_reason = .none;
     }
 
     /// Records a `GOAWAY` frame and moves the connection into draining mode.
     pub fn beginGoAway(self: *Connection, last_stream_id: u31) void {
         self.goaway_last_stream_id = last_stream_id;
-        self.state = .draining;
+        if (self.state != .closed) {
+            self.state = .draining;
+        }
+    }
+
+    /// Marks the connection as fully closed.
+    pub fn close(self: *Connection) void {
+        self.state = .closed;
+    }
+
+    /// Returns the tracked stream pointer for the provided identifier.
+    fn findStream(self: *Connection, stream_id: u31) StreamLookupError!*Stream {
+        for (self.streams.items) |*stream| {
+            if (stream.id == stream_id) {
+                return stream;
+            }
+        }
+        return error.StreamNotFound;
     }
 };
-
-/// Error set returned by the local HTTP/2 interop session.
-pub const InteropError = error{
-    /// The request scheme is not valid for the local secure HTTP/2 flow.
-    InvalidScheme,
-    /// The request target does not match the session endpoint.
-    InvalidTarget,
-    /// The request body reader surfaced an unexpected failure.
-    BodyReadFailed,
-    /// The request body exceeded the local harness buffering limit.
-    RequestBodyTooLarge,
-    /// Allocation failed while materializing the response.
-    OutOfMemory,
-};
-
-/// Reusable in-memory HTTP/2 session backed by the shared interop harness.
-pub const InteropSession = struct {
-    /// Allocator used for owned response data.
-    allocator: std.mem.Allocator,
-    /// Endpoint served by the local harness session.
-    endpoint: interop_harness.Endpoint,
-    /// HTTP/2 connection state reused across requests.
-    connection: Connection,
-    /// Number of requests executed on the session.
-    executed_requests: usize,
-
-    /// Initializes an HTTP/2 interop session for the provided loopback endpoint.
-    pub fn init(
-        allocator: std.mem.Allocator,
-        host: []const u8,
-        port: types.Port,
-    ) InteropSession {
-        var connection = Connection.init(allocator);
-        connection.sendClientPreface();
-        return .{
-            .allocator = allocator,
-            .endpoint = .{
-                .host = host,
-                .port = port,
-                .transport = .tcp,
-                .protocol = .h2,
-            },
-            .connection = connection,
-            .executed_requests = 0,
-        };
-    }
-
-    /// Releases the reused connection state.
-    pub fn deinit(self: *InteropSession) void {
-        self.connection.deinit();
-        self.* = undefined;
-    }
-
-    /// Returns how many requests have executed on the session.
-    pub fn requestCount(self: *const InteropSession) usize {
-        return self.executed_requests;
-    }
-
-    /// Returns the next locally initiated stream identifier.
-    pub fn nextStreamId(self: *const InteropSession) u31 {
-        return self.connection.next_stream_id;
-    }
-
-    /// Executes one request against the shared local interop harness.
-    pub fn executeRequest(self: *InteropSession, request: *const types.Request) InteropError!types.Response {
-        if (request.uri.scheme != .https) {
-            return error.InvalidScheme;
-        }
-        if (!std.ascii.eqlIgnoreCase(request.uri.host, self.endpoint.host) or
-            request.uri.effectivePort().toInt() != self.endpoint.port.toInt())
-        {
-            return error.InvalidTarget;
-        }
-
-        _ = self.connection.openLocalStream() catch |err| return mapAllocatorError(err);
-        self.executed_requests += 1;
-
-        const request_body = if (request.body) |body_reader|
-            try readBodyAlloc(self.allocator, body_reader, 256 * 1024)
-        else
-            self.allocator.alloc(u8, 0) catch return error.OutOfMemory;
-        defer self.allocator.free(request_body);
-
-        var semantic = interop_harness.buildSemanticResponse(self.allocator, .{
-            .method = request.method,
-            .path = request.uri.path,
-            .query = request.uri.query,
-            .negotiated_protocol = .h2,
-            .body = request_body,
-            .cookie_header = request.headers.get("cookie"),
-        }) catch return error.OutOfMemory;
-        defer semantic.deinit();
-
-        return semanticToResponse(self.allocator, semantic, .http_2);
-    }
-};
-
-/// In-memory response body state for local HTTP/2 responses.
-const OwnedBody = struct {
-    /// Allocator used to destroy the body state.
-    allocator: std.mem.Allocator,
-    /// Owned response body bytes.
-    bytes: []u8,
-    /// Current read offset.
-    offset: usize,
-
-    /// Reads one chunk from the owned body bytes.
-    fn read(ctx: ?*anyopaque, dest: []u8) anyerror!usize {
-        const self: *OwnedBody = @ptrCast(@alignCast(ctx.?));
-        if (self.offset >= self.bytes.len) {
-            return 0;
-        }
-
-        const remaining = self.bytes.len - self.offset;
-        const to_copy = @min(dest.len, remaining);
-        std.mem.copyForwards(u8, dest[0..to_copy], self.bytes[self.offset .. self.offset + to_copy]);
-        self.offset += to_copy;
-        return to_copy;
-    }
-
-    /// Releases the owned body buffer.
-    fn close(ctx: ?*anyopaque) void {
-        const self: *OwnedBody = @ptrCast(@alignCast(ctx.?));
-        self.allocator.free(self.bytes);
-        self.allocator.destroy(self);
-    }
-};
-
-/// Allocates a body state for a decoded response body.
-fn makeBodyState(allocator: std.mem.Allocator, bytes: []u8) std.mem.Allocator.Error!*OwnedBody {
-    const state = try allocator.create(OwnedBody);
-    state.* = .{
-        .allocator = allocator,
-        .bytes = bytes,
-        .offset = 0,
-    };
-    return state;
-}
-
-/// Reads a full request body into memory for the local harness flow.
-fn readBodyAlloc(
-    allocator: std.mem.Allocator,
-    body_reader: types.BodyReader,
-    max_bytes: usize,
-) InteropError![]u8 {
-    var collected = std.ArrayListUnmanaged(u8){};
-    errdefer collected.deinit(allocator);
-
-    var buffer: [4096]u8 = undefined;
-    while (true) {
-        const read_len = body_reader.read(&buffer) catch return error.BodyReadFailed;
-        if (read_len == 0) {
-            break;
-        }
-        if (collected.items.len + read_len > max_bytes) {
-            return error.RequestBodyTooLarge;
-        }
-        collected.appendSlice(allocator, buffer[0..read_len]) catch return error.OutOfMemory;
-    }
-
-    return collected.toOwnedSlice(allocator) catch return error.OutOfMemory;
-}
-
-/// Converts an interop-harness response into the shared HTTP response type.
-fn semanticToResponse(
-    allocator: std.mem.Allocator,
-    semantic: interop_harness.SemanticResponse,
-    version: types.Version,
-) InteropError!types.Response {
-    var response = types.Response.init(allocator, version, semantic.status);
-    errdefer response.deinit();
-
-    var iterator = semantic.headers.iterator();
-    while (iterator.next()) |header| {
-        response.headers.append(header.name, header.value) catch return error.OutOfMemory;
-    }
-
-    if (semantic.body.len > 0) {
-        const owned_body = allocator.dupe(u8, semantic.body) catch return error.OutOfMemory;
-        const state = makeBodyState(allocator, owned_body) catch return error.OutOfMemory;
-        response.body = .{
-            .ctx = state,
-            .read_fn = OwnedBody.read,
-            .close_fn = OwnedBody.close,
-        };
-    }
-
-    return response;
-}
-
-/// Maps allocator failures into the interop error surface.
-fn mapAllocatorError(_: std.mem.Allocator.Error) InteropError {
-    return error.OutOfMemory;
-}
 
 test "http2 connection opens client streams on odd identifiers" {
     var conn = Connection.init(std.testing.allocator);
@@ -362,4 +320,24 @@ test "http2 connection tracks settings and goaway state" {
     try std.testing.expectEqual(@as(u32, 32768), conn.settings_remote.max_frame_size);
     try std.testing.expectEqual(@as(u32, 70000), conn.settings_remote.initial_window_size);
     try std.testing.expectEqual(ConnectionState.draining, conn.state);
+    try std.testing.expectEqual(@as(?u31, 7), conn.goaway_last_stream_id);
+}
+
+test "http2 connection tracks blocked reasons and buffered bytes per stream" {
+    var conn = Connection.init(std.testing.allocator);
+    defer conn.deinit();
+
+    conn.sendClientPreface();
+    const stream_id = try conn.openLocalStream();
+    try conn.setStreamState(stream_id, .open);
+    try conn.setBufferedBodyBytes(stream_id, 512);
+    try conn.setBlockedReason(stream_id, .connection_buffer);
+
+    try std.testing.expectEqual(@as(usize, 1), conn.activeStreamCount());
+    try std.testing.expectEqual(BlockedReason.connection_buffer, conn.streams.items[0].blocked_reason);
+    try std.testing.expectEqual(@as(usize, 512), conn.streams.items[0].buffered_body_bytes);
+
+    try conn.clearBlockedReason(stream_id);
+    try conn.finishStream(stream_id);
+    try std.testing.expectEqual(@as(usize, 0), conn.activeStreamCount());
 }

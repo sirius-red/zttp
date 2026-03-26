@@ -5,6 +5,8 @@ const types = @import("types.zig");
 const mailbox = @import("util/mailbox.zig");
 const future = @import("util/future.zig");
 const connection_h1 = @import("http1/connection_h1.zig");
+const http2_connection = @import("http2/connection.zig");
+const connection_h2 = @import("http2/connection_h2.zig");
 const tls_config = @import("tls/config.zig");
 const request_encoder = @import("http1/request_encoder.zig");
 const redirects = @import("redirects/redirects.zig");
@@ -153,6 +155,26 @@ pub const PoolOptions = struct {
     }
 };
 
+/// HTTP/2 shared-runtime limits surfaced through the client API.
+pub const H2Options = struct {
+    /// Maximum active streams admitted on one shared connection.
+    max_active_streams: connection_h2.ActiveStreamCount,
+    /// Maximum buffered bytes retained for one stream body.
+    max_stream_buffer_bytes: ByteSize,
+    /// Maximum buffered bytes retained across one shared connection.
+    max_connection_buffer_bytes: ByteSize,
+
+    /// Returns default HTTP/2 shared-runtime limits.
+    pub fn default() H2Options {
+        const defaults = connection_h2.Options.default();
+        return .{
+            .max_active_streams = defaults.max_active_streams,
+            .max_stream_buffer_bytes = defaults.max_stream_buffer_bytes,
+            .max_connection_buffer_bytes = defaults.max_connection_buffer_bytes,
+        };
+    }
+};
+
 /// Redirect handling mode.
 pub const RedirectMode = enum {
     /// Do not follow redirects.
@@ -248,6 +270,8 @@ pub const Options = struct {
     cookie_jar: ?*CookieJar,
     /// TLS configuration.
     tls: TlsConfig,
+    /// HTTP/2 shared-runtime configuration.
+    http2: H2Options,
 
     /// Returns default client options.
     pub fn default() Options {
@@ -259,6 +283,7 @@ pub const Options = struct {
             .proxy = ProxyConfig.default(),
             .cookie_jar = null,
             .tls = TlsConfig.default(),
+            .http2 = H2Options.default(),
         };
     }
 };
@@ -1029,6 +1054,11 @@ const RequestState = struct {
         var response = response_value;
         try self.storeCookies(request_uri, &response);
         if (response.body) |body_reader| {
+            if (self.lease == null and response.version == .http_2) {
+                self.completed = true;
+                return response;
+            }
+
             const lease = self.takeLease() orelse {
                 body_reader.close();
                 response.deinit();
@@ -1235,6 +1265,10 @@ const RequestState = struct {
         };
 
         self.mutex.unlock();
+
+        if (origin.negotiated_protocol == .h2) {
+            self.releaseLease();
+        }
     }
 
     /// Releases the lease back to the pool, if present.
@@ -1432,6 +1466,10 @@ pub const Client = struct {
         lease.connection.submit(prepared.request, state.future.completion()) catch |err| {
             return mapSubmitError(err);
         };
+
+        if (origin.negotiated_protocol == .h2) {
+            state.releaseLease();
+        }
 
         cleanup = false;
         cleanup_prepared = false;
@@ -1756,6 +1794,9 @@ pub const Client = struct {
         options.max_status_line_bytes = self.options.limits.max_response_line_bytes.toInt();
         options.tls_config = self.effectiveTlsConfigForRequest(request_value);
         options.expected_protocol = protocol_plan.expected_protocol;
+        options.h2_max_active_streams = self.options.http2.max_active_streams.toInt();
+        options.h2_max_stream_buffer_bytes = self.options.http2.max_stream_buffer_bytes.toInt();
+        options.h2_max_connection_buffer_bytes = self.options.http2.max_connection_buffer_bytes.toInt();
         return options;
     }
 
@@ -2439,6 +2480,53 @@ test "https connection options keep the compatibility path for omitted alpn peer
     try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, connection_options.expected_protocol);
 }
 
+/// Returns the internal HTTP/2 runtime snapshot for the request origin.
+fn snapshotSharedH2Runtime(client: *Client, request_value: *const types.Request) !connection_h2.Snapshot {
+    const origin = try client.buildOriginKey(request_value, null, null);
+    const entry = client.pool.origins.getEntryContext(origin, OriginKeyContext{}) orelse return error.Transport;
+    try std.testing.expectEqual(@as(usize, 1), entry.value_ptr.idle.items.len);
+    return entry.value_ptr.idle.items[0].connection.http2_runtime.?.snapshot();
+}
+
+/// Polls until the shared HTTP/2 runtime reports stream-scoped backpressure.
+fn waitForSharedH2StreamBackpressure(client: *Client, request_value: *const types.Request) !connection_h2.Snapshot {
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        const snapshot = try snapshotSharedH2Runtime(client, request_value);
+        if (snapshot.saw_stream_backpressure) {
+            return snapshot;
+        }
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    return error.Timeout;
+}
+
+/// Polls until the shared HTTP/2 runtime reports connection-scoped backpressure.
+fn waitForSharedH2ConnectionBackpressure(client: *Client, request_value: *const types.Request) !connection_h2.Snapshot {
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        const snapshot = try snapshotSharedH2Runtime(client, request_value);
+        if (snapshot.saw_connection_backpressure) {
+            return snapshot;
+        }
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    return error.Timeout;
+}
+
+/// Polls until the shared HTTP/2 runtime enters the draining state.
+fn waitForSharedH2Draining(client: *Client, request_value: *const types.Request) !connection_h2.Snapshot {
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        const snapshot = try snapshotSharedH2Runtime(client, request_value);
+        if (snapshot.state == http2_connection.ConnectionState.draining and !snapshot.reusable) {
+            return snapshot;
+        }
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    return error.Timeout;
+}
+
 test "client routes dual-alpn loopback https requests over http2 automatically" {
     const peer = interop_harness.alpnPeerProfileForId(.dual_alpn).?;
 
@@ -2463,6 +2551,181 @@ test "client routes dual-alpn loopback https requests over http2 automatically" 
     var body: [128]u8 = undefined;
     const read_len = try response.body.?.read(&body);
     try std.testing.expect(std.mem.containsAtLeast(u8, body[0..read_len], 1, "\"protocol\":\"h2\""));
+}
+
+test "client reuses one shared h2 runtime for concurrent requests" {
+    const peer = interop_harness.alpnPeerProfileForId(.dual_alpn).?;
+
+    var options = Options.default();
+    options.pool.max_connections = ConnectionCount.init(1);
+
+    var client = Client.init(std.testing.allocator, options);
+    defer client.deinit();
+
+    var health_request = types.Request.init(
+        std.testing.allocator,
+        .get,
+        types.Uri.init(.https, peer.host, peer.port, "/health", null, null),
+    );
+    defer health_request.deinit();
+    try health_request.headers.append("Host", peer.host);
+
+    var echo_request = types.Request.init(
+        std.testing.allocator,
+        .get,
+        types.Uri.init(.https, peer.host, peer.port, "/echo", null, null),
+    );
+    defer echo_request.deinit();
+    try echo_request.headers.append("Host", peer.host);
+
+    var health_handle = try client.request(&health_request);
+    defer health_handle.deinit();
+    var echo_handle = try client.request(&echo_request);
+    defer echo_handle.deinit();
+
+    var health_response = try health_handle.wait();
+    defer health_response.deinit();
+    defer if (health_response.body) |body| body.close();
+    var echo_response = try echo_handle.wait();
+    defer echo_response.deinit();
+    defer if (echo_response.body) |body| body.close();
+
+    const snapshot = try snapshotSharedH2Runtime(&client, &health_request);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.request_count);
+    try std.testing.expect(snapshot.max_overlapping_streams >= 2);
+    try std.testing.expectEqual(@as(u31, 5), snapshot.next_stream_id);
+}
+
+test "client h2 runtime reports stream and connection backpressure under a held body reader" {
+    const peer = interop_harness.alpnPeerProfileForId(.dual_alpn).?;
+
+    var options = Options.default();
+    options.pool.max_connections = ConnectionCount.init(1);
+    options.http2.max_stream_buffer_bytes = ByteSize.fromBytes(512);
+    options.http2.max_connection_buffer_bytes = ByteSize.fromBytes(768);
+
+    var client = Client.init(std.testing.allocator, options);
+    defer client.deinit();
+
+    var large_request = types.Request.init(
+        std.testing.allocator,
+        .get,
+        types.Uri.init(.https, peer.host, peer.port, "/stream/large", null, null),
+    );
+    defer large_request.deinit();
+    try large_request.headers.append("Host", peer.host);
+
+    var second_large_request = types.Request.init(
+        std.testing.allocator,
+        .get,
+        types.Uri.init(.https, peer.host, peer.port, "/stream/large", null, null),
+    );
+    defer second_large_request.deinit();
+    try second_large_request.headers.append("Host", peer.host);
+
+    var large_handle = try client.request(&large_request);
+    defer large_handle.deinit();
+
+    var large_response = try large_handle.wait();
+    defer large_response.deinit();
+    defer if (large_response.body) |body| body.close();
+    _ = try waitForSharedH2StreamBackpressure(&client, &large_request);
+
+    var second_large_handle = try client.request(&second_large_request);
+    defer second_large_handle.deinit();
+    var second_large_response = try second_large_handle.wait();
+    defer second_large_response.deinit();
+    defer if (second_large_response.body) |body| body.close();
+
+    const snapshot = try waitForSharedH2ConnectionBackpressure(&client, &large_request);
+    try std.testing.expect(snapshot.saw_stream_backpressure);
+    try std.testing.expect(snapshot.saw_connection_backpressure);
+}
+
+test "client isolates h2 rst_stream failures from healthy peers" {
+    const peer = interop_harness.alpnPeerProfileForId(.dual_alpn).?;
+
+    var options = Options.default();
+    options.pool.max_connections = ConnectionCount.init(1);
+
+    var client = Client.init(std.testing.allocator, options);
+    defer client.deinit();
+
+    var rst_request = types.Request.init(
+        std.testing.allocator,
+        .get,
+        types.Uri.init(.https, peer.host, peer.port, "/stream/chunked", "action=rst", null),
+    );
+    defer rst_request.deinit();
+    try rst_request.headers.append("Host", peer.host);
+
+    var health_request = types.Request.init(
+        std.testing.allocator,
+        .get,
+        types.Uri.init(.https, peer.host, peer.port, "/health", null, null),
+    );
+    defer health_request.deinit();
+    try health_request.headers.append("Host", peer.host);
+
+    var rst_handle = try client.request(&rst_request);
+    defer rst_handle.deinit();
+    var health_handle = try client.request(&health_request);
+    defer health_handle.deinit();
+
+    var rst_response = try rst_handle.wait();
+    defer rst_response.deinit();
+    defer if (rst_response.body) |body| body.close();
+
+    var buffer: [32]u8 = undefined;
+    _ = try rst_response.body.?.read(&buffer);
+    try std.testing.expectError(error.Protocol, rst_response.body.?.read(&buffer));
+
+    var health_response = try health_handle.wait();
+    defer health_response.deinit();
+    defer if (health_response.body) |body| body.close();
+    try std.testing.expectEqual(types.Status.ok, health_response.status);
+}
+
+test "client rejects new h2 admissions after goaway begins draining" {
+    const peer = interop_harness.alpnPeerProfileForId(.dual_alpn).?;
+
+    var options = Options.default();
+    options.pool.max_connections = ConnectionCount.init(1);
+
+    var client = Client.init(std.testing.allocator, options);
+    defer client.deinit();
+
+    var goaway_request = types.Request.init(
+        std.testing.allocator,
+        .get,
+        types.Uri.init(.https, peer.host, peer.port, "/stream/chunked", "action=goaway", null),
+    );
+    defer goaway_request.deinit();
+    try goaway_request.headers.append("Host", peer.host);
+
+    var rejected_request = types.Request.init(
+        std.testing.allocator,
+        .get,
+        types.Uri.init(.https, peer.host, peer.port, "/health", null, null),
+    );
+    defer rejected_request.deinit();
+    try rejected_request.headers.append("Host", peer.host);
+
+    var goaway_handle = try client.request(&goaway_request);
+    defer goaway_handle.deinit();
+
+    var goaway_response = try goaway_handle.wait();
+    defer goaway_response.deinit();
+    defer if (goaway_response.body) |body| body.close();
+
+    const snapshot = try waitForSharedH2Draining(&client, &goaway_request);
+
+    var rejected_handle = try client.request(&rejected_request);
+    defer rejected_handle.deinit();
+    try std.testing.expectError(error.LimitExceeded, rejected_handle.wait());
+
+    try std.testing.expectEqual(http2_connection.ConnectionState.draining, snapshot.state);
+    try std.testing.expect(!snapshot.reusable);
 }
 
 test "client surfaces unsupported secure negotiation as a distinct error" {

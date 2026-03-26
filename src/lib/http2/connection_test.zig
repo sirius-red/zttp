@@ -97,56 +97,29 @@ test "interop routes advertise http2 coverage" {
     try std.testing.expectEqualStrings("h2", types.NegotiatedProtocol.h2.asAlpnBytes());
 }
 
-test "http2 interop session reuses stream state across repeated requests" {
-    const peer = interop_harness.alpnPeerProfileForId(.dual_alpn).?;
-    var session = connection.InteropSession.init(std.testing.allocator, peer.host, peer.port);
-    defer session.deinit();
+test "http2 typed connection state tracks repeated stream openings" {
+    var state = connection.Connection.init(std.testing.allocator);
+    defer state.deinit();
 
-    const uri = types.Uri.init(.https, peer.host, peer.port, "/health", null, null);
-
-    var request_one = types.Request.init(std.testing.allocator, .get, uri);
-    defer request_one.deinit();
-    try request_one.headers.append("Host", peer.host);
-
-    var response_one = try session.executeRequest(&request_one);
-    defer response_one.deinit();
-    defer if (response_one.body) |body| body.close();
-
-    try std.testing.expectEqual(types.Version.http_2, response_one.version);
-    try std.testing.expectEqual(@as(usize, 1), session.requestCount());
-    try std.testing.expectEqual(@as(u31, 3), session.nextStreamId());
-
-    var request_two = types.Request.init(std.testing.allocator, .get, uri);
-    defer request_two.deinit();
-    try request_two.headers.append("Host", peer.host);
-
-    var response_two = try session.executeRequest(&request_two);
-    defer response_two.deinit();
-    defer if (response_two.body) |body| body.close();
-
-    try std.testing.expectEqual(types.Version.http_2, response_two.version);
-    try std.testing.expectEqual(@as(usize, 2), session.requestCount());
-    try std.testing.expectEqual(@as(u31, 5), session.nextStreamId());
+    state.sendClientPreface();
+    try std.testing.expectEqual(@as(u31, 1), try state.openLocalStream());
+    try std.testing.expectEqual(@as(u31, 3), try state.openLocalStream());
+    try std.testing.expectEqual(@as(usize, 2), state.activeStreamCount());
+    try std.testing.expectEqual(@as(u31, 5), state.next_stream_id);
 }
 
-test "http2 interop session surfaces h2 diagnostics on harness responses" {
-    const peer = interop_harness.alpnPeerProfileForId(.dual_alpn).?;
-    var session = connection.InteropSession.init(std.testing.allocator, peer.host, peer.port);
-    defer session.deinit();
+test "http2 typed connection state records blocked scope transitions" {
+    var state = connection.Connection.init(std.testing.allocator);
+    defer state.deinit();
 
-    var request = types.Request.init(
-        std.testing.allocator,
-        .get,
-        types.Uri.init(.https, peer.host, peer.port, "/health", null, null),
-    );
-    defer request.deinit();
-    try request.headers.append("Host", peer.host);
+    state.sendClientPreface();
+    const stream_id = try state.openLocalStream();
+    try state.setStreamState(stream_id, .open);
+    try state.setBlockedReason(stream_id, .stream_buffer);
+    try std.testing.expectEqual(connection.BlockedReason.stream_buffer, state.streams.items[0].blocked_reason);
+    try std.testing.expectEqual(connection.StreamState.blocked_stream, state.streams.items[0].state);
 
-    var response = try session.executeRequest(&request);
-    defer response.deinit();
-    defer if (response.body) |body| body.close();
-
-    var buffer: [128]u8 = undefined;
-    const read_len = try response.body.?.read(&buffer);
-    try std.testing.expect(std.mem.containsAtLeast(u8, buffer[0..read_len], 1, "\"protocol\":\"h2\""));
+    try state.clearBlockedReason(stream_id);
+    try std.testing.expectEqual(connection.BlockedReason.none, state.streams.items[0].blocked_reason);
+    try std.testing.expectEqual(connection.StreamState.open, state.streams.items[0].state);
 }

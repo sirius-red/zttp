@@ -257,6 +257,8 @@ pub const MultiplexingDiagnostics = struct {
     shared_connection_count: types.ConnectionCount,
     /// Minimum overlapping active streams observed during the scenario.
     minimum_overlapping_streams: StreamCount,
+    /// Whether local validation must observe distinct stream identifiers.
+    distinct_stream_ids_required: bool = false,
     /// Expected blocked scopes surfaced by the scenario.
     expected_backpressure_scopes: []const BackpressureScope,
     /// Expected failure scope surfaced by the scenario, if any.
@@ -575,6 +577,7 @@ const default_multiplexing_scenarios = [_]MultiplexingScenario{
         .diagnostics = .{
             .shared_connection_count = types.ConnectionCount.init(1),
             .minimum_overlapping_streams = StreamCount.init(2),
+            .distinct_stream_ids_required = true,
             .expected_backpressure_scopes = &no_backpressure_scopes,
             .expected_failure_scope = null,
             .bounded_buffering_required = false,
@@ -1142,6 +1145,7 @@ test "multiplexing catalog captures shared-connection and scope diagnostics" {
     try std.testing.expectEqual(RouteId.echo_get, health_echo.routes[1]);
     try std.testing.expectEqual(@as(usize, 1), health_echo.diagnostics.shared_connection_count.toInt());
     try std.testing.expectEqual(@as(usize, 2), health_echo.diagnostics.minimum_overlapping_streams.toInt());
+    try std.testing.expect(health_echo.diagnostics.distinct_stream_ids_required);
     try std.testing.expectEqual(@as(usize, 0), health_echo.diagnostics.expected_backpressure_scopes.len);
     try std.testing.expectEqual(@as(?FailureScope, null), health_echo.diagnostics.expected_failure_scope);
 
