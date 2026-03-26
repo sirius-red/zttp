@@ -207,6 +207,88 @@ pub const AlpnFailureDiagnostic = struct {
     client_failure: AlpnClientFailure,
 };
 
+/// Stream count with an explicit unit for multiplexing diagnostics.
+pub const StreamCount = struct {
+    /// Number of active or overlapping streams.
+    count: usize,
+
+    /// Creates a stream count from the provided value.
+    pub fn init(count: usize) StreamCount {
+        return .{ .count = count };
+    }
+
+    /// Returns the raw stream count.
+    pub fn toInt(self: StreamCount) usize {
+        return self.count;
+    }
+};
+
+/// Stable identifier for an HTTP/2 multiplexing validation scenario.
+pub const MultiplexingScenarioId = enum {
+    /// Concurrent `/health` and `/echo` requests share one H2 connection.
+    concurrent_health_echo,
+    /// Slow-consumer pressure exercises stream and connection backpressure.
+    slow_consumer_large_body,
+    /// One reset stream fails without corrupting healthy peers.
+    rst_stream_isolated,
+    /// `GOAWAY` drains the shared connection and blocks new admissions.
+    goaway_drains_connection,
+};
+
+/// Scope classification for a blocked backpressure state.
+pub const BackpressureScope = enum {
+    /// One stream is blocked while others may still progress.
+    stream,
+    /// The shared connection budget blocks affected streams together.
+    connection,
+};
+
+/// Scope classification for a failure outcome.
+pub const FailureScope = enum {
+    /// Failure is isolated to one stream.
+    stream,
+    /// Failure applies to the entire shared connection.
+    connection,
+};
+
+/// Typed multiplexing diagnostic expectations for one local validation scenario.
+pub const MultiplexingDiagnostics = struct {
+    /// Expected shared-connection count observed by the validation surface.
+    shared_connection_count: types.ConnectionCount,
+    /// Minimum overlapping active streams observed during the scenario.
+    minimum_overlapping_streams: StreamCount,
+    /// Expected blocked scopes surfaced by the scenario.
+    expected_backpressure_scopes: []const BackpressureScope,
+    /// Expected failure scope surfaced by the scenario, if any.
+    expected_failure_scope: ?FailureScope,
+    /// Whether bounded buffering must be observable.
+    bounded_buffering_required: bool,
+    /// Whether blocked work must resume after capacity returns.
+    resume_required: bool,
+    /// Whether unrelated healthy streams must continue.
+    unrelated_streams_continue: bool,
+    /// Whether new requests must be rejected once drain begins.
+    new_requests_rejected_after_drain: bool,
+};
+
+/// Declarative HTTP/2 multiplexing scenario shared across contracts and tests.
+pub const MultiplexingScenario = struct {
+    /// Stable scenario identifier.
+    id: MultiplexingScenarioId,
+    /// Human-readable scenario name.
+    name: []const u8,
+    /// Short summary of the validation contract.
+    summary: []const u8,
+    /// Dual-ALPN peer profile used by the scenario.
+    peer_profile: AlpnPeerProfileId,
+    /// Routes exercised by the scenario.
+    routes: []const RouteId,
+    /// Whether the scenario requires one reusable H2 connection.
+    requires_shared_connection: bool,
+    /// Typed diagnostics expected from the local harness.
+    diagnostics: MultiplexingDiagnostics,
+};
+
 /// UDP-focused HTTP/3 scenario metadata.
 pub const Http3DatagramScenario = struct {
     /// Route served by the datagram scenario.
@@ -286,6 +368,12 @@ const alpn_dual_protocols = [_]types.NegotiatedProtocol{ .h2, .http_1_1 };
 const alpn_http1_only_protocols = [_]types.NegotiatedProtocol{.http_1_1};
 const alpn_no_protocols = [_]types.NegotiatedProtocol{};
 const windows_only_platforms = [_]ReadinessPlatform{.windows};
+const no_backpressure_scopes = [_]BackpressureScope{};
+const stream_and_connection_backpressure_scopes = [_]BackpressureScope{ .stream, .connection };
+const health_echo_routes = [_]RouteId{ .health, .echo_get };
+const large_body_routes = [_]RouteId{ .stream_large, .health };
+const rst_stream_routes = [_]RouteId{ .stream_chunked, .health };
+const goaway_routes = [_]RouteId{ .health, .echo_get };
 const windows_loopback_server_command = [_][]const u8{
     "zig",
     "build",
@@ -476,6 +564,81 @@ const default_readiness_scenarios = [_]ReadinessScenario{
     },
 };
 
+const default_multiplexing_scenarios = [_]MultiplexingScenario{
+    .{
+        .id = .concurrent_health_echo,
+        .name = "concurrent-health-echo",
+        .summary = "Verify that overlapping /health and /echo requests reuse one shared HTTP/2 connection with distinct stream identities.",
+        .peer_profile = .dual_alpn,
+        .routes = &health_echo_routes,
+        .requires_shared_connection = true,
+        .diagnostics = .{
+            .shared_connection_count = types.ConnectionCount.init(1),
+            .minimum_overlapping_streams = StreamCount.init(2),
+            .expected_backpressure_scopes = &no_backpressure_scopes,
+            .expected_failure_scope = null,
+            .bounded_buffering_required = false,
+            .resume_required = false,
+            .unrelated_streams_continue = true,
+            .new_requests_rejected_after_drain = false,
+        },
+    },
+    .{
+        .id = .slow_consumer_large_body,
+        .name = "slow-consumer-large-body",
+        .summary = "Verify that a slow large-body stream stays bounded, surfaces stream and connection pressure, and resumes after capacity returns.",
+        .peer_profile = .dual_alpn,
+        .routes = &large_body_routes,
+        .requires_shared_connection = true,
+        .diagnostics = .{
+            .shared_connection_count = types.ConnectionCount.init(1),
+            .minimum_overlapping_streams = StreamCount.init(2),
+            .expected_backpressure_scopes = &stream_and_connection_backpressure_scopes,
+            .expected_failure_scope = null,
+            .bounded_buffering_required = true,
+            .resume_required = true,
+            .unrelated_streams_continue = true,
+            .new_requests_rejected_after_drain = false,
+        },
+    },
+    .{
+        .id = .rst_stream_isolated,
+        .name = "rst-stream-isolated",
+        .summary = "Verify that one reset stream fails with stream scope while a healthy concurrent request continues on the same connection.",
+        .peer_profile = .dual_alpn,
+        .routes = &rst_stream_routes,
+        .requires_shared_connection = true,
+        .diagnostics = .{
+            .shared_connection_count = types.ConnectionCount.init(1),
+            .minimum_overlapping_streams = StreamCount.init(2),
+            .expected_backpressure_scopes = &no_backpressure_scopes,
+            .expected_failure_scope = .stream,
+            .bounded_buffering_required = false,
+            .resume_required = false,
+            .unrelated_streams_continue = true,
+            .new_requests_rejected_after_drain = false,
+        },
+    },
+    .{
+        .id = .goaway_drains_connection,
+        .name = "goaway-drains-connection",
+        .summary = "Verify that GOAWAY drains one shared connection, preserves a connection-scoped outcome, and rejects new admissions after drain begins.",
+        .peer_profile = .dual_alpn,
+        .routes = &goaway_routes,
+        .requires_shared_connection = true,
+        .diagnostics = .{
+            .shared_connection_count = types.ConnectionCount.init(1),
+            .minimum_overlapping_streams = StreamCount.init(2),
+            .expected_backpressure_scopes = &no_backpressure_scopes,
+            .expected_failure_scope = .connection,
+            .bounded_buffering_required = false,
+            .resume_required = false,
+            .unrelated_streams_continue = false,
+            .new_requests_rejected_after_drain = true,
+        },
+    },
+};
+
 const default_http3_datagram_scenarios = [_]Http3DatagramScenario{
     .{
         .route = .health,
@@ -603,9 +766,24 @@ pub fn defaultReadinessScenarios() []const ReadinessScenario {
     return &default_readiness_scenarios;
 }
 
+/// Returns the default HTTP/2 multiplexing validation scenarios.
+pub fn defaultMultiplexingScenarios() []const MultiplexingScenario {
+    return &default_multiplexing_scenarios;
+}
+
 /// Returns the release-readiness scenario for the provided identifier, if any.
 pub fn readinessScenarioForId(id: ReadinessScenarioId) ?ReadinessScenario {
     for (default_readiness_scenarios) |scenario| {
+        if (scenario.id == id) {
+            return scenario;
+        }
+    }
+    return null;
+}
+
+/// Returns the HTTP/2 multiplexing validation scenario for the provided identifier, if any.
+pub fn multiplexingScenarioForId(id: MultiplexingScenarioId) ?MultiplexingScenario {
+    for (default_multiplexing_scenarios) |scenario| {
         if (scenario.id == id) {
             return scenario;
         }
@@ -953,4 +1131,33 @@ test "readiness catalog includes the dedicated windows loopback scenario" {
     try std.testing.expectEqualStrings("http://127.0.0.1:18080/health", readiness.request_command.argv[5]);
     try std.testing.expect(std.mem.containsAtLeast(u8, readiness.expected_body_substring, 1, "\"protocol\":\"http/1.1\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, readiness.known_failure_signature.?, 1, "GetLastError(87)"));
+}
+
+test "multiplexing catalog captures shared-connection and scope diagnostics" {
+    const health_echo = multiplexingScenarioForId(.concurrent_health_echo).?;
+    try std.testing.expectEqualStrings("concurrent-health-echo", health_echo.name);
+    try std.testing.expectEqual(AlpnPeerProfileId.dual_alpn, health_echo.peer_profile);
+    try std.testing.expectEqual(@as(usize, 2), health_echo.routes.len);
+    try std.testing.expectEqual(RouteId.health, health_echo.routes[0]);
+    try std.testing.expectEqual(RouteId.echo_get, health_echo.routes[1]);
+    try std.testing.expectEqual(@as(usize, 1), health_echo.diagnostics.shared_connection_count.toInt());
+    try std.testing.expectEqual(@as(usize, 2), health_echo.diagnostics.minimum_overlapping_streams.toInt());
+    try std.testing.expectEqual(@as(usize, 0), health_echo.diagnostics.expected_backpressure_scopes.len);
+    try std.testing.expectEqual(@as(?FailureScope, null), health_echo.diagnostics.expected_failure_scope);
+
+    const slow_consumer = multiplexingScenarioForId(.slow_consumer_large_body).?;
+    try std.testing.expectEqual(@as(usize, 2), slow_consumer.diagnostics.expected_backpressure_scopes.len);
+    try std.testing.expectEqual(BackpressureScope.stream, slow_consumer.diagnostics.expected_backpressure_scopes[0]);
+    try std.testing.expectEqual(BackpressureScope.connection, slow_consumer.diagnostics.expected_backpressure_scopes[1]);
+    try std.testing.expect(slow_consumer.diagnostics.bounded_buffering_required);
+    try std.testing.expect(slow_consumer.diagnostics.resume_required);
+    try std.testing.expect(slow_consumer.diagnostics.unrelated_streams_continue);
+
+    const rst_stream = multiplexingScenarioForId(.rst_stream_isolated).?;
+    try std.testing.expectEqual(FailureScope.stream, rst_stream.diagnostics.expected_failure_scope.?);
+    try std.testing.expect(rst_stream.diagnostics.unrelated_streams_continue);
+
+    const goaway = multiplexingScenarioForId(.goaway_drains_connection).?;
+    try std.testing.expectEqual(FailureScope.connection, goaway.diagnostics.expected_failure_scope.?);
+    try std.testing.expect(goaway.diagnostics.new_requests_rejected_after_drain);
 }
