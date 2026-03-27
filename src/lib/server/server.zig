@@ -14,5 +14,17 @@ pub const ServerConfig = Types.ServerConfig;
 pub const ServerRequest = Types.ServerRequest;
 /// Public response writer alias.
 pub const ServerResponseWriter = Types.ServerResponseWriter;
+/// Public negotiated session metadata alias.
+pub const NegotiatedSession = Types.NegotiatedSession;
+/// Public route definition alias.
+pub const Route = Types.Route;
+/// Public shared request behavior alias.
+pub const Middleware = Types.Middleware;
+/// Public middleware decision alias.
+pub const MiddlewareDecision = Types.MiddlewareDecision;
+/// Public route catalog alias.
+pub const RouteCatalog = Types.RouteCatalog;
+/// Public fallback handler alias.
+pub const FallbackHandler = Types.FallbackHandler;
 /// Public server runtime alias.
 pub const Server = Runtime.Server;

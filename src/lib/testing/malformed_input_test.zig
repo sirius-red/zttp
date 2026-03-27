@@ -6,6 +6,8 @@ const response_parser = @import("../http1/response_parser.zig");
 const http2_frame = @import("../http2/frame.zig");
 const qpack = @import("../http3/qpack.zig");
 const quic = @import("../http3/quic.zig");
+const server_http2 = @import("../server/http2.zig");
+const server_types = @import("../server/types.zig");
 const interop_harness = @import("interop_harness.zig");
 const smoke_runner = @import("smoke_runner.zig");
 
@@ -117,4 +119,9 @@ test "interop harness scenarios keep explicit negative cases for shared-bug cros
         try std.testing.expect(scenario.negative_case != null);
         try std.testing.expect(scenario.negative_case.?.len > 0);
     }
+}
+
+test "server http2 failure classification distinguishes malformed from unsupported exchanges" {
+    try std.testing.expectEqual(server_types.Http2FailureCategory.malformed_frame, server_http2.classifyFailure(error.InvalidClientPreface).?);
+    try std.testing.expectEqual(server_types.Http2FailureCategory.unsupported_exchange, server_http2.classifyFailure(error.UnsupportedExchange).?);
 }

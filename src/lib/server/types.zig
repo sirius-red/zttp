@@ -3,6 +3,7 @@
 const std = @import("std");
 const core = @import("../types.zig");
 const tls_config = @import("../tls/config.zig");
+const tls_server = @import("../tls/server.zig");
 
 const default_alpn_protocols = [_]core.NegotiatedProtocol{ .h2, .http_1_1 };
 
@@ -69,6 +70,132 @@ pub const ConfigError = tls_config.ValidationError || error{
     MissingTlsIdentity,
     /// HTTP/2 requires TLS ALPN advertising in this runtime.
     InvalidHttp2Configuration,
+    /// The higher-level route catalog contains an invalid exact duplicate.
+    InvalidRouteCatalog,
+};
+
+/// Re-exported TLS listener plan used by secure server configurations.
+pub const SecureListenerPlan = tls_server.ListenerPlan;
+
+/// Explicit ALPN negotiation failure surfaced by the secure listener runtime.
+pub const NegotiationFailureCategory = enum {
+    /// The peer selected or required an unsupported application protocol.
+    unsupported_protocol,
+    /// The peer sent bytes that could not be routed to a supported protocol path.
+    invalid_negotiation_bytes,
+};
+
+/// Predictable failure category surfaced by the minimal HTTP/2 server path.
+pub const Http2FailureCategory = enum {
+    /// The peer sent malformed HTTP/2 wire data.
+    malformed_frame,
+    /// The peer requested an unsupported HTTP/2 exchange shape.
+    unsupported_exchange,
+};
+
+/// Typed negotiated session metadata for one accepted server connection.
+pub const NegotiatedSession = struct {
+    /// Peer address for the accepted socket.
+    peer: std.net.Address,
+    /// Stable TLS identity token when secure listener mode is active.
+    identity_token: ?core.TlsIdentityToken,
+    /// Negotiated application protocol for the connection.
+    negotiated_protocol: core.NegotiatedProtocol,
+    /// Effective request version that will be surfaced to handlers.
+    request_version: core.Version,
+    /// Whether the connection was accepted in secure-listener mode.
+    secure: bool,
+    /// Whether the connection is still considered alive.
+    alive: bool,
+};
+
+/// Result returned by one shared request-behavior callback.
+pub const MiddlewareDecision = enum {
+    /// Continue into the next middleware or the matched route.
+    continue_processing,
+    /// Stop processing because the middleware already produced the response.
+    handled,
+};
+
+/// Shared request behavior applied before route-specific handling.
+pub const Middleware = struct {
+    /// Stable middleware name used for diagnostics.
+    name: []const u8,
+    /// Optional opaque middleware context.
+    context: ?*anyopaque,
+    /// Callback invoked before route dispatch.
+    handler: *const fn (
+        ctx: ?*anyopaque,
+        request: *ServerRequest,
+        writer: *ServerResponseWriter,
+    ) anyerror!MiddlewareDecision,
+};
+
+/// One exact method/path route definition.
+pub const Route = struct {
+    /// Stable route name used for diagnostics.
+    name: []const u8,
+    /// Exact HTTP method match for the route.
+    method: core.Method,
+    /// Exact request path match for the route.
+    path: []const u8,
+    /// Route-specific handler callback.
+    handler: Handler,
+    /// Optional route-specific handler context.
+    handler_context: ?*anyopaque,
+};
+
+/// Optional fallback handler used when no route matches the request.
+pub const FallbackHandler = struct {
+    /// Fallback callback invoked for unmapped requests.
+    handler: Handler,
+    /// Optional fallback callback context.
+    handler_context: ?*anyopaque,
+};
+
+/// Conflict policy used when more than one route matches the same identity.
+pub const RouteAmbiguityPolicy = enum {
+    /// Reject duplicate exact method/path pairs during validation.
+    reject_duplicates,
+    /// Allow duplicates and dispatch the first registered route.
+    first_registered,
+};
+
+/// Typed higher-level routing surface layered over the core runtime handler.
+pub const RouteCatalog = struct {
+    /// Exact routes available for dispatch.
+    routes: []const Route,
+    /// Shared request behaviors executed before route dispatch.
+    middleware: []const Middleware,
+    /// Optional fallback handler for unmatched requests.
+    fallback: ?FallbackHandler,
+    /// Conflict policy for duplicate route identities.
+    ambiguity_policy: RouteAmbiguityPolicy,
+
+    /// Returns an empty route catalog with default validation policy.
+    pub fn empty() RouteCatalog {
+        return .{
+            .routes = &.{},
+            .middleware = &.{},
+            .fallback = null,
+            .ambiguity_policy = .reject_duplicates,
+        };
+    }
+
+    /// Validates duplicate route identities under the selected policy.
+    pub fn validate(self: RouteCatalog) ConfigError!void {
+        if (self.ambiguity_policy != .reject_duplicates) {
+            return;
+        }
+
+        for (self.routes, 0..) |route, index| {
+            for (self.routes[index + 1 ..]) |other| {
+                if (routeIdentityEquals(route, other)) {
+                    return error.InvalidRouteCatalog;
+                }
+            }
+        }
+    }
 };
 
 /// Public server configuration for the runtime and CLI.
@@ -89,6 +216,8 @@ pub const ServerConfig = struct {
     http2_enabled: bool,
     /// Runtime connection and parsing limits.
     connection_limits: ConnectionLimits,
+    /// Optional higher-level route catalog layered on top of the core handler.
+    router: ?RouteCatalog,
 
     /// Returns a loopback-friendly default configuration.
     pub fn init(handler: Handler) ServerConfig {
@@ -101,12 +230,21 @@ pub const ServerConfig = struct {
             .alpn = &default_alpn_protocols,
             .http2_enabled = false,
             .connection_limits = ConnectionLimits.default(),
+            .router = null,
         };
+    }
+
+    /// Returns the authoritative TLS configuration with routed ALPN ordering applied.
+    pub fn effectiveTlsConfig(self: ServerConfig) ?core.TlsConfig {
+        if (self.tls) |tls| {
+            return tls.withAlpnProtocols(self.alpn);
+        }
+        return null;
     }
 
     /// Validates the configuration before binding the listener.
     pub fn validate(self: ServerConfig) ConfigError!void {
-        if (self.tls) |tls| {
+        if (self.effectiveTlsConfig()) |tls| {
             try tls_config.validate(tls);
             if (tls.certificate_chain_path == null or tls.private_key_path == null) {
                 return error.MissingTlsIdentity;
@@ -120,6 +258,9 @@ pub const ServerConfig = struct {
             if (!supportsProtocol(self.alpn, .h2)) {
                 return error.InvalidHttp2Configuration;
             }
+        }
+        if (self.router) |router| {
+            try router.validate();
         }
     }
 };
@@ -142,6 +283,12 @@ pub const ServerRequest = struct {
     peer: std.net.Address,
     /// Negotiated protocol label for the connection.
     negotiated_protocol: core.NegotiatedProtocol,
+    /// Whether the accepted connection ran in secure-listener mode.
+    secure: bool,
+    /// Stable TLS identity token when secure-listener mode is active.
+    identity_token: ?core.TlsIdentityToken,
+    /// Negotiated-session metadata for the accepted connection.
+    session: NegotiatedSession,
     /// Owned host bytes backing `uri.host`.
     owned_host: []u8,
     /// Owned path bytes backing `uri.path`.
@@ -318,6 +465,12 @@ fn supportsProtocol(
     return false;
 }
 
+/// Returns true when two routes target the same exact method/path identity.
+fn routeIdentityEquals(a: Route, b: Route) bool {
+    return std.ascii.eqlIgnoreCase(a.method.asBytes(), b.method.asBytes()) and
+        std.mem.eql(u8, a.path, b.path);
+}
+
 test "server config requires a full tls identity for listener mode" {
     const noop = struct {
         fn handle(_: ?*anyopaque, _: *ServerRequest, _: *ServerResponseWriter) !void {}
@@ -339,4 +492,34 @@ test "server config rejects http2 without tls alpn" {
     config.http2_enabled = true;
 
     try std.testing.expectError(error.InvalidHttp2Configuration, config.validate());
+}
+
+test "route catalog rejects duplicate exact identities by default" {
+    const noop = struct {
+        fn handle(_: ?*anyopaque, _: *ServerRequest, _: *ServerResponseWriter) !void {}
+    };
+
+    const router = RouteCatalog{
+        .routes = &.{
+            .{
+                .name = "health-a",
+                .method = .get,
+                .path = "/health",
+                .handler = noop.handle,
+                .handler_context = null,
+            },
+            .{
+                .name = "health-b",
+                .method = .get,
+                .path = "/health",
+                .handler = noop.handle,
+                .handler_context = null,
+            },
+        },
+        .middleware = &.{},
+        .fallback = null,
+        .ambiguity_policy = .reject_duplicates,
+    };
+
+    try std.testing.expectError(error.InvalidRouteCatalog, router.validate());
 }

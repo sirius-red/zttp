@@ -60,6 +60,18 @@ pub const ServerConfig = server.ServerConfig;
 pub const ServerRequest = server.ServerRequest;
 /// Server response writer type.
 pub const ServerResponseWriter = server.ServerResponseWriter;
+/// Negotiated session metadata for one accepted server connection.
+pub const NegotiatedSession = server.NegotiatedSession;
+/// Higher-level exact route definition.
+pub const Route = server.Route;
+/// Shared request behavior definition.
+pub const Middleware = server.Middleware;
+/// Shared request behavior decision type.
+pub const MiddlewareDecision = server.MiddlewareDecision;
+/// Higher-level route catalog surface.
+pub const RouteCatalog = server.RouteCatalog;
+/// Optional fallback handler for unmatched routes.
+pub const FallbackHandler = server.FallbackHandler;
 /// Bound server runtime type.
 pub const ServerRuntime = server.Server;
 /// HTTP/3 module entrypoint.

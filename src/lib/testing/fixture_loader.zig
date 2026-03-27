@@ -121,6 +121,36 @@ pub const CommandCapture = struct {
     }
 };
 
+/// Owned loopback identity fixture paths for server-mode validation.
+pub const LoopbackIdentityPaths = struct {
+    /// Path to the loopback certificate chain fixture.
+    certificate_chain_path: []u8,
+    /// Path to the loopback private key fixture.
+    private_key_path: []u8,
+
+    /// Releases the owned fixture paths.
+    pub fn deinit(self: *LoopbackIdentityPaths, allocator: std.mem.Allocator) void {
+        allocator.free(self.certificate_chain_path);
+        allocator.free(self.private_key_path);
+        self.* = undefined;
+    }
+};
+
+/// Owned loopback identity fixture contents for server-mode validation.
+pub const LoopbackIdentity = struct {
+    /// Certificate chain fixture bytes.
+    certificate_chain: []u8,
+    /// Private key fixture bytes.
+    private_key: []u8,
+
+    /// Releases the owned fixture contents.
+    pub fn deinit(self: *LoopbackIdentity, allocator: std.mem.Allocator) void {
+        allocator.free(self.certificate_chain);
+        allocator.free(self.private_key);
+        self.* = undefined;
+    }
+};
+
 /// Reusable loader for local fixture files.
 pub const Loader = struct {
     /// Root path for all fixture files.
@@ -170,6 +200,28 @@ pub const Loader = struct {
     /// Loads an HTTP/3 fixture payload.
     pub fn loadHttp3Fixture(self: Loader, allocator: std.mem.Allocator, relative_path: []const u8) LoadError![]u8 {
         return try self.loadFromGroup(allocator, .http3, relative_path);
+    }
+
+    /// Returns the default loopback certificate and private-key fixture paths.
+    pub fn loopbackIdentityPaths(
+        self: Loader,
+        allocator: std.mem.Allocator,
+    ) LoadError!LoopbackIdentityPaths {
+        return .{
+            .certificate_chain_path = try self.pathFor(allocator, "certs/loopback-server.pem"),
+            .private_key_path = try self.pathFor(allocator, "certs/loopback-server.key"),
+        };
+    }
+
+    /// Loads the default loopback certificate and private-key fixtures.
+    pub fn loadLoopbackIdentity(
+        self: Loader,
+        allocator: std.mem.Allocator,
+    ) LoadError!LoopbackIdentity {
+        return .{
+            .certificate_chain = try self.loadCertificate(allocator, "loopback-server.pem"),
+            .private_key = try self.loadCertificate(allocator, "loopback-server.key"),
+        };
     }
 
     /// Builds an absolute or repository-relative path to a fixture.
@@ -271,6 +323,21 @@ test "fixture loader joins grouped paths" {
     try std.testing.expect(
         std.mem.endsWith(u8, full_path, "certs/loopback.pem") or
             std.mem.endsWith(u8, full_path, "certs\\loopback.pem"),
+    );
+}
+
+test "fixture loader resolves loopback identity fixture paths" {
+    const loader = Loader.init();
+    var paths = try loader.loopbackIdentityPaths(std.testing.allocator);
+    defer paths.deinit(std.testing.allocator);
+
+    try std.testing.expect(
+        std.mem.endsWith(u8, paths.certificate_chain_path, "certs/loopback-server.pem") or
+            std.mem.endsWith(u8, paths.certificate_chain_path, "certs\\loopback-server.pem"),
+    );
+    try std.testing.expect(
+        std.mem.endsWith(u8, paths.private_key_path, "certs/loopback-server.key") or
+            std.mem.endsWith(u8, paths.private_key_path, "certs\\loopback-server.key"),
     );
 }
 

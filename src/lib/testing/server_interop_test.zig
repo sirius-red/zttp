@@ -5,6 +5,7 @@ const server = @import("../server/server.zig");
 const types = @import("../types.zig");
 const socket_io = @import("../util/socket_io.zig");
 const interop_harness = @import("interop_harness.zig");
+const server_http2 = @import("../server/http2.zig");
 
 /// Declarative expectation for one server interop route.
 pub const RouteExpectation = struct {
@@ -106,6 +107,22 @@ fn runRawExchange(
     return response.toOwnedSlice(allocator);
 }
 
+/// Builds the secure interop server used by the loopback HTTPS and HTTP/2 tests.
+fn initSecureInteropServer() !server.Server {
+    var config = server.ServerConfig.init(interop_harness.handleServerRequest);
+    config.listen_host = "127.0.0.1";
+    config.port = types.Port.init(0);
+    config.http2_enabled = true;
+
+    var tls = types.TlsConfig.default();
+    tls.verify = .insecure;
+    tls.certificate_chain_path = "src/lib/testing/fixtures/certs/loopback-server.pem";
+    tls.private_key_path = "src/lib/testing/fixtures/certs/loopback-server.key";
+    config.tls = tls;
+
+    return server.Server.init(std.testing.allocator, config);
+}
+
 test "server interop catalog covers required contract routes" {
     try std.testing.expectEqual(@as(usize, 8), required_routes.len);
 
@@ -166,4 +183,28 @@ test "server interop preserves the windows loopback readiness round trip" {
 
     try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "HTTP/1.1 200 OK"));
     try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, readiness.expected_body_substring));
+}
+
+test "server interop secure listener serves the shared health route over h2" {
+    var runtime = try initSecureInteropServer();
+    defer runtime.deinit();
+    try runtime.start();
+
+    const request_bytes = try server_http2.encodeClientRequest(
+        std.testing.allocator,
+        .get,
+        "/health",
+        "127.0.0.1",
+        "",
+    );
+    defer std.testing.allocator.free(request_bytes);
+
+    const response_bytes = try runRawExchange(std.testing.allocator, runtime.port(), request_bytes);
+    defer std.testing.allocator.free(response_bytes);
+
+    var response = try server_http2.decodeServerResponse(std.testing.allocator, response_bytes);
+    defer response.deinit();
+
+    try std.testing.expectEqual(types.Status.ok, response.status);
+    try std.testing.expect(std.mem.containsAtLeast(u8, response.body, 1, "\"protocol\":\"h2\""));
 }

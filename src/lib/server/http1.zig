@@ -36,11 +36,33 @@ pub fn readRequest(
     negotiated_protocol: core.NegotiatedProtocol,
     limits: server_types.ConnectionLimits,
 ) (std.mem.Allocator.Error || std.net.Stream.ReadError || ParseError)!server_types.ServerRequest {
+    return readRequestPrefixed(
+        allocator,
+        stream,
+        &.{},
+        scheme,
+        peer,
+        negotiated_protocol,
+        limits,
+    );
+}
+
+/// Parses one HTTP/1.1 request, starting from an already-buffered prefix.
+pub fn readRequestPrefixed(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    prefix_bytes: []const u8,
+    scheme: core.Scheme,
+    peer: std.net.Address,
+    negotiated_protocol: core.NegotiatedProtocol,
+    limits: server_types.ConnectionLimits,
+) (std.mem.Allocator.Error || std.net.Stream.ReadError || ParseError)!server_types.ServerRequest {
     var head_bytes = std.ArrayListUnmanaged(u8){};
     defer head_bytes.deinit(allocator);
+    try head_bytes.appendSlice(allocator, prefix_bytes);
 
     var buffer: [1024]u8 = undefined;
-    var header_end: ?usize = null;
+    var header_end: ?usize = std.mem.indexOf(u8, head_bytes.items, "\r\n\r\n");
     while (header_end == null) {
         const read_len = try socket_io.read(stream, &buffer);
         if (read_len == 0) {
@@ -139,6 +161,16 @@ pub fn readRequest(
         .body = body,
         .peer = peer,
         .negotiated_protocol = negotiated_protocol,
+        .secure = scheme == .https,
+        .identity_token = null,
+        .session = .{
+            .peer = peer,
+            .identity_token = null,
+            .negotiated_protocol = negotiated_protocol,
+            .request_version = version,
+            .secure = scheme == .https,
+            .alive = true,
+        },
         .owned_host = owned_host,
         .owned_path = owned_path,
         .owned_query = owned_query,

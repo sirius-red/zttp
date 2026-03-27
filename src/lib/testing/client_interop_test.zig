@@ -1,6 +1,7 @@
 //! Client interop regression coverage tied to the shared harness contract.
 
 const std = @import("std");
+const fixture_loader = @import("fixture_loader.zig");
 const interop_harness = @import("interop_harness.zig");
 const smoke_runner = @import("smoke_runner.zig");
 
@@ -57,4 +58,19 @@ test "client interop preserves the windows loopback readiness probe contract" {
         1,
         "\"protocol\":\"http/1.1\"",
     ));
+}
+
+test "client interop loopback identities resolve to repository fixtures" {
+    const loader = fixture_loader.Loader.init();
+    var paths = try loader.loopbackIdentityPaths(std.testing.allocator);
+    defer paths.deinit(std.testing.allocator);
+
+    try std.testing.expect(
+        std.mem.endsWith(u8, paths.certificate_chain_path, "certs/loopback-server.pem") or
+            std.mem.endsWith(u8, paths.certificate_chain_path, "certs\\loopback-server.pem"),
+    );
+    try std.testing.expect(
+        std.mem.endsWith(u8, paths.private_key_path, "certs/loopback-server.key") or
+            std.mem.endsWith(u8, paths.private_key_path, "certs\\loopback-server.key"),
+    );
 }

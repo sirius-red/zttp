@@ -5,6 +5,7 @@ const server_types = @import("types.zig");
 const types = @import("../types.zig");
 const interop_harness = @import("../testing/interop_harness.zig");
 const runtime = @import("runtime.zig");
+const server_http2 = @import("http2.zig");
 const socket_io = @import("../util/socket_io.zig");
 
 /// HTTP/1.1 server behavior class covered by a regression scenario.
@@ -84,6 +85,75 @@ const regression_cases = [_]RegressionCase{
 fn initInteropServer() !runtime.Server {
     var config = server_types.ServerConfig.init(interop_harness.handleServerRequest);
     config.port = types.Port.init(0);
+
+    return runtime.Server.init(std.testing.allocator, config);
+}
+
+/// Initializes the shared interop-harness server in secure-listener mode.
+fn initSecureInteropServer() !runtime.Server {
+    var config = server_types.ServerConfig.init(interop_harness.handleServerRequest);
+    config.port = types.Port.init(0);
+    config.http2_enabled = true;
+
+    var tls = types.TlsConfig.default();
+    tls.verify = .insecure;
+    tls.certificate_chain_path = "src/lib/testing/fixtures/certs/loopback-server.pem";
+    tls.private_key_path = "src/lib/testing/fixtures/certs/loopback-server.key";
+    config.tls = tls;
+
+    return runtime.Server.init(std.testing.allocator, config);
+}
+
+/// Initializes the server with a first route catalog and shared middleware.
+fn initRoutedInteropServer() !runtime.Server {
+    const Routed = struct {
+        fn health(_: ?*anyopaque, request: *server_types.ServerRequest, writer: *server_types.ServerResponseWriter) !void {
+            try interop_harness.handleServerRequest(null, request, writer);
+        }
+
+        fn echo(_: ?*anyopaque, request: *server_types.ServerRequest, writer: *server_types.ServerResponseWriter) !void {
+            try interop_harness.handleServerRequest(null, request, writer);
+        }
+
+        fn middleware(
+            _: ?*anyopaque,
+            _: *server_types.ServerRequest,
+            writer: *server_types.ServerResponseWriter,
+        ) !server_types.MiddlewareDecision {
+            try writer.appendHeader("X-Shared-Behavior", "applied");
+            return .continue_processing;
+        }
+    };
+
+    var config = server_types.ServerConfig.init(interop_harness.handleServerRequest);
+    config.port = types.Port.init(0);
+    config.router = .{
+        .routes = &.{
+            .{
+                .name = "health",
+                .method = .get,
+                .path = "/health",
+                .handler = Routed.health,
+                .handler_context = null,
+            },
+            .{
+                .name = "echo",
+                .method = .get,
+                .path = "/echo",
+                .handler = Routed.echo,
+                .handler_context = null,
+            },
+        },
+        .middleware = &.{
+            .{
+                .name = "shared-behavior",
+                .context = null,
+                .handler = Routed.middleware,
+            },
+        },
+        .fallback = null,
+        .ambiguity_policy = .reject_duplicates,
+    };
 
     return runtime.Server.init(std.testing.allocator, config);
 }
@@ -210,4 +280,80 @@ test "server runtime rejects truncated request bodies" {
 
     try std.testing.expect(!std.mem.containsAtLeast(u8, response, 1, "HTTP/1.1 200 OK"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, response, 1, "\"body_size\":3"));
+}
+
+test "secure server runtime preserves http1 compatibility on the loopback listener" {
+    var server = try initSecureInteropServer();
+    defer server.deinit();
+    try server.start();
+
+    const response = try runRawExchange(
+        std.testing.allocator,
+        server.port(),
+        &.{
+            "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        },
+    );
+    defer std.testing.allocator.free(response);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "HTTP/1.1 200 OK"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "\"protocol\":\"http/1.1\""));
+}
+
+test "secure server runtime answers a minimal negotiated h2 request" {
+    var server = try initSecureInteropServer();
+    defer server.deinit();
+    try server.start();
+
+    const request_bytes = try server_http2.encodeClientRequest(
+        std.testing.allocator,
+        .get,
+        "/health",
+        "127.0.0.1",
+        "",
+    );
+    defer std.testing.allocator.free(request_bytes);
+
+    const response_bytes = try runRawExchange(
+        std.testing.allocator,
+        server.port(),
+        &.{request_bytes},
+    );
+    defer std.testing.allocator.free(response_bytes);
+
+    var response = try server_http2.decodeServerResponse(std.testing.allocator, response_bytes);
+    defer response.deinit();
+
+    try std.testing.expectEqual(types.Status.ok, response.status);
+    try std.testing.expect(std.mem.containsAtLeast(u8, response.body, 1, "\"protocol\":\"h2\""));
+}
+
+test "route catalog applies shared middleware and default 404 fallback" {
+    var server = try initRoutedInteropServer();
+    defer server.deinit();
+    try server.start();
+
+    const health_response = try runRawExchange(
+        std.testing.allocator,
+        server.port(),
+        &.{
+            "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        },
+    );
+    defer std.testing.allocator.free(health_response);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, health_response, 1, "X-Shared-Behavior: applied"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, health_response, 1, "HTTP/1.1 200 OK"));
+
+    const missing_response = try runRawExchange(
+        std.testing.allocator,
+        server.port(),
+        &.{
+            "GET /missing HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        },
+    );
+    defer std.testing.allocator.free(missing_response);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, missing_response, 1, "HTTP/1.1 404 Not Found"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, missing_response, 1, "{\"error\":\"not_found\"}"));
 }

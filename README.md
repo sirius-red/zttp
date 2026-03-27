@@ -113,12 +113,13 @@ What is next:
 
 - [ ] Continue hardening TLS and ALPN behavior around broader client and server interoperability edges.
 - [ ] Deliver full public HTTP/2 client support, not just low-level protocol pieces.
-- [ ] Expand server support with real TLS listener support and minimal end-to-end HTTP/2 serving.
+- [X] Expand server support with loopback secure-listener semantics, ALPN dispatch, and minimal end-to-end HTTP/2 serving.
+- [X] Add first higher-level server ergonomics on top of the core runtime, including exact routing, shared middleware, and fallback handling.
 - [ ] Move HTTP/3 beyond local harness flows into real networked runtime support where practical.
 
 Longer-term goals:
 
-- [ ] Add higher-level server features on top of the core runtime, including routing, middleware, static files, and compression.
+- [ ] Expand higher-level server features further with static files, compression, and broader framework conveniences.
 - [ ] Add higher-level client conveniences such as multipart/form-data helpers, retries, caching, and automatic decompression.
 - [ ] Add WebSocket support.
 - [ ] Bring HTTP/2 and HTTP/3 interoperability and production hardening closer to the maturity of the current HTTP/1.1 path.
