@@ -72,6 +72,16 @@ pub const MiddlewareDecision = server.MiddlewareDecision;
 pub const RouteCatalog = server.RouteCatalog;
 /// Optional fallback handler for unmatched routes.
 pub const FallbackHandler = server.FallbackHandler;
+/// HTTP/3 UDP listener configuration type.
+pub const Http3ListenerConfig = server.Http3ListenerConfig;
+/// HTTP/3 session-limit configuration type.
+pub const Http3SessionLimits = server.Http3SessionLimits;
+/// HTTP/3 QPACK-limit configuration type.
+pub const Http3QpackLimits = server.Http3QpackLimits;
+/// HTTP/3 runtime failure category surfaced by the server path.
+pub const Http3FailureCategory = server.Http3FailureCategory;
+/// Bound HTTP/3 UDP runtime type.
+pub const Http3Runtime = server.Http3Runtime;
 /// Bound server runtime type.
 pub const ServerRuntime = server.Server;
 /// HTTP/3 module entrypoint.

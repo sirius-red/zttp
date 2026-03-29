@@ -12,6 +12,7 @@ const request_encoder = @import("http1/request_encoder.zig");
 const redirects = @import("redirects/redirects.zig");
 const cookies = @import("cookies/cookie_jar.zig");
 const proxy_env = @import("proxy/proxy_env.zig");
+const http3_client = @import("http3/client.zig");
 const interop_harness = @import("testing/interop_harness.zig");
 
 /// Typed client errors.
@@ -835,6 +836,32 @@ const RequestState = struct {
         };
     }
 
+    /// Initializes a request state for protocol paths that do not use the shared pool.
+    fn initWithoutLease(
+        allocator: std.mem.Allocator,
+        client: *Client,
+        request_value: *const types.Request,
+        owned_request: ?*types.Request,
+        follow_redirects: bool,
+        request_options: RequestOptions,
+    ) RequestState {
+        return .{
+            .allocator = allocator,
+            .mutex = .{},
+            .client = client,
+            .request = request_value,
+            .owned_request = owned_request,
+            .follow_redirects = follow_redirects,
+            .request_options = request_options,
+            .start_ns = std.time.nanoTimestamp(),
+            .cancel_token = CancellationToken.init(),
+            .pool = &client.pool,
+            .lease = null,
+            .future = connection_h1.ResponseFuture.init(),
+            .completed = false,
+        };
+    }
+
     /// Waits for completion and attaches response cleanup hooks.
     fn wait(self: *RequestState) ResponseFuture.WaitError!types.Response {
         return self.waitInternal(null);
@@ -1054,7 +1081,7 @@ const RequestState = struct {
         var response = response_value;
         try self.storeCookies(request_uri, &response);
         if (response.body) |body_reader| {
-            if (self.lease == null and response.version == .http_2) {
+            if (self.lease == null and (response.version == .http_2 or response.version == .http_3)) {
                 self.completed = true;
                 return response;
             }
@@ -1365,6 +1392,23 @@ fn mapSubmitError(err: connection_h1.SubmitError) Error {
     };
 }
 
+/// Maps HTTP/3 runtime request failures into the request-future error surface.
+fn mapHttp3ClientError(err: anyerror) connection_h1.ResponseFuture.WaitError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidScheme => error.InvalidUri,
+        error.Canceled => error.Canceled,
+        error.Timeout,
+        error.ConnectionTimedOut,
+        => error.Timeout,
+        error.ConnectionRefused,
+        error.NetworkUnreachable,
+        error.ConnectionResetByPeer,
+        => error.Transport,
+        else => error.Protocol,
+    };
+}
+
 /// Maps connection wait errors into client-visible errors.
 fn mapConnectionWaitError(err: connection_h1.ResponseFuture.WaitError) ResponseFuture.WaitError {
     return switch (err) {
@@ -1423,6 +1467,9 @@ pub const Client = struct {
         follow_redirects: bool,
         request_options: RequestOptions,
     ) Error!RequestHandle {
+        if (request_value.version == .http_3) {
+            return self.requestHttp3Runtime(request_value, follow_redirects, request_options);
+        }
         try self.validateOptions();
         const proxy_config = request_options.proxy orelse self.options.proxy;
         try self.validateProxyConfig(proxy_config);
@@ -1473,6 +1520,38 @@ pub const Client = struct {
 
         cleanup = false;
         cleanup_prepared = false;
+        return .{ .state = state };
+    }
+
+    /// Executes an HTTP/3 request over the UDP-backed runtime path.
+    fn requestHttp3Runtime(
+        self: *Client,
+        request_value: *const types.Request,
+        follow_redirects: bool,
+        request_options: RequestOptions,
+    ) Error!RequestHandle {
+        if (request_value.uri.scheme != .https) {
+            return error.InvalidUri;
+        }
+
+        const state = self.allocator.create(RequestState) catch {
+            return error.OutOfMemory;
+        };
+        errdefer self.allocator.destroy(state);
+        state.* = RequestState.initWithoutLease(
+            self.allocator,
+            self,
+            request_value,
+            null,
+            follow_redirects,
+            request_options,
+        );
+
+        const response = http3_client.executeRuntimeRequest(self.allocator, request_value) catch |err| {
+            _ = state.future.complete(mapHttp3ClientError(err));
+            return .{ .state = state };
+        };
+        _ = state.future.complete(response);
         return .{ .state = state };
     }
 

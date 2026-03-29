@@ -64,12 +64,84 @@ pub const ConnectionLimits = struct {
     }
 };
 
+/// Maximum per-session stream counts admitted by the HTTP/3 runtime.
+pub const Http3SessionLimits = struct {
+    /// Maximum simultaneous QUIC sessions on one bound listener.
+    max_sessions: core.ConnectionCount,
+    /// Maximum active request streams admitted on one session.
+    max_streams_per_session: core.ConnectionCount,
+
+    /// Returns the default loopback-oriented HTTP/3 session limits.
+    pub fn default() Http3SessionLimits {
+        return .{
+            .max_sessions = core.ConnectionCount.init(8),
+            .max_streams_per_session = core.ConnectionCount.init(8),
+        };
+    }
+};
+
+/// QPACK limits surfaced through the HTTP/3 listener configuration.
+pub const Http3QpackLimits = struct {
+    /// Maximum dynamic-table capacity retained per peer.
+    dynamic_table_capacity: core.ByteSize,
+    /// Maximum number of blocked streams admitted before decode fails.
+    blocked_streams: core.ConnectionCount,
+
+    /// Returns the default local HTTP/3 QPACK limits.
+    pub fn default() Http3QpackLimits {
+        return .{
+            .dynamic_table_capacity = core.ByteSize.fromKib(4),
+            .blocked_streams = core.ConnectionCount.init(8),
+        };
+    }
+};
+
+/// Typed HTTP/3 listener configuration owned by the canonical server runtime.
+pub const Http3ListenerConfig = struct {
+    /// Host or IPv4 literal bound by the UDP listener.
+    listen_host: []const u8,
+    /// UDP port bound by the listener.
+    port: core.Port,
+    /// Maximum protected datagram payload size.
+    max_datagram_size: core.ByteSize,
+    /// Per-listener session and stream admission limits.
+    session_limits: Http3SessionLimits,
+    /// Per-peer QPACK capacity and blocked-stream limits.
+    qpack_limits: Http3QpackLimits,
+
+    /// Returns a loopback-friendly default HTTP/3 listener configuration.
+    pub fn init() Http3ListenerConfig {
+        return .{
+            .listen_host = "127.0.0.1",
+            .port = core.Port.init(4433),
+            .max_datagram_size = core.ByteSize.fromBytes(1200),
+            .session_limits = Http3SessionLimits.default(),
+            .qpack_limits = Http3QpackLimits.default(),
+        };
+    }
+
+    /// Validates the configured datagram and admission limits.
+    pub fn validate(self: Http3ListenerConfig) !void {
+        if (self.max_datagram_size.toInt() < 256) {
+            return error.InvalidHttp3Configuration;
+        }
+        if (self.session_limits.max_sessions.toInt() == 0) {
+            return error.InvalidHttp3Configuration;
+        }
+        if (self.session_limits.max_streams_per_session.toInt() == 0) {
+            return error.InvalidHttp3Configuration;
+        }
+    }
+};
+
 /// Error set returned by server configuration validation.
 pub const ConfigError = tls_config.ValidationError || error{
     /// TLS listener mode requires both a certificate chain and private key.
     MissingTlsIdentity,
     /// HTTP/2 requires TLS ALPN advertising in this runtime.
     InvalidHttp2Configuration,
+    /// HTTP/3 requires valid listener, datagram, and admission settings.
+    InvalidHttp3Configuration,
     /// The higher-level route catalog contains an invalid exact duplicate.
     InvalidRouteCatalog,
 };
@@ -91,6 +163,20 @@ pub const Http2FailureCategory = enum {
     malformed_frame,
     /// The peer requested an unsupported HTTP/2 exchange shape.
     unsupported_exchange,
+};
+
+/// Distinct failure category surfaced by the HTTP/3 runtime bridge.
+pub const Http3FailureCategory = enum {
+    /// Listener startup or bind failed before serving requests.
+    startup,
+    /// Datagram transport or packet protection failed.
+    transport,
+    /// Session establishment or stream admission failed.
+    session,
+    /// QPACK or control-stream state was invalid.
+    compression,
+    /// Route dispatch failed after transport setup succeeded.
+    route,
 };
 
 /// Typed negotiated session metadata for one accepted server connection.
@@ -214,6 +300,8 @@ pub const ServerConfig = struct {
     alpn: []const core.NegotiatedProtocol,
     /// Enables minimal HTTP/2 negotiation planning.
     http2_enabled: bool,
+    /// Optional HTTP/3 UDP listener configuration.
+    http3: ?Http3ListenerConfig,
     /// Runtime connection and parsing limits.
     connection_limits: ConnectionLimits,
     /// Optional higher-level route catalog layered on top of the core handler.
@@ -229,6 +317,7 @@ pub const ServerConfig = struct {
             .tls = null,
             .alpn = &default_alpn_protocols,
             .http2_enabled = false,
+            .http3 = null,
             .connection_limits = ConnectionLimits.default(),
             .router = null,
         };
@@ -258,6 +347,9 @@ pub const ServerConfig = struct {
             if (!supportsProtocol(self.alpn, .h2)) {
                 return error.InvalidHttp2Configuration;
             }
+        }
+        if (self.http3) |http3| {
+            try http3.validate();
         }
         if (self.router) |router| {
             try router.validate();

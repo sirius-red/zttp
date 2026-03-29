@@ -7,6 +7,7 @@ const interop_harness = @import("../testing/interop_harness.zig");
 const server_types = @import("types.zig");
 const http1 = @import("http1.zig");
 const http2 = @import("http2.zig");
+const http3 = @import("http3.zig");
 const socket_io = @import("../util/socket_io.zig");
 
 /// Error set returned by server startup and serving operations.
@@ -28,6 +29,8 @@ pub const Server = struct {
     active_connections: std.atomic.Value(usize),
     /// Secure listener plan when TLS listener mode is configured.
     secure_listener_plan: ?server_types.SecureListenerPlan,
+    /// Optional HTTP/3 UDP runtime bound alongside the TCP listener.
+    http3_runtime: ?http3.Runtime,
 
     /// Binds a server to the configured listen address.
     pub fn init(allocator: std.mem.Allocator, config: server_types.ServerConfig) Error!Server {
@@ -51,6 +54,7 @@ pub const Server = struct {
             .stop_requested = std.atomic.Value(bool).init(false),
             .active_connections = std.atomic.Value(usize).init(0),
             .secure_listener_plan = secure_listener_plan,
+            .http3_runtime = if (config.http3 != null) try http3.Runtime.init(allocator, config) else null,
         };
     }
 
@@ -59,11 +63,19 @@ pub const Server = struct {
         if (self.thread != null) {
             return error.AlreadyStarted;
         }
+        if (self.http3_runtime) |*http3_runtime| {
+            try http3_runtime.start();
+        }
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
     /// Runs the accept loop on the current thread until stopped.
     pub fn serve(self: *Server) Error!void {
+        if (self.http3_runtime) |*http3_runtime| {
+            if (http3_runtime.thread == null) {
+                try http3_runtime.start();
+            }
+        }
         while (!self.stop_requested.load(.seq_cst)) {
             if (self.listener == null) {
                 return;
@@ -92,6 +104,14 @@ pub const Server = struct {
         return self.address().getPort();
     }
 
+    /// Returns the bound UDP HTTP/3 port when the runtime is enabled.
+    pub fn http3Port(self: *const Server) ?u16 {
+        if (self.http3_runtime) |http3_runtime| {
+            return http3_runtime.port();
+        }
+        return null;
+    }
+
     /// Requests the accept loop to stop and wakes a blocked listener, if needed.
     pub fn requestStop(self: *Server) void {
         if (self.stop_requested.swap(true, .seq_cst)) {
@@ -103,6 +123,9 @@ pub const Server = struct {
             if (wake_stream) |*stream| {
                 stream.close();
             }
+        }
+        if (self.http3_runtime) |*http3_runtime| {
+            http3_runtime.requestStop();
         }
     }
 
@@ -116,6 +139,10 @@ pub const Server = struct {
         if (self.listener) |*listener| {
             listener.deinit();
             self.listener = null;
+        }
+        if (self.http3_runtime) |*http3_runtime| {
+            http3_runtime.deinit();
+            self.http3_runtime = null;
         }
         self.* = undefined;
     }

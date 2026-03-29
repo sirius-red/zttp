@@ -357,3 +357,17 @@ test "route catalog applies shared middleware and default 404 fallback" {
     try std.testing.expect(std.mem.containsAtLeast(u8, missing_response, 1, "HTTP/1.1 404 Not Found"));
     try std.testing.expect(std.mem.containsAtLeast(u8, missing_response, 1, "{\"error\":\"not_found\"}"));
 }
+
+test "server runtime exposes the bound http3 port when enabled" {
+    var config = server_types.ServerConfig.init(interop_harness.handleServerRequest);
+    config.port = types.Port.init(0);
+    var http3_config = server_types.Http3ListenerConfig.init();
+    http3_config.port = types.Port.init(0);
+    config.http3 = http3_config;
+
+    var server = try runtime.Server.init(std.testing.allocator, config);
+    defer server.deinit();
+
+    try std.testing.expect(server.http3Port() != null);
+    try std.testing.expect(server.http3Port().? != 0);
+}

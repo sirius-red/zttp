@@ -44,7 +44,7 @@ const request_help =
 /// Extra help text for HTTP/3-enabled request builds.
 const request_help_http3 =
     \\  Experimental:
-    \\      --http3             Use the local in-process HTTP/3 harness flow
+    \\      --http3             Use the local UDP-backed HTTP/3 runtime path
     \\
 ;
 
@@ -68,7 +68,7 @@ const server_help =
 /// Extra help text for HTTP/3-enabled server builds.
 const server_help_http3 =
     \\  Experimental:
-    \\      --http3             Print the UDP HTTP/3 harness endpoint metadata
+    \\      --http3             Enable the UDP-backed HTTP/3 runtime on the same library-owned server
     \\
 ;
 
@@ -174,14 +174,6 @@ const Cli = struct {
             };
         }
 
-        if (request_args.http3) {
-            var response = try zttp.Http3.Client.executeHarnessRequest(self.allocator, &request);
-            defer response.deinit();
-            defer if (response.body) |body_reader| body_reader.close();
-            try self.printResponse(&response);
-            return;
-        }
-
         var client = zttp.Client.init(self.allocator, client_options);
         defer client.deinit();
 
@@ -212,27 +204,21 @@ const Cli = struct {
             return error.InvalidArguments;
         };
 
-        if (server_args.http3) {
-            const http3_server = zttp.Http3.Server.init(self.allocator, .{
-                .host = server_args.listen,
-                .port = zttp.Port.init(server_args.port),
-            });
-            const endpoint = http3_server.endpoint();
-            try self.printErr("http3 harness endpoint udp://{s}:{d}\n", .{
-                endpoint.host,
-                endpoint.port.toInt(),
-            });
-            return;
-        }
-
         const config = try buildServerConfig(server_args);
         var server = try zttp.ServerRuntime.init(self.allocator, config);
         defer server.deinit();
 
-        try self.printErr("listening on {s}:{d}\n", .{
-            server_args.listen,
-            server.port(),
-        });
+        if (server_args.http3) {
+            try self.printErr("listening on udp://{s}:{d}\n", .{
+                server_args.listen,
+                server.http3Port() orelse server_args.port,
+            });
+        } else {
+            try self.printErr("listening on {s}:{d}\n", .{
+                server_args.listen,
+                server.port(),
+            });
+        }
         try server.serve();
     }
 
@@ -242,6 +228,12 @@ const Cli = struct {
         config.listen_host = server_args.listen;
         config.port = zttp.Port.init(server_args.port);
         config.http2_enabled = server_args.http2;
+        if (server_args.http3) {
+            var http3 = zttp.Http3ListenerConfig.init();
+            http3.listen_host = server_args.listen;
+            http3.port = zttp.Port.init(server_args.port);
+            config.http3 = http3;
+        }
 
         if (server_args.tls_cert != null or server_args.tls_key != null) {
             var tls = zttp.TlsConfig.default();

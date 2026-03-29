@@ -1,5 +1,6 @@
 //! HTTP/3 client request flow for local harness interoperability.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const types = @import("../types.zig");
 const qpack = @import("qpack.zig");
@@ -7,16 +8,7 @@ const quic = @import("quic.zig");
 const server = @import("server.zig");
 
 /// Error set returned by the local HTTP/3 client helpers.
-pub const Error = quic.Error || qpack.Error || server.Error || error{
-    /// HTTP/3 is only supported for HTTPS-style requests in this scaffold.
-    InvalidScheme,
-    /// The request body reader surfaced an unexpected failure.
-    BodyReadFailed,
-    /// The request body exceeded the local harness buffering limit.
-    RequestBodyTooLarge,
-    /// The response omitted the required `:status` pseudo-header.
-    MissingStatus,
-};
+pub const Error = anyerror;
 
 /// Prepared HTTP/3 request metadata and encoded header block.
 pub const RequestPlan = struct {
@@ -146,6 +138,101 @@ pub fn executeHarnessRequest(
     return try decodeResponse(allocator, &client_conn, response_packet);
 }
 
+/// Reusable UDP-backed HTTP/3 client session for local loopback exchanges.
+pub const RuntimeSession = struct {
+    /// Allocator used for connection and response storage.
+    allocator: std.mem.Allocator,
+    /// Connected UDP socket for the peer listener.
+    socket: std.posix.socket_t,
+    /// QUIC transport state retained across repeated exchanges.
+    connection: quic.Connection,
+    /// Connection-scoped QPACK state retained across repeated exchanges.
+    qpack_state: qpack.PeerState,
+
+    /// Connects a new loopback HTTP/3 runtime session.
+    pub fn init(
+        allocator: std.mem.Allocator,
+        host: []const u8,
+        port: types.Port,
+    ) Error!RuntimeSession {
+        const peer = try std.net.Address.parseIp(host, port.toInt());
+        const socket = try std.posix.socket(
+            peer.any.family,
+            std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC,
+            std.posix.IPPROTO.UDP,
+        );
+        errdefer std.posix.close(socket);
+
+        var local = try std.net.Address.parseIp("127.0.0.1", 0);
+        try std.posix.bind(socket, &local.any, local.getOsSockLen());
+        try std.posix.connect(socket, &peer.any, peer.getOsSockLen());
+
+        var connection = quic.Connection.init(
+            allocator,
+            deriveClientConnectionId(host, port),
+            "server01".*,
+        );
+        connection.beginHandshake();
+        connection.establish();
+
+        return .{
+            .allocator = allocator,
+            .socket = socket,
+            .connection = connection,
+            .qpack_state = qpack.PeerState.init(allocator, 4 * 1024, 8),
+        };
+    }
+
+    /// Releases the connected UDP socket and retained session state.
+    pub fn deinit(self: *RuntimeSession) void {
+        std.posix.close(self.socket);
+        self.connection.deinit();
+        self.qpack_state.deinit();
+        self.* = undefined;
+    }
+
+    /// Executes one HTTP/3 request against the connected runtime.
+    pub fn executeRequest(self: *RuntimeSession, request: *const types.Request) Error!types.Response {
+        var plan = try prepareRuntimeRequest(
+            self.allocator,
+            &self.connection,
+            &self.qpack_state,
+            request,
+        );
+        defer plan.deinit();
+
+        const request_payload = try encodeRequest(self.allocator, plan);
+        defer self.allocator.free(request_payload);
+        const request_packet = try self.connection.protectPacket(
+            self.allocator,
+            .application,
+            request_payload,
+        );
+        defer self.allocator.free(request_packet);
+
+        _ = try sendConnected(self.socket, request_packet);
+
+        var buffer: [64 * 1024]u8 = undefined;
+        const read_len = try recvConnected(self.socket, buffer[0..]);
+        return try decodeResponseWithPeerState(
+            self.allocator,
+            &self.connection,
+            &self.qpack_state,
+            buffer[0..read_len],
+        );
+    }
+};
+
+/// Executes one local loopback request against the real UDP-backed HTTP/3 runtime.
+pub fn executeRuntimeRequest(
+    allocator: std.mem.Allocator,
+    request: *const types.Request,
+) Error!types.Response {
+    var session = try RuntimeSession.init(allocator, request.uri.host, request.uri.effectivePort());
+    defer session.deinit();
+    return try session.executeRequest(request);
+}
+
 /// Decodes a protected HTTP/3 response packet into the shared response type.
 pub fn decodeResponse(
     allocator: std.mem.Allocator,
@@ -197,6 +284,60 @@ pub fn decodeResponse(
     }
     _ = connection.acknowledge(.application, packet.number);
 
+    return response;
+}
+
+/// Decodes a protected HTTP/3 response packet using connection-scoped QPACK state.
+pub fn decodeResponseWithPeerState(
+    allocator: std.mem.Allocator,
+    connection: *quic.Connection,
+    qpack_state: *qpack.PeerState,
+    packet_bytes: []const u8,
+) Error!types.Response {
+    var packet = try connection.unprotectPacket(allocator, packet_bytes);
+    defer packet.deinit(allocator);
+
+    const frames = try qpack.decodeFrames(allocator, packet.payload);
+    defer qpack.freeFrames(allocator, frames);
+
+    var status: ?types.Status = null;
+    var response = types.Response.init(allocator, .http_3, .ok);
+    errdefer response.deinit();
+    var body = std.ArrayListUnmanaged(u8){};
+    errdefer body.deinit(allocator);
+
+    for (frames) |frame| {
+        switch (frame.frame_type) {
+            .headers => {
+                const headers = try qpack_state.decodeHeaders(frame.payload);
+                defer qpack.freeHeaderFields(allocator, headers);
+
+                for (headers) |header| {
+                    if (std.mem.eql(u8, header.name, ":status")) {
+                        const status_code = std.fmt.parseInt(u16, header.value, 10) catch {
+                            return error.InvalidStatus;
+                        };
+                        status = types.Status.fromInt(status_code);
+                        continue;
+                    }
+                    try response.headers.append(header.name, header.value);
+                }
+            },
+            .data => try body.appendSlice(allocator, frame.payload),
+            else => {},
+        }
+    }
+
+    response.status = status orelse return error.MissingStatus;
+    if (body.items.len > 0) {
+        const owned_body = try body.toOwnedSlice(allocator);
+        response.body = .{
+            .ctx = try makeBodyState(allocator, owned_body),
+            .read_fn = OwnedBody.read,
+            .close_fn = OwnedBody.close,
+        };
+    }
+    _ = connection.acknowledge(.application, packet.number);
     return response;
 }
 
@@ -264,6 +405,126 @@ fn readBodyAlloc(
     }
 
     return collected.toOwnedSlice(allocator);
+}
+
+/// Prepares an HTTP/3 request while retaining connection-scoped QPACK state.
+fn prepareRuntimeRequest(
+    allocator: std.mem.Allocator,
+    connection: *quic.Connection,
+    qpack_state: *qpack.PeerState,
+    request: *const types.Request,
+) Error!RequestPlan {
+    if (request.uri.scheme != .https) {
+        return error.InvalidScheme;
+    }
+
+    var headers = std.ArrayListUnmanaged(qpack.HeaderField){};
+    defer {
+        for (headers.items) |*header| {
+            header.deinit(allocator);
+        }
+        headers.deinit(allocator);
+    }
+
+    const authority = if (request.uri.port) |port|
+        try std.fmt.allocPrint(allocator, "{s}:{d}", .{ request.uri.host, port.toInt() })
+    else
+        try allocator.dupe(u8, request.uri.host);
+    defer allocator.free(authority);
+
+    const path = if (request.uri.query) |query|
+        try std.fmt.allocPrint(allocator, "{s}?{s}", .{ request.uri.path, query })
+    else
+        try allocator.dupe(u8, request.uri.path);
+    defer allocator.free(path);
+
+    try appendOwnedHeader(allocator, &headers, ":method", request.method.asBytes());
+    try appendOwnedHeader(allocator, &headers, ":scheme", request.uri.scheme.asBytes());
+    try appendOwnedHeader(allocator, &headers, ":authority", authority);
+    try appendOwnedHeader(allocator, &headers, ":path", path);
+
+    var iter = request.headers.iterator();
+    while (iter.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "host")) {
+            continue;
+        }
+        try appendOwnedHeader(allocator, &headers, header.name, header.value);
+    }
+
+    const header_block = try qpack_state.encodeHeaders(headers.items);
+    errdefer allocator.free(header_block);
+    const body = if (request.body) |body_reader|
+        try readBodyAlloc(allocator, body_reader, 256 * 1024)
+    else
+        try allocator.alloc(u8, 0);
+    errdefer allocator.free(body);
+
+    return .{
+        .allocator = allocator,
+        .stream_id = try connection.openStream(.bidirectional),
+        .header_block = header_block,
+        .body = body,
+    };
+}
+
+/// Derives a stable client connection identifier from the loopback target.
+fn deriveClientConnectionId(host: []const u8, port: types.Port) quic.ConnectionId {
+    var id: quic.ConnectionId = undefined;
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(host);
+    const port_bytes = std.mem.toBytes(port.toInt());
+    hasher.update(&port_bytes);
+    const hash = std.mem.toBytes(hasher.final());
+    std.mem.copyForwards(u8, id[0..], hash[0..id.len]);
+    return id;
+}
+
+/// Sends one datagram on a connected UDP socket.
+fn sendConnected(socket: std.posix.socket_t, bytes: []const u8) !usize {
+    if (builtin.os.tag == .windows) {
+        switch (std.os.windows.ws2_32.send(
+            socket,
+            bytes.ptr,
+            @intCast(bytes.len),
+            0,
+        )) {
+            std.os.windows.ws2_32.SOCKET_ERROR => switch (std.os.windows.ws2_32.WSAGetLastError()) {
+                .WSAECONNRESET => return error.ConnectionResetByPeer,
+                .WSAEMSGSIZE => return error.MessageTooBig,
+                .WSAENETUNREACH, .WSAEHOSTUNREACH => return error.NetworkUnreachable,
+                .WSAEWOULDBLOCK => return error.WouldBlock,
+                else => |err| return std.os.windows.unexpectedWSAError(err),
+            },
+            else => |written| return @intCast(written),
+        }
+    }
+
+    return std.posix.send(socket, bytes, 0);
+}
+
+/// Receives one datagram on a connected UDP socket.
+fn recvConnected(socket: std.posix.socket_t, buffer: []u8) !usize {
+    if (builtin.os.tag == .windows) {
+        switch (std.os.windows.ws2_32.recv(
+            socket,
+            buffer.ptr,
+            @intCast(buffer.len),
+            0,
+        )) {
+            std.os.windows.ws2_32.SOCKET_ERROR => switch (std.os.windows.ws2_32.WSAGetLastError()) {
+                .WSAECONNRESET => return error.ConnectionResetByPeer,
+                .WSAEMSGSIZE => return error.MessageTooBig,
+                .WSAENETDOWN => return error.NetworkSubsystemFailed,
+                .WSAENOTCONN => return error.SocketNotConnected,
+                .WSAEWOULDBLOCK => return error.WouldBlock,
+                .WSAETIMEDOUT => return error.ConnectionTimedOut,
+                else => |err| return std.os.windows.unexpectedWSAError(err),
+            },
+            else => |read_len| return @intCast(read_len),
+        }
+    }
+
+    return std.posix.recv(socket, buffer, 0);
 }
 
 /// Appends one owned header field to the provided list.

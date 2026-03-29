@@ -8,6 +8,10 @@ pub const Error = std.mem.Allocator.Error || error{
     UnexpectedEof,
     /// The encoded varint exceeded the supported size for this module.
     InvalidVarInt,
+    /// A control or instruction stream contained an unsupported instruction.
+    MalformedInstruction,
+    /// The peer exceeded the configured blocked-stream limit.
+    BlockedStreamsExceeded,
 };
 
 /// One QPACK header field.
@@ -94,6 +98,138 @@ pub const DynamicTable = struct {
         while (self.entries.items.len > self.capacity) {
             var removed = self.entries.orderedRemove(0);
             removed.deinit(self.allocator);
+        }
+    }
+};
+
+/// Encoder-side control stream state for one QPACK peer.
+pub const EncoderStream = struct {
+    /// Stable encoder stream identifier, when one exists.
+    stream_id: ?u64 = null,
+    /// Number of inserts emitted on the stream.
+    insert_count: usize = 0,
+};
+
+/// Decoder-side control stream state for one QPACK peer.
+pub const DecoderStream = struct {
+    /// Stable decoder stream identifier, when one exists.
+    stream_id: ?u64 = null,
+    /// Highest insert count acknowledged by the peer.
+    acknowledged_insert_count: usize = 0,
+};
+
+/// Connection-scoped QPACK state retained across repeated exchanges.
+pub const PeerState = struct {
+    /// Encoder-side dynamic table.
+    encoder_table: DynamicTable,
+    /// Decoder-side dynamic table.
+    decoder_table: DynamicTable,
+    /// Maximum blocked streams admitted before decode fails.
+    blocked_stream_limit: usize,
+    /// Number of streams currently blocked on unseen inserts.
+    blocked_streams: usize,
+    /// Encoder stream state for the peer.
+    encoder_stream: EncoderStream,
+    /// Decoder stream state for the peer.
+    decoder_stream: DecoderStream,
+
+    /// Returns an empty peer state for the provided capacity and stream limit.
+    pub fn init(
+        allocator: std.mem.Allocator,
+        table_capacity: usize,
+        blocked_stream_limit: usize,
+    ) PeerState {
+        return .{
+            .encoder_table = DynamicTable.init(allocator, table_capacity),
+            .decoder_table = DynamicTable.init(allocator, table_capacity),
+            .blocked_stream_limit = blocked_stream_limit,
+            .blocked_streams = 0,
+            .encoder_stream = .{},
+            .decoder_stream = .{},
+        };
+    }
+
+    /// Releases the retained QPACK state.
+    pub fn deinit(self: *PeerState) void {
+        self.encoder_table.deinit();
+        self.decoder_table.deinit();
+        self.* = undefined;
+    }
+
+    /// Encodes headers while retaining connection-scoped dynamic-table state.
+    pub fn encodeHeaders(self: *PeerState, headers: []const HeaderField) Error![]u8 {
+        const encoded = try encodeHeaderBlock(self.encoder_table.allocator, headers);
+        for (headers) |header| {
+            try self.encoder_table.insert(header.name, header.value);
+            self.encoder_stream.insert_count += 1;
+        }
+        return encoded;
+    }
+
+    /// Decodes headers while retaining connection-scoped dynamic-table state.
+    pub fn decodeHeaders(self: *PeerState, bytes: []const u8) Error![]HeaderField {
+        if (self.blocked_streams >= self.blocked_stream_limit and self.blocked_stream_limit != 0) {
+            return error.BlockedStreamsExceeded;
+        }
+        const headers = try decodeHeaderBlock(self.decoder_table.allocator, bytes);
+        errdefer freeHeaderFields(self.decoder_table.allocator, headers);
+        for (headers) |header| {
+            try self.decoder_table.insert(header.name, header.value);
+        }
+        return headers;
+    }
+
+    /// Applies minimal encoder-stream instructions for local repeated-exchange tests.
+    pub fn applyEncoderInstructions(self: *PeerState, bytes: []const u8) Error!void {
+        var index: usize = 0;
+        while (index < bytes.len) {
+            const opcode = bytes[index];
+            index += 1;
+            switch (opcode) {
+                0x01 => {
+                    const name_len: usize = @intCast(try decodeVarInt(bytes, &index));
+                    if (index + name_len > bytes.len) {
+                        return error.MalformedInstruction;
+                    }
+                    const name = bytes[index .. index + name_len];
+                    index += name_len;
+                    const value_len: usize = @intCast(try decodeVarInt(bytes, &index));
+                    if (index + value_len > bytes.len) {
+                        return error.MalformedInstruction;
+                    }
+                    const value = bytes[index .. index + value_len];
+                    index += value_len;
+                    try self.decoder_table.insert(name, value);
+                },
+                0x02 => {
+                    const capacity: usize = @intCast(try decodeVarInt(bytes, &index));
+                    self.encoder_table.capacity = capacity;
+                    self.decoder_table.capacity = capacity;
+                },
+                else => return error.MalformedInstruction,
+            }
+        }
+    }
+
+    /// Applies minimal decoder-stream instructions for local acknowledgement tests.
+    pub fn applyDecoderInstructions(self: *PeerState, bytes: []const u8) Error!void {
+        var index: usize = 0;
+        while (index < bytes.len) {
+            const opcode = bytes[index];
+            index += 1;
+            switch (opcode) {
+                0x03 => {
+                    self.decoder_stream.acknowledged_insert_count = @intCast(try decodeVarInt(bytes, &index));
+                },
+                0x04 => {
+                    const blocked_streams: usize = @intCast(try decodeVarInt(bytes, &index));
+                    if (blocked_streams > self.blocked_stream_limit) {
+                        return error.BlockedStreamsExceeded;
+                    }
+                    self.blocked_streams = blocked_streams;
+                },
+                else => return error.MalformedInstruction,
+            }
         }
     }
 };
@@ -408,4 +544,45 @@ test "http3 frames round trip headers and data payloads" {
     try std.testing.expectEqual(@as(usize, 2), decoded.len);
     try std.testing.expectEqual(FrameType.headers, decoded[0].frame_type);
     try std.testing.expectEqualStrings("body", decoded[1].payload);
+}
+
+test "qpack peer state retains repeated header blocks" {
+    var peer = PeerState.init(std.testing.allocator, 8, 4);
+    defer peer.deinit();
+
+    const encoded_first = try peer.encodeHeaders(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/health" },
+    });
+    defer std.testing.allocator.free(encoded_first);
+
+    const decoded_first = try peer.decodeHeaders(encoded_first);
+    defer freeHeaderFields(std.testing.allocator, decoded_first);
+
+    const encoded_second = try peer.encodeHeaders(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/echo" },
+        .{ .name = "x-retry", .value = "2" },
+    });
+    defer std.testing.allocator.free(encoded_second);
+
+    const decoded_second = try peer.decodeHeaders(encoded_second);
+    defer freeHeaderFields(std.testing.allocator, decoded_second);
+
+    try std.testing.expectEqual(@as(usize, 5), peer.decoder_table.entries.items.len);
+    try std.testing.expectEqualStrings("/echo", decoded_second[1].value);
+}
+
+test "qpack peer state rejects malformed instructions" {
+    var peer = PeerState.init(std.testing.allocator, 8, 1);
+    defer peer.deinit();
+
+    try std.testing.expectError(
+        error.MalformedInstruction,
+        peer.applyEncoderInstructions(&.{ 0xff, 0x01 }),
+    );
+    try std.testing.expectError(
+        error.BlockedStreamsExceeded,
+        peer.applyDecoderInstructions(&.{ 0x04, 0x02 }),
+    );
 }
