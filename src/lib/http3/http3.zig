@@ -1,6 +1,7 @@
 //! Typed HTTP/3 control-plane, exchange, and validation state.
 
 const std = @import("std");
+const qpack = @import("qpack.zig");
 
 /// Whether HTTP/3 support is enabled for this build.
 pub const enabled = true;
@@ -89,6 +90,20 @@ pub const StreamExchange = struct {
     failure_category: ?ValidationCategory = null,
 };
 
+/// One QUIC application payload tagged with the HTTP/3 stream id it belongs to.
+pub const StreamEnvelope = struct {
+    /// QUIC stream identifier associated with the payload.
+    stream_id: u64,
+    /// Owned payload bytes carried on the stream.
+    payload: []u8,
+
+    /// Releases the owned payload buffer.
+    pub fn deinit(self: *StreamEnvelope, allocator: std.mem.Allocator) void {
+        allocator.free(self.payload);
+        self.* = undefined;
+    }
+};
+
 /// Predictable local validation result for one HTTP/3 operation.
 pub const ValidationOutcome = struct {
     /// Validation category for the result.
@@ -100,6 +115,43 @@ pub const ValidationOutcome = struct {
     /// Optional route that was being served or requested.
     related_route: ?[]const u8 = null,
 };
+
+/// Encodes one stream envelope into an owned byte slice.
+pub fn encodeStreamEnvelope(
+    allocator: std.mem.Allocator,
+    stream_id: u64,
+    payload: []const u8,
+) (std.mem.Allocator.Error || qpack.Error)![]u8 {
+    const encoded_stream_id = try qpack.encodeVarInt(allocator, stream_id);
+    defer allocator.free(encoded_stream_id);
+    const encoded_length = try qpack.encodeVarInt(allocator, payload.len);
+    defer allocator.free(encoded_length);
+
+    var bytes = std.ArrayListUnmanaged(u8){};
+    errdefer bytes.deinit(allocator);
+    try bytes.appendSlice(allocator, encoded_stream_id);
+    try bytes.appendSlice(allocator, encoded_length);
+    try bytes.appendSlice(allocator, payload);
+    return bytes.toOwnedSlice(allocator);
+}
+
+/// Decodes one stream envelope from the provided bytes.
+pub fn decodeStreamEnvelope(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) (std.mem.Allocator.Error || qpack.Error || error{InvalidStreamEnvelope})!StreamEnvelope {
+    var index: usize = 0;
+    const stream_id = try qpack.decodeVarInt(bytes, &index);
+    const payload_len: usize = @intCast(try qpack.decodeVarInt(bytes, &index));
+    if (index + payload_len != bytes.len) {
+        return error.InvalidStreamEnvelope;
+    }
+
+    return .{
+        .stream_id = stream_id,
+        .payload = try allocator.dupe(u8, bytes[index..]),
+    };
+}
 
 /// QUIC transport helpers exposed by the HTTP/3 module family.
 pub const Quic = @import("quic.zig");
@@ -119,6 +171,7 @@ test {
     _ = ControlPlaneState;
     _ = StreamExchangeState;
     _ = StreamExchange;
+    _ = StreamEnvelope;
     _ = ValidationOutcome;
     _ = Quic;
     _ = Qpack;
@@ -138,4 +191,15 @@ test "http3 validation outcome retains route diagnostics" {
     try std.testing.expectEqual(ValidationCategory.route, outcome.category);
     try std.testing.expectEqual(ValidationStatus.failed, outcome.status);
     try std.testing.expectEqualStrings("/missing", outcome.related_route.?);
+}
+
+test "http3 stream envelope round trips stream identity and payload" {
+    const encoded = try encodeStreamEnvelope(std.testing.allocator, 4, "payload");
+    defer std.testing.allocator.free(encoded);
+
+    var envelope = try decodeStreamEnvelope(std.testing.allocator, encoded);
+    defer envelope.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u64, 4), envelope.stream_id);
+    try std.testing.expectEqualStrings("payload", envelope.payload);
 }

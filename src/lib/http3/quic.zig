@@ -17,6 +17,8 @@ pub const Error = std.mem.Allocator.Error || error{
     HandshakeIncomplete,
     /// No tracked packet matched the requested retransmission target.
     PacketNotOutstanding,
+    /// A peer attempted to register a stream id that is already tracked.
+    StreamAlreadyTracked,
 };
 
 /// Lifecycle state for one QUIC session.
@@ -343,6 +345,27 @@ pub const StreamRegistry = struct {
         return stream_id;
     }
 
+    /// Tracks a peer-initiated stream with an explicit stream id.
+    pub fn trackPeerStream(
+        self: *StreamRegistry,
+        allocator: std.mem.Allocator,
+        stream_id: u64,
+        kind: StreamKind,
+    ) Error!void {
+        if (self.stateFor(stream_id) != null) {
+            return error.StreamAlreadyTracked;
+        }
+
+        const stream = StreamState{
+            .id = stream_id,
+            .kind = kind,
+        };
+        switch (kind) {
+            .bidirectional => try self.bidirectional.append(allocator, stream),
+            .unidirectional => try self.unidirectional.append(allocator, stream),
+        }
+    }
+
     /// Returns the lifecycle state for the provided stream, when tracked.
     pub fn stateFor(self: *const StreamRegistry, stream_id: u64) ?StreamLifecycle {
         if (findStream(self.bidirectional.items, stream_id)) |stream| {
@@ -378,6 +401,22 @@ pub const StreamRegistry = struct {
             return true;
         }
         return false;
+    }
+
+    /// Returns the number of streams that are still open in the selected family.
+    pub fn activeCount(self: *const StreamRegistry, kind: StreamKind) usize {
+        const streams = switch (kind) {
+            .bidirectional => self.bidirectional.items,
+            .unidirectional => self.unidirectional.items,
+        };
+
+        var total: usize = 0;
+        for (streams) |stream| {
+            if (stream.lifecycle == .open) {
+                total += 1;
+            }
+        }
+        return total;
     }
 };
 
@@ -492,6 +531,14 @@ pub const Session = struct {
         return self.stream_registry.openStream(self.allocator, kind);
     }
 
+    /// Admits a peer-initiated stream into the local registry.
+    pub fn admitPeerStream(self: *Session, stream_id: u64, kind: StreamKind) Error!void {
+        if (self.state != .established) {
+            return error.HandshakeIncomplete;
+        }
+        try self.stream_registry.trackPeerStream(self.allocator, stream_id, kind);
+    }
+
     /// Marks one previously opened stream as completed.
     pub fn completeStream(self: *Session, stream_id: u64) bool {
         return self.stream_registry.markCompleted(stream_id);
@@ -505,6 +552,11 @@ pub const Session = struct {
     /// Returns the lifecycle state for one tracked stream, when present.
     pub fn streamState(self: *const Session, stream_id: u64) ?StreamLifecycle {
         return self.stream_registry.stateFor(stream_id);
+    }
+
+    /// Returns the number of streams still open in the selected family.
+    pub fn activeStreamCount(self: *const Session, kind: StreamKind) usize {
+        return self.stream_registry.activeCount(kind);
     }
 
     /// Applies reversible packet protection and returns an owned datagram.

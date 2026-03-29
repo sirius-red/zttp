@@ -7,8 +7,25 @@ const qpack = @import("qpack.zig");
 const quic = @import("quic.zig");
 const server = @import("server.zig");
 
+/// Monotonic seed used to derive distinct loopback runtime session identifiers.
+var runtime_session_seed = std.atomic.Value(u64).init(0);
+
 /// Error set returned by the local HTTP/3 client helpers.
 pub const Error = anyerror;
+
+/// One decoded runtime stream envelope retained long enough to parse a response.
+const StreamEnvelope = struct {
+    /// Stream identifier associated with the payload.
+    stream_id: u64,
+    /// Owned payload bytes carried for the stream.
+    payload: []u8,
+
+    /// Releases the owned payload buffer.
+    fn deinit(self: *StreamEnvelope, allocator: std.mem.Allocator) void {
+        allocator.free(self.payload);
+        self.* = undefined;
+    }
+};
 
 /// Prepared HTTP/3 request metadata and encoded header block.
 pub const RequestPlan = struct {
@@ -234,10 +251,16 @@ pub const RuntimeSession = struct {
 
         const request_payload = try encodeRequest(self.allocator, plan);
         defer self.allocator.free(request_payload);
+        const stream_payload = try encodeStreamEnvelope(
+            self.allocator,
+            plan.stream_id,
+            request_payload,
+        );
+        defer self.allocator.free(stream_payload);
         const request_packet = try self.connection.protectPacket(
             self.allocator,
             .application,
-            request_payload,
+            stream_payload,
         );
         defer self.allocator.free(request_packet);
 
@@ -249,6 +272,7 @@ pub const RuntimeSession = struct {
             self.allocator,
             &self.connection,
             &self.qpack_state,
+            plan.stream_id,
             buffer[0..read_len],
         );
     }
@@ -336,12 +360,19 @@ pub fn decodeResponseWithPeerState(
     allocator: std.mem.Allocator,
     connection: *quic.Connection,
     qpack_state: *qpack.PeerState,
+    expected_stream_id: u64,
     packet_bytes: []const u8,
 ) Error!types.Response {
     var packet = try connection.unprotectPacket(allocator, packet_bytes);
     defer packet.deinit(allocator);
 
-    const frames = try qpack.decodeFrames(allocator, packet.payload);
+    var envelope = try decodeStreamEnvelope(allocator, packet.payload);
+    defer envelope.deinit(allocator);
+    if (envelope.stream_id != expected_stream_id) {
+        return error.InvalidStreamEnvelope;
+    }
+
+    const frames = try qpack.decodeFrames(allocator, envelope.payload);
     defer qpack.freeFrames(allocator, frames);
 
     var status: ?types.Status = null;
@@ -518,9 +549,48 @@ fn deriveClientConnectionId(host: []const u8, port: types.Port) quic.ConnectionI
     hasher.update(host);
     const port_bytes = std.mem.toBytes(port.toInt());
     hasher.update(&port_bytes);
+    const seed_bytes = std.mem.toBytes(runtime_session_seed.fetchAdd(1, .seq_cst));
+    hasher.update(&seed_bytes);
     const hash = std.mem.toBytes(hasher.final());
     std.mem.copyForwards(u8, id[0..], hash[0..id.len]);
     return id;
+}
+
+/// Encodes one runtime request payload with its QUIC stream identifier.
+fn encodeStreamEnvelope(
+    allocator: std.mem.Allocator,
+    stream_id: u64,
+    payload: []const u8,
+) Error![]u8 {
+    const encoded_stream_id = try qpack.encodeVarInt(allocator, stream_id);
+    defer allocator.free(encoded_stream_id);
+    const encoded_payload_len = try qpack.encodeVarInt(allocator, payload.len);
+    defer allocator.free(encoded_payload_len);
+
+    var bytes = std.ArrayListUnmanaged(u8){};
+    errdefer bytes.deinit(allocator);
+    try bytes.appendSlice(allocator, encoded_stream_id);
+    try bytes.appendSlice(allocator, encoded_payload_len);
+    try bytes.appendSlice(allocator, payload);
+    return bytes.toOwnedSlice(allocator);
+}
+
+/// Decodes one runtime response envelope into stream metadata plus payload bytes.
+fn decodeStreamEnvelope(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) Error!StreamEnvelope {
+    var index: usize = 0;
+    const stream_id = try qpack.decodeVarInt(bytes, &index);
+    const payload_len: usize = @intCast(try qpack.decodeVarInt(bytes, &index));
+    if (index + payload_len != bytes.len) {
+        return error.InvalidStreamEnvelope;
+    }
+
+    return .{
+        .stream_id = stream_id,
+        .payload = try allocator.dupe(u8, bytes[index..]),
+    };
 }
 
 /// Sends one datagram on a connected UDP socket.

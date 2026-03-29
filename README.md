@@ -115,7 +115,7 @@ What is next:
 - [ ] Deliver full public HTTP/2 client support, not just low-level protocol pieces.
 - [X] Expand server support with loopback secure-listener semantics, ALPN dispatch, and minimal end-to-end HTTP/2 serving.
 - [X] Add first higher-level server ergonomics on top of the core runtime, including exact routing, shared middleware, and fallback handling.
-- [ ] Move HTTP/3 beyond local harness flows into real networked runtime support where practical.
+- [X] Move HTTP/3 beyond local harness flows into real networked runtime support where practical.
 
 Longer-term goals:
 

@@ -9,6 +9,7 @@ const server_types = @import("../server/types.zig");
 const types = @import("../types.zig");
 const interop_harness = @import("interop_harness.zig");
 const smoke_runner = @import("smoke_runner.zig");
+const testing_helpers = @import("testing.zig");
 
 /// Declarative expectation for one HTTP/3 interop route.
 pub const RouteExpectation = struct {
@@ -241,6 +242,106 @@ test "http3 runtime preserves repeated header values with connection scoped qpac
         try std.testing.expect(listener_session.qpack_state.decoder_stream.stream_id != null);
         try std.testing.expect(listener_session.qpack_state.decoder_table.entries.items.len >= 8);
         try std.testing.expect(listener_session.qpack_state.encoder_table.entries.items.len >= 6);
+    } else {
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "http3 runtime serves repeated health requests on one retained session" {
+    var config = server_types.ServerConfig.init(interop_harness.handleServerRequest);
+    config.port = types.Port.init(0);
+    var http3_config = testing_helpers.Http3Runtime.defaultListenerConfig();
+    http3_config.port = types.Port.init(0);
+    config.http3 = http3_config;
+
+    var server = try runtime.Server.init(std.testing.allocator, config);
+    defer server.deinit();
+    try server.start();
+
+    const port = types.Port.init(server.http3Port().?);
+    var session = try http3_client.RuntimeSession.init(std.testing.allocator, "127.0.0.1", port);
+    defer session.deinit();
+
+    var count: usize = 0;
+    while (count < testing_helpers.Http3Runtime.defaultExpectations().sequential_requests_without_restart) : (count += 1) {
+        var request = types.Request.init(
+            std.testing.allocator,
+            .get,
+            types.Uri.init(.https, "127.0.0.1", port, "/health", null, null),
+        );
+        defer request.deinit();
+        try request.headers.append("Host", "127.0.0.1");
+
+        var response = try session.executeRequest(&request);
+        defer response.deinit();
+        defer if (response.body) |body| body.close();
+
+        try std.testing.expectEqual(types.Status.ok, response.status);
+    }
+
+    if (server.http3_runtime) |*http3_runtime| {
+        try std.testing.expectEqual(@as(usize, 1), http3_runtime.sessions.items.len);
+    } else {
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "http3 runtime keeps multi-session and multi-stream state isolated" {
+    var config = server_types.ServerConfig.init(interop_harness.handleServerRequest);
+    config.port = types.Port.init(0);
+    var http3_config = testing_helpers.Http3Runtime.defaultListenerConfig();
+    http3_config.port = types.Port.init(0);
+    http3_config.session_limits.max_sessions = types.ConnectionCount.init(2);
+    http3_config.session_limits.max_streams_per_session = types.ConnectionCount.init(2);
+    config.http3 = http3_config;
+
+    var server = try runtime.Server.init(std.testing.allocator, config);
+    defer server.deinit();
+    try server.start();
+
+    const port = types.Port.init(server.http3Port().?);
+    var session_a = try http3_client.RuntimeSession.init(std.testing.allocator, "127.0.0.1", port);
+    defer session_a.deinit();
+    var session_b = try http3_client.RuntimeSession.init(std.testing.allocator, "127.0.0.1", port);
+    defer session_b.deinit();
+
+    const session_paths = [_][]const u8{ "/health", "/echo" };
+    for (session_paths) |path| {
+        var request_a = types.Request.init(
+            std.testing.allocator,
+            .get,
+            types.Uri.init(.https, "127.0.0.1", port, path, null, null),
+        );
+        defer request_a.deinit();
+        try request_a.headers.append("Host", "127.0.0.1");
+        try request_a.headers.append("X-Session", "a");
+
+        var response_a = try session_a.executeRequest(&request_a);
+        defer response_a.deinit();
+        defer if (response_a.body) |body| body.close();
+        try std.testing.expectEqual(types.Status.ok, response_a.status);
+
+        var request_b = types.Request.init(
+            std.testing.allocator,
+            .get,
+            types.Uri.init(.https, "127.0.0.1", port, path, null, null),
+        );
+        defer request_b.deinit();
+        try request_b.headers.append("Host", "127.0.0.1");
+        try request_b.headers.append("X-Session", "b");
+
+        var response_b = try session_b.executeRequest(&request_b);
+        defer response_b.deinit();
+        defer if (response_b.body) |body| body.close();
+        try std.testing.expectEqual(types.Status.ok, response_b.status);
+    }
+
+    if (server.http3_runtime) |*http3_runtime| {
+        try std.testing.expectEqual(@as(usize, 2), http3_runtime.sessions.items.len);
+        for (http3_runtime.sessions.items) |record| {
+            try std.testing.expect(record.session.connection.stream_registry.bidirectional.items.len >= 2);
+            try std.testing.expectEqual(@as(usize, 0), record.session.connection.activeStreamCount(.bidirectional));
+        }
     } else {
         return error.TestUnexpectedResult;
     }

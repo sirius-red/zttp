@@ -39,6 +39,20 @@ const SessionRecord = struct {
     session: ListenerSession,
 };
 
+/// One decoded runtime stream envelope retained while bridging a request or response.
+const StreamEnvelope = struct {
+    /// QUIC stream identifier associated with the payload.
+    stream_id: u64,
+    /// Owned payload bytes carried for that stream.
+    payload: []u8,
+
+    /// Releases the owned payload buffer.
+    fn deinit(self: *StreamEnvelope, allocator: std.mem.Allocator) void {
+        allocator.free(self.payload);
+        self.* = undefined;
+    }
+};
+
 /// Buffer-backed response writer context used by the HTTP/3 bridge.
 const ResponseBuffer = struct {
     /// Allocator used for buffered body bytes.
@@ -257,12 +271,17 @@ pub const Runtime = struct {
             return;
         }
 
+        var envelope = try decodeStreamEnvelope(self.allocator, packet.payload);
+        defer envelope.deinit(self.allocator);
+        try self.admitRequestStream(session, envelope.stream_id);
+        errdefer _ = session.connection.resetStream(envelope.stream_id);
+
         var request = try h3_server.decodeRequestWithPeerState(
             self.allocator,
             &session.qpack_state,
             session.control_plane.peer_settings.?.qpack_max_table_capacity,
             session.control_plane.peer_settings.?.qpack_blocked_streams,
-            packet.payload,
+            envelope.payload,
         );
         defer request.deinit(self.allocator);
 
@@ -294,11 +313,17 @@ pub const Runtime = struct {
             response_buffer.body.items,
         );
         defer self.allocator.free(payload);
+        const response_stream_payload = try encodeStreamEnvelope(
+            self.allocator,
+            envelope.stream_id,
+            payload,
+        );
+        defer self.allocator.free(response_stream_payload);
 
         const response_packet = try session.connection.protectPacket(
             self.allocator,
             .application,
-            payload,
+            response_stream_payload,
         );
         defer self.allocator.free(response_packet);
 
@@ -307,7 +332,25 @@ pub const Runtime = struct {
             response_packet,
             peer,
         );
+        _ = session.connection.completeStream(envelope.stream_id);
         _ = session.connection.acknowledge(.application, packet.number);
+    }
+
+    /// Admits one peer request stream under the configured per-session limits.
+    fn admitRequestStream(
+        self: *Runtime,
+        session: *ListenerSession,
+        stream_id: u64,
+    ) Error!void {
+        if (session.connection.streamState(stream_id) != null) {
+            return error.InvalidStreamState;
+        }
+
+        const max_streams = self.config.http3.?.session_limits.max_streams_per_session.toInt();
+        if (session.connection.activeStreamCount(.bidirectional) >= max_streams) {
+            return error.StreamLimitExceeded;
+        }
+        try session.connection.admitPeerStream(stream_id, .bidirectional);
     }
 
     /// Returns the retained session for the peer connection identifier.
@@ -516,6 +559,73 @@ fn applyNegotiatedQpackState(session: *ListenerSession) Error!void {
     );
 }
 
+/// Returns a predictable failure category for one HTTP/3 runtime error.
+pub fn classifyFailure(err: anyerror) ?server_types.Http3FailureCategory {
+    return switch (err) {
+        error.AddressInUse,
+        error.PermissionDenied,
+        error.AlreadyStarted,
+        error.InvalidHttp3Configuration,
+        => .startup,
+
+        error.ConnectionResetByPeer,
+        error.MessageTooBig,
+        error.NetworkUnreachable,
+        error.WouldBlock,
+        error.NetworkSubsystemFailed,
+        error.SocketNotConnected,
+        error.ConnectionTimedOut,
+        error.ShortPacket,
+        error.InvalidPacketLength,
+        error.ConnectionIdMismatch,
+        => .transport,
+
+        error.SessionLimitExceeded,
+        error.StreamLimitExceeded,
+        error.InvalidStreamEnvelope,
+        error.InvalidStreamState,
+        error.HandshakeIncomplete,
+        error.StreamAlreadyTracked,
+        => .session,
+
+        error.MalformedInstruction,
+        error.BlockedStreamsExceeded,
+        error.InvalidVarInt,
+        error.UnexpectedEof,
+        error.InvalidControlStreamState,
+        => .compression,
+
+        else => null,
+    };
+}
+
+/// Builds a validation outcome for one HTTP/3 runtime error when it maps cleanly.
+pub fn validationOutcomeForError(err: anyerror, related_route: ?[]const u8) ?h3.ValidationOutcome {
+    const category = classifyFailure(err) orelse return null;
+    return .{
+        .category = validationCategory(category),
+        .status = .failed,
+        .message = @errorName(err),
+        .related_route = related_route,
+    };
+}
+
+/// Builds a validation outcome for one served response status when it maps cleanly.
+pub fn validationOutcomeForStatus(
+    status: core.Status,
+    related_route: ?[]const u8,
+) ?h3.ValidationOutcome {
+    if (status == .not_found) {
+        return .{
+            .category = .route,
+            .status = .failed,
+            .message = "not_found",
+            .related_route = related_route,
+        };
+    }
+    return null;
+}
+
 /// Returns the connection identifiers carried by one protected QUIC packet.
 fn parseConnectionIds(
     packet_bytes: []const u8,
@@ -534,6 +644,54 @@ fn parseConnectionIds(
     return .{
         .destination = destination,
         .source = source,
+    };
+}
+
+/// Decodes one runtime request or response envelope from the QUIC payload bytes.
+fn decodeStreamEnvelope(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) Error!StreamEnvelope {
+    var index: usize = 0;
+    const stream_id = try h3_qpack.decodeVarInt(bytes, &index);
+    const payload_len: usize = @intCast(try h3_qpack.decodeVarInt(bytes, &index));
+    if (index + payload_len != bytes.len) {
+        return error.InvalidStreamEnvelope;
+    }
+
+    return .{
+        .stream_id = stream_id,
+        .payload = try allocator.dupe(u8, bytes[index..]),
+    };
+}
+
+/// Encodes one runtime request or response envelope with its QUIC stream id.
+fn encodeStreamEnvelope(
+    allocator: std.mem.Allocator,
+    stream_id: u64,
+    payload: []const u8,
+) Error![]u8 {
+    const encoded_stream_id = try h3_qpack.encodeVarInt(allocator, stream_id);
+    defer allocator.free(encoded_stream_id);
+    const encoded_payload_len = try h3_qpack.encodeVarInt(allocator, payload.len);
+    defer allocator.free(encoded_payload_len);
+
+    var bytes = std.ArrayListUnmanaged(u8){};
+    errdefer bytes.deinit(allocator);
+    try bytes.appendSlice(allocator, encoded_stream_id);
+    try bytes.appendSlice(allocator, encoded_payload_len);
+    try bytes.appendSlice(allocator, payload);
+    return bytes.toOwnedSlice(allocator);
+}
+
+/// Converts a server-facing HTTP/3 failure category into the shared validation enum.
+fn validationCategory(category: server_types.Http3FailureCategory) h3.ValidationCategory {
+    return switch (category) {
+        .startup => .startup,
+        .transport => .transport,
+        .session => .session,
+        .compression => .compression,
+        .route => .route,
     };
 }
 

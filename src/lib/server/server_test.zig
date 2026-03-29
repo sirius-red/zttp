@@ -4,6 +4,9 @@ const std = @import("std");
 const server_types = @import("types.zig");
 const types = @import("../types.zig");
 const interop_harness = @import("../testing/interop_harness.zig");
+const testing_helpers = @import("../testing/testing.zig");
+const http3_client = @import("../http3/client.zig");
+const http3_bridge = @import("http3.zig");
 const runtime = @import("runtime.zig");
 const server_http2 = @import("http2.zig");
 const socket_io = @import("../util/socket_io.zig");
@@ -154,6 +157,17 @@ fn initRoutedInteropServer() !runtime.Server {
         .fallback = null,
         .ambiguity_policy = .reject_duplicates,
     };
+
+    return runtime.Server.init(std.testing.allocator, config);
+}
+
+/// Initializes the shared interop-harness server with the real HTTP/3 runtime enabled.
+fn initHttp3InteropServer() !runtime.Server {
+    var config = server_types.ServerConfig.init(interop_harness.handleServerRequest);
+    config.port = types.Port.init(0);
+    var http3_config = testing_helpers.Http3Runtime.defaultListenerConfig();
+    http3_config.port = types.Port.init(0);
+    config.http3 = http3_config;
 
     return runtime.Server.init(std.testing.allocator, config);
 }
@@ -370,4 +384,63 @@ test "server runtime exposes the bound http3 port when enabled" {
 
     try std.testing.expect(server.http3Port() != null);
     try std.testing.expect(server.http3Port().? != 0);
+}
+
+test "server http3 runtime reuses one listener for repeated health requests" {
+    var server = try initHttp3InteropServer();
+    defer server.deinit();
+    try server.start();
+
+    const port = types.Port.init(server.http3Port().?);
+    var session = try http3_client.RuntimeSession.init(std.testing.allocator, "127.0.0.1", port);
+    defer session.deinit();
+
+    var iteration: usize = 0;
+    while (iteration < testing_helpers.Http3Runtime.defaultExpectations().sequential_requests_without_restart) : (iteration += 1) {
+        var request = types.Request.init(
+            std.testing.allocator,
+            .get,
+            types.Uri.init(.https, "127.0.0.1", port, "/health", null, null),
+        );
+        defer request.deinit();
+        try request.headers.append("Host", "127.0.0.1");
+
+        var response = try session.executeRequest(&request);
+        defer response.deinit();
+        defer if (response.body) |body| body.close();
+
+        try std.testing.expectEqual(types.Status.ok, response.status);
+        try std.testing.expectEqual(types.Version.http_3, response.version);
+    }
+
+    if (server.http3_runtime) |*http3_runtime| {
+        try std.testing.expectEqual(@as(usize, 1), http3_runtime.sessions.items.len);
+        try std.testing.expectEqual(@as(usize, 0), http3_runtime.sessions.items[0].session.connection.activeStreamCount(.bidirectional));
+    } else {
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "server http3 runtime reports distinct startup transport session compression and route outcomes" {
+    var first = try initHttp3InteropServer();
+    defer first.deinit();
+
+    var config = server_types.ServerConfig.init(interop_harness.handleServerRequest);
+    config.port = types.Port.init(0);
+    var http3_config = testing_helpers.Http3Runtime.defaultListenerConfig();
+    http3_config.port = types.Port.init(first.http3Port().?);
+    config.http3 = http3_config;
+
+    try std.testing.expectError(error.AddressInUse, runtime.Server.init(std.testing.allocator, config));
+    try std.testing.expectEqual(server_types.Http3FailureCategory.startup, http3_bridge.classifyFailure(error.AddressInUse).?);
+    try std.testing.expectEqual(server_types.Http3FailureCategory.transport, http3_bridge.classifyFailure(error.ShortPacket).?);
+    try std.testing.expectEqual(server_types.Http3FailureCategory.session, http3_bridge.classifyFailure(error.StreamLimitExceeded).?);
+    try std.testing.expectEqual(server_types.Http3FailureCategory.compression, http3_bridge.classifyFailure(error.MalformedInstruction).?);
+
+    const transport_outcome = http3_bridge.validationOutcomeForError(error.ShortPacket, null).?;
+    try std.testing.expectEqual(@import("../http3/http3.zig").ValidationCategory.transport, transport_outcome.category);
+
+    const route_outcome = http3_bridge.validationOutcomeForStatus(.not_found, "/missing").?;
+    try std.testing.expectEqual(@import("../http3/http3.zig").ValidationCategory.route, route_outcome.category);
+    try std.testing.expectEqualStrings("/missing", route_outcome.related_route.?);
 }
