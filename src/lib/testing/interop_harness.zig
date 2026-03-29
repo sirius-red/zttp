@@ -291,6 +291,60 @@ pub const MultiplexingScenario = struct {
     diagnostics: MultiplexingDiagnostics,
 };
 
+/// Required HTTP/3 critical stream retained by one runtime session.
+pub const Http3CriticalStreamKind = enum {
+    /// Unidirectional control stream carrying SETTINGS and GOAWAY.
+    control,
+    /// Unidirectional QPACK encoder stream.
+    qpack_encoder,
+    /// Unidirectional QPACK decoder stream.
+    qpack_decoder,
+};
+
+/// Disturbance class admitted by a local HTTP/3 runtime scenario.
+pub const Http3DisturbanceKind = enum {
+    /// Random packet loss within the accepted local envelope.
+    loss,
+    /// Random packet duplication within the accepted local envelope.
+    duplication,
+    /// Datagram reordering within the accepted local envelope.
+    reordering,
+    /// Added per-datagram delay within the accepted local envelope.
+    delay,
+};
+
+/// Stable identifier for a local HTTP/3 disturbance profile.
+pub const LocalDisturbanceProfileId = enum {
+    /// Basic packet-loss, duplication, reordering, and delay envelope.
+    basic,
+};
+
+/// Listener and session expectations shared by real HTTP/3 runtime scenarios.
+pub const Http3RuntimeExpectations = struct {
+    /// Minimum number of sequential requests or sessions served without restart.
+    sequential_requests_without_restart: usize,
+    /// Minimum simultaneous sessions admitted by one listener.
+    concurrent_sessions_minimum: types.ConnectionCount,
+    /// Minimum overlapping streams admitted within one session.
+    overlapping_streams_per_session_minimum: StreamCount,
+};
+
+/// Real-runtime semantics attached to one UDP HTTP/3 scenario.
+pub const Http3RuntimeSemantics = struct {
+    /// Critical streams that must exist before request exchange proceeds.
+    required_critical_streams: []const Http3CriticalStreamKind,
+    /// Whether the scenario requires connection-scoped QPACK state reuse.
+    qpack_dynamic_state_required: bool = false,
+    /// Accepted disturbance envelope for the scenario, when applicable.
+    disturbance_profile: ?LocalDisturbanceProfileId = null,
+    /// Disturbance classes covered by the scenario.
+    disturbance_kinds: []const Http3DisturbanceKind = &.{},
+    /// Distinct failure category expected for negative-path validation, if any.
+    expected_failure_category: ?server_types.Http3FailureCategory = null,
+    /// Listener and concurrency expectations shared by the runtime.
+    expectations: Http3RuntimeExpectations,
+};
+
 /// UDP-focused HTTP/3 scenario metadata.
 pub const Http3DatagramScenario = struct {
     /// Route served by the datagram scenario.
@@ -301,6 +355,8 @@ pub const Http3DatagramScenario = struct {
     max_datagram_size: usize,
     /// Maximum buffered application data for the scenario.
     datagram_budget: usize,
+    /// Real-runtime semantics expected for the route.
+    runtime: Http3RuntimeSemantics,
 };
 
 /// Host platform classification for release-readiness scenarios.
@@ -372,10 +428,18 @@ const alpn_no_protocols = [_]types.NegotiatedProtocol{};
 const windows_only_platforms = [_]ReadinessPlatform{.windows};
 const no_backpressure_scopes = [_]BackpressureScope{};
 const stream_and_connection_backpressure_scopes = [_]BackpressureScope{ .stream, .connection };
+const http3_critical_streams = [_]Http3CriticalStreamKind{ .control, .qpack_encoder, .qpack_decoder };
+const no_http3_disturbances = [_]Http3DisturbanceKind{};
+const basic_http3_disturbances = [_]Http3DisturbanceKind{ .loss, .duplication, .reordering, .delay };
 const health_echo_routes = [_]RouteId{ .health, .echo_get };
 const large_body_routes = [_]RouteId{ .stream_large, .health };
 const rst_stream_routes = [_]RouteId{ .stream_chunked, .health };
 const goaway_routes = [_]RouteId{ .health, .echo_get };
+const default_http3_runtime_expectations = Http3RuntimeExpectations{
+    .sequential_requests_without_restart = 10,
+    .concurrent_sessions_minimum = types.ConnectionCount.init(2),
+    .overlapping_streams_per_session_minimum = StreamCount.init(2),
+};
 const windows_loopback_server_command = [_][]const u8{
     "zig",
     "build",
@@ -653,6 +717,14 @@ const default_http3_datagram_scenarios = [_]Http3DatagramScenario{
         },
         .max_datagram_size = 1200,
         .datagram_budget = 16 * 1024,
+        .runtime = .{
+            .required_critical_streams = &http3_critical_streams,
+            .qpack_dynamic_state_required = false,
+            .disturbance_profile = null,
+            .disturbance_kinds = &no_http3_disturbances,
+            .expected_failure_category = null,
+            .expectations = default_http3_runtime_expectations,
+        },
     },
     .{
         .route = .echo_get,
@@ -664,6 +736,14 @@ const default_http3_datagram_scenarios = [_]Http3DatagramScenario{
         },
         .max_datagram_size = 1200,
         .datagram_budget = 16 * 1024,
+        .runtime = .{
+            .required_critical_streams = &http3_critical_streams,
+            .qpack_dynamic_state_required = true,
+            .disturbance_profile = null,
+            .disturbance_kinds = &no_http3_disturbances,
+            .expected_failure_category = null,
+            .expectations = default_http3_runtime_expectations,
+        },
     },
     .{
         .route = .echo_post,
@@ -675,6 +755,14 @@ const default_http3_datagram_scenarios = [_]Http3DatagramScenario{
         },
         .max_datagram_size = 1200,
         .datagram_budget = 64 * 1024,
+        .runtime = .{
+            .required_critical_streams = &http3_critical_streams,
+            .qpack_dynamic_state_required = true,
+            .disturbance_profile = null,
+            .disturbance_kinds = &no_http3_disturbances,
+            .expected_failure_category = null,
+            .expectations = default_http3_runtime_expectations,
+        },
     },
     .{
         .route = .stream_large,
@@ -686,6 +774,14 @@ const default_http3_datagram_scenarios = [_]Http3DatagramScenario{
         },
         .max_datagram_size = 1200,
         .datagram_budget = 96 * 1024,
+        .runtime = .{
+            .required_critical_streams = &http3_critical_streams,
+            .qpack_dynamic_state_required = false,
+            .disturbance_profile = .basic,
+            .disturbance_kinds = &basic_http3_disturbances,
+            .expected_failure_category = .transport,
+            .expectations = default_http3_runtime_expectations,
+        },
     },
 };
 
@@ -1118,6 +1214,14 @@ test "udp http3 scenarios advertise local health and echo coverage" {
     try std.testing.expectEqual(Transport.udp, scenarios[0].endpoint.transport);
     try std.testing.expectEqual(types.NegotiatedProtocol.h3, scenarios[1].endpoint.protocol);
     try std.testing.expectEqual(@as(usize, 64 * 1024), http3DatagramScenarioForRoute(.echo_post).?.datagram_budget);
+    try std.testing.expectEqual(@as(usize, 3), scenarios[0].runtime.required_critical_streams.len);
+    try std.testing.expect(!scenarios[0].runtime.qpack_dynamic_state_required);
+    try std.testing.expect(http3DatagramScenarioForRoute(.echo_get).?.runtime.qpack_dynamic_state_required);
+    try std.testing.expectEqual(@as(?LocalDisturbanceProfileId, .basic), http3DatagramScenarioForRoute(.stream_large).?.runtime.disturbance_profile);
+    try std.testing.expectEqual(server_types.Http3FailureCategory.transport, http3DatagramScenarioForRoute(.stream_large).?.runtime.expected_failure_category.?);
+    try std.testing.expectEqual(@as(usize, 10), scenarios[0].runtime.expectations.sequential_requests_without_restart);
+    try std.testing.expectEqual(@as(usize, 2), scenarios[0].runtime.expectations.concurrent_sessions_minimum.toInt());
+    try std.testing.expectEqual(@as(usize, 2), scenarios[0].runtime.expectations.overlapping_streams_per_session_minimum.toInt());
 }
 
 test "readiness catalog includes the dedicated windows loopback scenario" {

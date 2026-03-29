@@ -151,6 +151,79 @@ pub const LoopbackIdentity = struct {
     }
 };
 
+/// Stable QUIC fixture identifier used by local HTTP/3 runtime scenarios.
+pub const QuicRuntimeFixtureId = enum {
+    /// Client-side Initial packet fixture for loopback session setup.
+    initial_client,
+    /// Server-side Initial packet fixture for loopback session setup.
+    initial_server,
+    /// Health-probe request fixture for runtime smoke coverage.
+    runtime_health,
+    /// Echo request fixture for runtime QPACK state coverage.
+    runtime_echo,
+    /// Large-stream fixture for disturbance and recovery coverage.
+    runtime_stream_large,
+
+    /// Returns the fixture path relative to the HTTP/3 fixture root.
+    pub fn relativePath(self: QuicRuntimeFixtureId) []const u8 {
+        return switch (self) {
+            .initial_client => "http3/quic/runtime/initial-client.bin",
+            .initial_server => "http3/quic/runtime/initial-server.bin",
+            .runtime_health => "http3/quic/runtime/health-request.bin",
+            .runtime_echo => "http3/quic/runtime/echo-request.bin",
+            .runtime_stream_large => "http3/quic/runtime/stream-large.bin",
+        };
+    }
+};
+
+/// Owned loopback QUIC fixture paths used by runtime-oriented HTTP/3 tests.
+pub const LoopbackQuicRuntimeFixturePaths = struct {
+    /// Path to the client Initial fixture.
+    initial_client_path: []u8,
+    /// Path to the server Initial fixture.
+    initial_server_path: []u8,
+    /// Path to the health-probe runtime fixture.
+    runtime_health_path: []u8,
+    /// Path to the echo runtime fixture.
+    runtime_echo_path: []u8,
+    /// Path to the large-stream runtime fixture.
+    runtime_stream_large_path: []u8,
+
+    /// Releases the owned fixture paths.
+    pub fn deinit(self: *LoopbackQuicRuntimeFixturePaths, allocator: std.mem.Allocator) void {
+        allocator.free(self.initial_client_path);
+        allocator.free(self.initial_server_path);
+        allocator.free(self.runtime_health_path);
+        allocator.free(self.runtime_echo_path);
+        allocator.free(self.runtime_stream_large_path);
+        self.* = undefined;
+    }
+};
+
+/// Owned loopback QUIC fixture contents used by runtime-oriented HTTP/3 tests.
+pub const LoopbackQuicRuntimeFixtures = struct {
+    /// Client-side Initial packet fixture bytes.
+    initial_client: []u8,
+    /// Server-side Initial packet fixture bytes.
+    initial_server: []u8,
+    /// Health-probe runtime fixture bytes.
+    runtime_health: []u8,
+    /// Echo runtime fixture bytes.
+    runtime_echo: []u8,
+    /// Large-stream runtime fixture bytes.
+    runtime_stream_large: []u8,
+
+    /// Releases the owned fixture contents.
+    pub fn deinit(self: *LoopbackQuicRuntimeFixtures, allocator: std.mem.Allocator) void {
+        allocator.free(self.initial_client);
+        allocator.free(self.initial_server);
+        allocator.free(self.runtime_health);
+        allocator.free(self.runtime_echo);
+        allocator.free(self.runtime_stream_large);
+        self.* = undefined;
+    }
+};
+
 /// Reusable loader for local fixture files.
 pub const Loader = struct {
     /// Root path for all fixture files.
@@ -200,6 +273,52 @@ pub const Loader = struct {
     /// Loads an HTTP/3 fixture payload.
     pub fn loadHttp3Fixture(self: Loader, allocator: std.mem.Allocator, relative_path: []const u8) LoadError![]u8 {
         return try self.loadFromGroup(allocator, .http3, relative_path);
+    }
+
+    /// Returns the full path for one named QUIC runtime fixture.
+    pub fn pathForQuicRuntimeFixture(
+        self: Loader,
+        allocator: std.mem.Allocator,
+        fixture: QuicRuntimeFixtureId,
+    ) LoadError![]u8 {
+        return try self.pathFor(allocator, fixture.relativePath());
+    }
+
+    /// Returns the default loopback QUIC runtime fixture paths.
+    pub fn loopbackQuicRuntimeFixturePaths(
+        self: Loader,
+        allocator: std.mem.Allocator,
+    ) LoadError!LoopbackQuicRuntimeFixturePaths {
+        return .{
+            .initial_client_path = try self.pathForQuicRuntimeFixture(allocator, .initial_client),
+            .initial_server_path = try self.pathForQuicRuntimeFixture(allocator, .initial_server),
+            .runtime_health_path = try self.pathForQuicRuntimeFixture(allocator, .runtime_health),
+            .runtime_echo_path = try self.pathForQuicRuntimeFixture(allocator, .runtime_echo),
+            .runtime_stream_large_path = try self.pathForQuicRuntimeFixture(allocator, .runtime_stream_large),
+        };
+    }
+
+    /// Loads one named QUIC runtime fixture.
+    pub fn loadQuicRuntimeFixture(
+        self: Loader,
+        allocator: std.mem.Allocator,
+        fixture: QuicRuntimeFixtureId,
+    ) LoadError![]u8 {
+        return try self.load(allocator, fixture.relativePath());
+    }
+
+    /// Loads the default loopback QUIC runtime fixtures.
+    pub fn loadLoopbackQuicRuntimeFixtures(
+        self: Loader,
+        allocator: std.mem.Allocator,
+    ) LoadError!LoopbackQuicRuntimeFixtures {
+        return .{
+            .initial_client = try self.loadQuicRuntimeFixture(allocator, .initial_client),
+            .initial_server = try self.loadQuicRuntimeFixture(allocator, .initial_server),
+            .runtime_health = try self.loadQuicRuntimeFixture(allocator, .runtime_health),
+            .runtime_echo = try self.loadQuicRuntimeFixture(allocator, .runtime_echo),
+            .runtime_stream_large = try self.loadQuicRuntimeFixture(allocator, .runtime_stream_large),
+        };
     }
 
     /// Returns the default loopback certificate and private-key fixture paths.
@@ -339,6 +458,46 @@ test "fixture loader resolves loopback identity fixture paths" {
         std.mem.endsWith(u8, paths.private_key_path, "certs/loopback-server.key") or
             std.mem.endsWith(u8, paths.private_key_path, "certs\\loopback-server.key"),
     );
+}
+
+test "fixture loader resolves loopback quic runtime fixture paths" {
+    const loader = Loader.init();
+    var paths = try loader.loopbackQuicRuntimeFixturePaths(std.testing.allocator);
+    defer paths.deinit(std.testing.allocator);
+
+    try std.testing.expect(
+        std.mem.endsWith(u8, paths.initial_client_path, "http3/quic/runtime/initial-client.bin") or
+            std.mem.endsWith(u8, paths.initial_client_path, "http3\\quic\\runtime\\initial-client.bin"),
+    );
+    try std.testing.expect(
+        std.mem.endsWith(u8, paths.runtime_stream_large_path, "http3/quic/runtime/stream-large.bin") or
+            std.mem.endsWith(u8, paths.runtime_stream_large_path, "http3\\quic\\runtime\\stream-large.bin"),
+    );
+}
+
+test "fixture loader loads quic runtime fixtures from a custom base path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("http3/quic/runtime");
+    try tmp.dir.writeFile(.{ .sub_path = "http3/quic/runtime/initial-client.bin", .data = "client-initial" });
+    try tmp.dir.writeFile(.{ .sub_path = "http3/quic/runtime/initial-server.bin", .data = "server-initial" });
+    try tmp.dir.writeFile(.{ .sub_path = "http3/quic/runtime/health-request.bin", .data = "health" });
+    try tmp.dir.writeFile(.{ .sub_path = "http3/quic/runtime/echo-request.bin", .data = "echo" });
+    try tmp.dir.writeFile(.{ .sub_path = "http3/quic/runtime/stream-large.bin", .data = "large-stream" });
+
+    const base_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base_path);
+
+    const loader = Loader.initWithBasePath(base_path);
+    var fixtures = try loader.loadLoopbackQuicRuntimeFixtures(std.testing.allocator);
+    defer fixtures.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("client-initial", fixtures.initial_client);
+    try std.testing.expectEqualStrings("server-initial", fixtures.initial_server);
+    try std.testing.expectEqualStrings("health", fixtures.runtime_health);
+    try std.testing.expectEqualStrings("echo", fixtures.runtime_echo);
+    try std.testing.expectEqualStrings("large-stream", fixtures.runtime_stream_large);
 }
 
 test "socket failure capture detects windows loopback signature" {
