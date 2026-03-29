@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-03-29
+
+### Added
+
+- Added the real UDP-backed HTTP/3 runtime path for the library and CLI, including retained session state and hardened stream isolation for repeated and concurrent loopback exchanges.
+
+## [0.8.0] - 2026-03-27
+
+### Added
+
+- Added secure server runtime routing with TLS, ALPN-driven protocol dispatch, and minimal end-to-end HTTP/2 serving.
+
+## [0.7.0] - 2026-03-26
+
+### Added
+
+- Added multiplexed HTTP/2 client streams with basic flow control, backpressure, GOAWAY handling, and failure isolation on a shared connection.
+
+## [0.6.0] - 2026-03-24
+
+### Added
+
+- Added HTTPS ALPN auto-selection that routes dual-ALPN peers over HTTP/2 while preserving HTTP/1.1 fallback and negotiation failure diagnostics.
+
 ## [0.5.0] - 2026-03-15
 
 ### Added
