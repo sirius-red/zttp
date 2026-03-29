@@ -91,6 +91,10 @@ test "quic transport rejects malformed packet lengths before http3 request decod
     defer sender.deinit();
     var receiver = quic.Connection.init(std.testing.allocator, "server01".*, "client01".*);
     defer receiver.deinit();
+    sender.beginHandshake();
+    sender.establish();
+    receiver.beginHandshake();
+    receiver.establish();
 
     try std.testing.expectError(
         error.ShortPacket,

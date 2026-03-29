@@ -1,6 +1,7 @@
 //! Regression coverage scaffolding for future QUIC transport work.
 
 const std = @import("std");
+const quic = @import("quic.zig");
 const types = @import("../types.zig");
 const fixture_loader = @import("../testing/fixture_loader.zig");
 const interop_harness = @import("../testing/interop_harness.zig");
@@ -113,4 +114,88 @@ test "interop routes advertise h3 coverage" {
     try std.testing.expect(echo_get.supportsProtocol(.h3));
     try std.testing.expect(echo_post.supportsProtocol(.h3));
     try std.testing.expectEqualStrings("h3", types.NegotiatedProtocol.h3.asAlpnBytes());
+}
+
+test "quic application packets require a completed handshake" {
+    var session = quic.Session.init(std.testing.allocator, "client01".*, "server01".*);
+    defer session.deinit();
+
+    try std.testing.expectError(
+        error.HandshakeIncomplete,
+        session.protectPacket(std.testing.allocator, .application, "blocked"),
+    );
+}
+
+test "quic disturbed delivery classifies reordered and duplicate packets predictably" {
+    var client = quic.Session.init(std.testing.allocator, "client01".*, "server01".*);
+    defer client.deinit();
+    var server = quic.Session.init(std.testing.allocator, "server01".*, "client01".*);
+    defer server.deinit();
+    client.beginHandshake();
+    client.establish();
+    server.beginHandshake();
+    server.establish();
+
+    const first = try client.protectPacket(std.testing.allocator, .application, "first");
+    defer std.testing.allocator.free(first);
+    const second = try client.protectPacket(std.testing.allocator, .application, "second");
+    defer std.testing.allocator.free(second);
+
+    var out_of_order = try server.unprotectPacket(std.testing.allocator, second);
+    defer out_of_order.deinit(std.testing.allocator);
+    try std.testing.expectEqual(quic.PacketDeliveryState.fresh, out_of_order.delivery_state);
+    try std.testing.expectEqualStrings("second", out_of_order.payload);
+
+    var reordered = try server.unprotectPacket(std.testing.allocator, first);
+    defer reordered.deinit(std.testing.allocator);
+    try std.testing.expectEqual(quic.PacketDeliveryState.reordered, reordered.delivery_state);
+    try std.testing.expectEqualStrings("first", reordered.payload);
+
+    var duplicate = try server.unprotectPacket(std.testing.allocator, first);
+    defer duplicate.deinit(std.testing.allocator);
+    try std.testing.expectEqual(quic.PacketDeliveryState.duplicate, duplicate.delivery_state);
+}
+
+test "quic retransmission rebuilds a lost payload with a fresh packet number" {
+    var client = quic.Session.init(std.testing.allocator, "client01".*, "server01".*);
+    defer client.deinit();
+    var server = quic.Session.init(std.testing.allocator, "server01".*, "client01".*);
+    defer server.deinit();
+    client.beginHandshake();
+    client.establish();
+    server.beginHandshake();
+    server.establish();
+
+    const original = try client.protectPacket(std.testing.allocator, .application, "health");
+    defer std.testing.allocator.free(original);
+    const retransmitted = try client.retransmitLostPacket(std.testing.allocator, .application, 0);
+    defer std.testing.allocator.free(retransmitted);
+
+    var packet = try server.unprotectPacket(std.testing.allocator, retransmitted);
+    defer packet.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u64, 1), packet.number);
+    try std.testing.expectEqualStrings("health", packet.payload);
+}
+
+test "quic stream registries preserve session isolation across overlapping stream ids" {
+    var session_a = quic.Session.init(std.testing.allocator, "client01".*, "server01".*);
+    defer session_a.deinit();
+    var session_b = quic.Session.init(std.testing.allocator, "client02".*, "server02".*);
+    defer session_b.deinit();
+    session_a.beginHandshake();
+    session_a.establish();
+    session_b.beginHandshake();
+    session_b.establish();
+
+    const stream_a = try session_a.openStream(.bidirectional);
+    const stream_b = try session_b.openStream(.bidirectional);
+    try std.testing.expectEqual(@as(u64, 0), stream_a);
+    try std.testing.expectEqual(@as(u64, 0), stream_b);
+
+    try std.testing.expect(session_a.completeStream(stream_a));
+    try std.testing.expect(session_b.resetStream(stream_b));
+
+    try std.testing.expectEqual(quic.StreamLifecycle.completed, session_a.streamState(stream_a).?);
+    try std.testing.expectEqual(quic.StreamLifecycle.reset, session_b.streamState(stream_b).?);
 }

@@ -156,6 +156,20 @@ pub const PeerState = struct {
         self.* = undefined;
     }
 
+    /// Applies negotiated QPACK limits from the peer control-plane state.
+    pub fn configureLimits(
+        self: *PeerState,
+        table_capacity: usize,
+        blocked_stream_limit: usize,
+    ) void {
+        self.encoder_table.capacity = table_capacity;
+        self.decoder_table.capacity = table_capacity;
+        self.blocked_stream_limit = blocked_stream_limit;
+        if (self.blocked_streams > blocked_stream_limit and blocked_stream_limit != 0) {
+            self.blocked_streams = blocked_stream_limit;
+        }
+    }
+
     /// Encodes headers while retaining connection-scoped dynamic-table state.
     pub fn encodeHeaders(self: *PeerState, headers: []const HeaderField) Error![]u8 {
         const encoded = try encodeHeaderBlock(self.encoder_table.allocator, headers);
@@ -203,8 +217,7 @@ pub const PeerState = struct {
                 },
                 0x02 => {
                     const capacity: usize = @intCast(try decodeVarInt(bytes, &index));
-                    self.encoder_table.capacity = capacity;
-                    self.decoder_table.capacity = capacity;
+                    self.configureLimits(capacity, self.blocked_stream_limit);
                 },
                 else => return error.MalformedInstruction,
             }

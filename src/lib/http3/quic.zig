@@ -13,6 +13,10 @@ pub const Error = std.mem.Allocator.Error || error{
     InvalidPacketLength,
     /// Encoded bytes targeted a different connection identifier.
     ConnectionIdMismatch,
+    /// Application-data work was attempted before the handshake completed.
+    HandshakeIncomplete,
+    /// No tracked packet matched the requested retransmission target.
+    PacketNotOutstanding,
 };
 
 /// Lifecycle state for one QUIC session.
@@ -29,6 +33,16 @@ pub const SessionState = enum {
     closed,
 };
 
+/// Handshake progress retained by the local QUIC session.
+pub const HandshakeStatus = enum {
+    /// No handshake packets have been sent yet.
+    idle,
+    /// Handshake packets are still in flight.
+    in_progress,
+    /// The handshake completed and application data is allowed.
+    confirmed,
+};
+
 /// Packet-number space used by a QUIC packet.
 pub const PacketNumberSpace = enum(u8) {
     /// Initial packets.
@@ -37,6 +51,16 @@ pub const PacketNumberSpace = enum(u8) {
     handshake = 1,
     /// Application-data packets.
     application = 2,
+};
+
+/// Delivery classification for one received QUIC packet.
+pub const PacketDeliveryState = enum {
+    /// First observation of the packet number for the space.
+    fresh,
+    /// Packet number has already been processed and should be ignored safely.
+    duplicate,
+    /// Packet arrived below the largest previously observed packet number.
+    reordered,
 };
 
 /// High-level stream family supported by the local transport scaffolding.
@@ -65,6 +89,8 @@ pub const PacketSpace = struct {
     next_packet_number: u64 = 0,
     /// Largest packet number received in this space.
     largest_received: ?u64 = null,
+    /// Packet numbers already observed in this space.
+    received_numbers: std.ArrayListUnmanaged(u64),
 
     /// Returns zeroed bookkeeping for the provided packet-number space.
     pub fn init(space: PacketNumberSpace) PacketSpace {
@@ -72,7 +98,38 @@ pub const PacketSpace = struct {
             .space = space,
             .next_packet_number = 0,
             .largest_received = null,
+            .received_numbers = .{},
         };
+    }
+
+    /// Releases received-packet tracking for the space.
+    pub fn deinit(self: *PacketSpace, allocator: std.mem.Allocator) void {
+        self.received_numbers.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// Records one received packet number and returns its delivery classification.
+    pub fn observeReceived(
+        self: *PacketSpace,
+        allocator: std.mem.Allocator,
+        number: u64,
+    ) std.mem.Allocator.Error!PacketDeliveryState {
+        for (self.received_numbers.items) |received| {
+            if (received == number) {
+                return .duplicate;
+            }
+        }
+
+        const delivery_state: PacketDeliveryState = if (self.largest_received) |largest|
+            if (number < largest) .reordered else .fresh
+        else
+            .fresh;
+        try self.received_numbers.append(allocator, number);
+        self.largest_received = if (self.largest_received) |largest|
+            @max(largest, number)
+        else
+            number;
+        return delivery_state;
     }
 };
 
@@ -86,6 +143,14 @@ pub const SentPacket = struct {
     bytes_in_flight: usize,
     /// Whether the packet was ack-eliciting.
     ack_eliciting: bool,
+    /// Application payload used to rebuild retransmissions.
+    payload: []u8,
+
+    /// Releases the retained payload bytes.
+    pub fn deinit(self: *SentPacket, allocator: std.mem.Allocator) void {
+        allocator.free(self.payload);
+        self.* = undefined;
+    }
 };
 
 /// Minimal recovery state used by the HTTP/3 scaffolding.
@@ -111,6 +176,9 @@ pub const Recovery = struct {
 
     /// Releases packet tracking storage.
     pub fn deinit(self: *Recovery, allocator: std.mem.Allocator) void {
+        for (self.outstanding.items) |*packet| {
+            packet.deinit(allocator);
+        }
         self.outstanding.deinit(allocator);
         self.* = undefined;
     }
@@ -143,6 +211,21 @@ pub const Recovery = struct {
 
     /// Marks a tracked packet as lost.
     pub fn onLoss(self: *Recovery, number: u64, space: PacketNumberSpace) ?SentPacket {
+        for (self.outstanding.items, 0..) |packet, index| {
+            if (packet.number == number and packet.space == space) {
+                self.loss_count += 1;
+                return self.outstanding.swapRemove(index);
+            }
+        }
+        return null;
+    }
+
+    /// Removes one tracked packet so the caller can retransmit its payload.
+    pub fn takeForRetransmission(
+        self: *Recovery,
+        number: u64,
+        space: PacketNumberSpace,
+    ) ?SentPacket {
         for (self.outstanding.items, 0..) |packet, index| {
             if (packet.number == number and packet.space == space) {
                 self.loss_count += 1;
@@ -203,6 +286,18 @@ pub const StreamState = struct {
     id: u64,
     /// Stream family.
     kind: StreamKind,
+    /// Lifecycle state for the stream inside the session.
+    lifecycle: StreamLifecycle = .open,
+};
+
+/// Lifecycle state retained for one locally tracked stream.
+pub const StreamLifecycle = enum {
+    /// The stream is open and can still exchange frames.
+    open,
+    /// The stream completed successfully.
+    completed,
+    /// The stream was reset or abandoned.
+    reset,
 };
 
 /// Stream registries retained for one QUIC session.
@@ -247,6 +342,43 @@ pub const StreamRegistry = struct {
         }
         return stream_id;
     }
+
+    /// Returns the lifecycle state for the provided stream, when tracked.
+    pub fn stateFor(self: *const StreamRegistry, stream_id: u64) ?StreamLifecycle {
+        if (findStream(self.bidirectional.items, stream_id)) |stream| {
+            return stream.lifecycle;
+        }
+        if (findStream(self.unidirectional.items, stream_id)) |stream| {
+            return stream.lifecycle;
+        }
+        return null;
+    }
+
+    /// Marks one tracked stream as completed.
+    pub fn markCompleted(self: *StreamRegistry, stream_id: u64) bool {
+        if (findStreamMutable(self.bidirectional.items, stream_id)) |stream| {
+            stream.lifecycle = .completed;
+            return true;
+        }
+        if (findStreamMutable(self.unidirectional.items, stream_id)) |stream| {
+            stream.lifecycle = .completed;
+            return true;
+        }
+        return false;
+    }
+
+    /// Marks one tracked stream as reset.
+    pub fn markReset(self: *StreamRegistry, stream_id: u64) bool {
+        if (findStreamMutable(self.bidirectional.items, stream_id)) |stream| {
+            stream.lifecycle = .reset;
+            return true;
+        }
+        if (findStreamMutable(self.unidirectional.items, stream_id)) |stream| {
+            stream.lifecycle = .reset;
+            return true;
+        }
+        return false;
+    }
 };
 
 /// Decoded packet bytes returned after packet protection is removed.
@@ -257,6 +389,8 @@ pub const Packet = struct {
     number: u64,
     /// Key phase marker stored in the header.
     key_phase: bool,
+    /// Delivery classification for the packet.
+    delivery_state: PacketDeliveryState,
     /// Decrypted payload bytes.
     payload: []u8,
 
@@ -273,6 +407,8 @@ pub const Session = struct {
     allocator: std.mem.Allocator,
     /// Current lifecycle state.
     state: SessionState,
+    /// Handshake progress retained for application-data admission.
+    handshake_status: HandshakeStatus,
     /// Local destination connection identifier.
     local_connection_id: ConnectionId,
     /// Peer connection identifier.
@@ -297,6 +433,7 @@ pub const Session = struct {
         return .{
             .allocator = allocator,
             .state = .initial,
+            .handshake_status = .idle,
             .local_connection_id = local_id,
             .remote_connection_id = remote_id,
             .packet_spaces = .{
@@ -313,6 +450,9 @@ pub const Session = struct {
 
     /// Releases session-owned bookkeeping.
     pub fn deinit(self: *Session) void {
+        for (&self.packet_spaces) |*packet_space| {
+            packet_space.deinit(self.allocator);
+        }
         self.recovery.deinit(self.allocator);
         self.stream_registry.deinit(self.allocator);
         self.* = undefined;
@@ -322,12 +462,14 @@ pub const Session = struct {
     pub fn beginHandshake(self: *Session) void {
         if (self.state == .initial) {
             self.state = .handshake;
+            self.handshake_status = .in_progress;
         }
     }
 
     /// Marks the session as ready for application data.
     pub fn establish(self: *Session) void {
         self.state = .established;
+        self.handshake_status = .confirmed;
     }
 
     /// Begins session close bookkeeping.
@@ -343,8 +485,26 @@ pub const Session = struct {
     }
 
     /// Opens a new stream in the selected stream family.
-    pub fn openStream(self: *Session, kind: StreamKind) std.mem.Allocator.Error!u64 {
+    pub fn openStream(self: *Session, kind: StreamKind) Error!u64 {
+        if (self.state != .established) {
+            return error.HandshakeIncomplete;
+        }
         return self.stream_registry.openStream(self.allocator, kind);
+    }
+
+    /// Marks one previously opened stream as completed.
+    pub fn completeStream(self: *Session, stream_id: u64) bool {
+        return self.stream_registry.markCompleted(stream_id);
+    }
+
+    /// Marks one previously opened stream as reset.
+    pub fn resetStream(self: *Session, stream_id: u64) bool {
+        return self.stream_registry.markReset(stream_id);
+    }
+
+    /// Returns the lifecycle state for one tracked stream, when present.
+    pub fn streamState(self: *const Session, stream_id: u64) ?StreamLifecycle {
+        return self.stream_registry.stateFor(stream_id);
     }
 
     /// Applies reversible packet protection and returns an owned datagram.
@@ -354,6 +514,9 @@ pub const Session = struct {
         space: PacketNumberSpace,
         payload: []const u8,
     ) Error![]u8 {
+        if (space == .application and self.handshake_status != .confirmed) {
+            return error.HandshakeIncomplete;
+        }
         const header_len = 28;
         const index = packetSpaceIndex(space);
         const packet_number = self.packet_spaces[index].next_packet_number;
@@ -379,11 +542,14 @@ pub const Session = struct {
             bytes[header_len + offset] = byte ^ mask;
         }
 
+        const payload_copy = try self.allocator.dupe(u8, payload);
+        errdefer self.allocator.free(payload_copy);
         try self.recovery.onPacketSent(self.allocator, .{
             .number = packet_number,
             .space = space,
             .bytes_in_flight = bytes.len,
             .ack_eliciting = true,
+            .payload = payload_copy,
         });
         self.congestion.onPacketSent(bytes.len);
 
@@ -427,34 +593,48 @@ pub const Session = struct {
         }
 
         const index = packetSpaceIndex(space);
-        self.packet_spaces[index].largest_received = if (self.packet_spaces[index].largest_received) |largest|
-            @max(largest, packet_number)
-        else
-            packet_number;
+        const delivery_state = try self.packet_spaces[index].observeReceived(self.allocator, packet_number);
         if (space == .application and self.state != .closed) {
             self.state = .established;
+            self.handshake_status = .confirmed;
         }
 
         return .{
             .space = space,
             .number = packet_number,
             .key_phase = packet_bytes[1] != 0,
+            .delivery_state = delivery_state,
             .payload = payload,
         };
     }
 
     /// Marks one packet as acknowledged and updates congestion state.
     pub fn acknowledge(self: *Session, space: PacketNumberSpace, number: u64) bool {
-        const packet = self.recovery.onAck(number, space) orelse return false;
+        var packet = self.recovery.onAck(number, space) orelse return false;
+        defer packet.deinit(self.allocator);
         self.congestion.onAck(packet.bytes_in_flight);
         return true;
     }
 
     /// Marks one packet as lost and updates congestion state.
     pub fn markLoss(self: *Session, space: PacketNumberSpace, number: u64) bool {
-        const packet = self.recovery.onLoss(number, space) orelse return false;
+        var packet = self.recovery.onLoss(number, space) orelse return false;
+        defer packet.deinit(self.allocator);
         self.congestion.onLoss(packet.bytes_in_flight);
         return true;
+    }
+
+    /// Retransmits one outstanding packet payload with a fresh packet number.
+    pub fn retransmitLostPacket(
+        self: *Session,
+        allocator: std.mem.Allocator,
+        space: PacketNumberSpace,
+        number: u64,
+    ) Error![]u8 {
+        var packet = self.recovery.takeForRetransmission(number, space) orelse return error.PacketNotOutstanding;
+        defer packet.deinit(self.allocator);
+        self.congestion.onLoss(packet.bytes_in_flight);
+        return self.protectPacket(allocator, space, packet.payload);
     }
 };
 
@@ -472,6 +652,26 @@ pub const Connection = Session;
 /// Returns the packet-space index used by `Connection.packet_spaces`.
 fn packetSpaceIndex(space: PacketNumberSpace) usize {
     return @intFromEnum(space);
+}
+
+/// Returns the tracked stream matching `stream_id`, when present.
+fn findStream(streams: []const StreamState, stream_id: u64) ?StreamState {
+    for (streams) |stream| {
+        if (stream.id == stream_id) {
+            return stream;
+        }
+    }
+    return null;
+}
+
+/// Returns a mutable tracked stream matching `stream_id`, when present.
+fn findStreamMutable(streams: []StreamState, stream_id: u64) ?*StreamState {
+    for (streams) |*stream| {
+        if (stream.id == stream_id) {
+            return stream;
+        }
+    }
+    return null;
 }
 
 /// Writes a big-endian `u16` into the provided slice.
@@ -553,6 +753,8 @@ test "quic packet protection round trips application payloads" {
 test "quic recovery updates congestion on ack and loss" {
     var client = Session.init(std.testing.allocator, "client01".*, "server01".*);
     defer client.deinit();
+    client.beginHandshake();
+    client.establish();
 
     const first = try client.protectPacket(std.testing.allocator, .application, "first");
     defer std.testing.allocator.free(first);
@@ -572,6 +774,8 @@ test "quic recovery updates congestion on ack and loss" {
 test "quic stream ids separate bidirectional and unidirectional families" {
     var client = Session.init(std.testing.allocator, "client01".*, "server01".*);
     defer client.deinit();
+    client.beginHandshake();
+    client.establish();
 
     try std.testing.expectEqual(@as(u64, 0), try client.openStream(.bidirectional));
     try std.testing.expectEqual(@as(u64, 4), try client.openStream(.bidirectional));

@@ -250,10 +250,20 @@ pub const Runtime = struct {
         }
 
         const session = try self.sessionForPeer(connection_ids.source, peer);
+        try applyNegotiatedQpackState(session);
         var packet = try session.connection.unprotectPacket(self.allocator, packet_bytes);
         defer packet.deinit(self.allocator);
+        if (packet.delivery_state == .duplicate) {
+            return;
+        }
 
-        var request = try h3_server.decodeRequest(self.allocator, packet.payload);
+        var request = try h3_server.decodeRequestWithPeerState(
+            self.allocator,
+            &session.qpack_state,
+            session.control_plane.peer_settings.?.qpack_max_table_capacity,
+            session.control_plane.peer_settings.?.qpack_blocked_streams,
+            packet.payload,
+        );
         defer request.deinit(self.allocator);
 
         var server_request = try self.buildServerRequest(peer, request);
@@ -275,7 +285,14 @@ pub const Runtime = struct {
         try dispatchRequest(self.config, &server_request, &writer);
         try writer.finish();
 
-        const payload = try encodeWriterResponse(self.allocator, &writer, response_buffer.body.items);
+        const payload = try encodeWriterResponse(
+            self.allocator,
+            &session.qpack_state,
+            session.control_plane.peer_settings.?.qpack_max_table_capacity,
+            session.control_plane.peer_settings.?.qpack_blocked_streams,
+            &writer,
+            response_buffer.body.items,
+        );
         defer self.allocator.free(payload);
 
         const response_packet = try session.connection.protectPacket(
@@ -314,19 +331,29 @@ pub const Runtime = struct {
         var connection = h3_quic.Connection.init(self.allocator, self.local_connection_id, remote_connection_id);
         connection.beginHandshake();
         connection.establish();
+        const control_stream_id = try connection.openStream(.unidirectional);
+        const qpack_encoder_stream_id = try connection.openStream(.unidirectional);
+        const qpack_decoder_stream_id = try connection.openStream(.unidirectional);
+        var qpack_state = h3_qpack.PeerState.init(
+            self.allocator,
+            http3_config.qpack_limits.dynamic_table_capacity.toInt(),
+            http3_config.qpack_limits.blocked_streams.toInt(),
+        );
+        qpack_state.encoder_stream.stream_id = qpack_encoder_stream_id;
+        qpack_state.decoder_stream.stream_id = qpack_decoder_stream_id;
 
         try self.sessions.append(self.allocator, .{
             .remote_connection_id = remote_connection_id,
             .session = .{
                 .connection = connection,
-                .qpack_state = h3_qpack.PeerState.init(
-                    self.allocator,
-                    http3_config.qpack_limits.dynamic_table_capacity.toInt(),
-                    http3_config.qpack_limits.blocked_streams.toInt(),
-                ),
+                .qpack_state = qpack_state,
                 .control_plane = .{
-                    .local_control_stream_id = 2,
+                    .local_control_stream_id = control_stream_id,
                     .peer_control_stream_id = 3,
+                    .local_settings = .{
+                        .qpack_max_table_capacity = http3_config.qpack_limits.dynamic_table_capacity.toInt(),
+                        .qpack_blocked_streams = http3_config.qpack_limits.blocked_streams.toInt(),
+                    },
                     .peer_settings = .{
                         .qpack_max_table_capacity = http3_config.qpack_limits.dynamic_table_capacity.toInt(),
                         .qpack_blocked_streams = http3_config.qpack_limits.blocked_streams.toInt(),
@@ -349,8 +376,16 @@ pub const Runtime = struct {
         errdefer headers.deinit();
 
         try headers.append("Host", self.config.http3.?.listen_host);
+        var iterator = request.headers.iterator();
+        while (iterator.next()) |header| {
+            try headers.append(header.name, header.value);
+        }
         if (request.cookie_header) |cookie_header| {
+            if (headers.get("cookie") != null) {
+                // The decoded header collection already preserved the cookie.
+            } else {
             try headers.append("Cookie", cookie_header);
+            }
         }
 
         const owned_host = try self.allocator.dupe(u8, self.config.http3.?.listen_host);
@@ -409,6 +444,9 @@ pub const Runtime = struct {
 /// Encodes a buffered writer state into HTTP/3 HEADERS and DATA frames.
 fn encodeWriterResponse(
     allocator: std.mem.Allocator,
+    qpack_state: *h3_qpack.PeerState,
+    qpack_max_table_capacity: usize,
+    qpack_blocked_streams: usize,
     writer: *const server_types.ServerResponseWriter,
     body: []const u8,
 ) Error![]u8 {
@@ -429,7 +467,8 @@ fn encodeWriterResponse(
         try appendOwnedHeader(allocator, &headers, header.name, header.value);
     }
 
-    const header_block = try h3_qpack.encodeHeaderBlock(allocator, headers.items);
+    qpack_state.configureLimits(qpack_max_table_capacity, qpack_blocked_streams);
+    const header_block = try qpack_state.encodeHeaders(headers.items);
     defer allocator.free(header_block);
     const headers_frame = try h3_qpack.encodeFrame(allocator, .headers, header_block);
     defer allocator.free(headers_frame);
@@ -460,6 +499,21 @@ fn appendOwnedHeader(
         .name = owned_name,
         .value = owned_value,
     });
+}
+
+/// Applies the negotiated SETTINGS values to the retained QPACK state.
+fn applyNegotiatedQpackState(session: *ListenerSession) Error!void {
+    const peer_settings = session.control_plane.peer_settings orelse return error.InvalidHttp3Configuration;
+    if (session.qpack_state.encoder_stream.stream_id == null) {
+        return error.InvalidHttp3Configuration;
+    }
+    if (session.qpack_state.decoder_stream.stream_id == null) {
+        return error.InvalidHttp3Configuration;
+    }
+    session.qpack_state.configureLimits(
+        peer_settings.qpack_max_table_capacity,
+        peer_settings.qpack_blocked_streams,
+    );
 }
 
 /// Returns the connection identifiers carried by one protected QUIC packet.

@@ -2,6 +2,10 @@
 
 const std = @import("std");
 const http3 = @import("../http3/http3.zig");
+const http3_client = @import("../http3/client.zig");
+const quic = @import("../http3/quic.zig");
+const runtime = @import("../server/runtime.zig");
+const server_types = @import("../server/types.zig");
 const types = @import("../types.zig");
 const interop_harness = @import("interop_harness.zig");
 const smoke_runner = @import("smoke_runner.zig");
@@ -108,4 +112,136 @@ test "http3 smoke scenario uses the default build path" {
     const http3_scenario = smoke_scenarios[smoke_scenarios.len - 1];
     try std.testing.expectEqualStrings("http3", http3_scenario.name);
     try std.testing.expectEqualStrings("--http3", http3_scenario.command.argv[5]);
+}
+
+test "http3 disturbance coverage classifies basic loss duplication and reordering predictably" {
+    const scenario = interop_harness.http3DatagramScenarioForRoute(.stream_large).?;
+    try std.testing.expectEqual(
+        @as(?interop_harness.LocalDisturbanceProfileId, .basic),
+        scenario.runtime.disturbance_profile,
+    );
+    try std.testing.expectEqual(@as(usize, 4), scenario.runtime.disturbance_kinds.len);
+
+    var client = quic.Session.init(std.testing.allocator, "client01".*, "server01".*);
+    defer client.deinit();
+    var server = quic.Session.init(std.testing.allocator, "server01".*, "client01".*);
+    defer server.deinit();
+    client.beginHandshake();
+    client.establish();
+    server.beginHandshake();
+    server.establish();
+
+    const stream_a = try client.openStream(.bidirectional);
+    const stream_b = try client.openStream(.bidirectional);
+    try std.testing.expectEqual(@as(u64, 0), stream_a);
+    try std.testing.expectEqual(@as(u64, 4), stream_b);
+
+    const first = try client.protectPacket(std.testing.allocator, .application, "stream-a");
+    defer std.testing.allocator.free(first);
+    const second = try client.protectPacket(std.testing.allocator, .application, "stream-b");
+    defer std.testing.allocator.free(second);
+
+    var second_packet = try server.unprotectPacket(std.testing.allocator, second);
+    defer second_packet.deinit(std.testing.allocator);
+    try std.testing.expectEqual(quic.PacketDeliveryState.fresh, second_packet.delivery_state);
+    try std.testing.expectEqualStrings("stream-b", second_packet.payload);
+
+    var first_packet = try server.unprotectPacket(std.testing.allocator, first);
+    defer first_packet.deinit(std.testing.allocator);
+    try std.testing.expectEqual(quic.PacketDeliveryState.reordered, first_packet.delivery_state);
+    try std.testing.expectEqualStrings("stream-a", first_packet.payload);
+
+    var duplicate_packet = try server.unprotectPacket(std.testing.allocator, first);
+    defer duplicate_packet.deinit(std.testing.allocator);
+    try std.testing.expectEqual(quic.PacketDeliveryState.duplicate, duplicate_packet.delivery_state);
+
+    const retransmitted = try client.retransmitLostPacket(std.testing.allocator, .application, 0);
+    defer std.testing.allocator.free(retransmitted);
+    var recovered = try server.unprotectPacket(std.testing.allocator, retransmitted);
+    defer recovered.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("stream-a", recovered.payload);
+}
+
+test "http3 runtime preserves repeated header values with connection scoped qpack state" {
+    const EchoHeaders = struct {
+        fn handle(
+            _: ?*anyopaque,
+            request: *server_types.ServerRequest,
+            writer: *server_types.ServerResponseWriter,
+        ) !void {
+            writer.setStatus(.ok);
+            try writer.appendHeader("Content-Type", "application/json");
+            if (request.header("x-state")) |value| {
+                try writer.appendHeader("X-State", value);
+            }
+            if (request.header("x-variant")) |value| {
+                try writer.appendHeader("X-Variant", value);
+            }
+            try writer.writeAll("{\"protocol\":\"h3\"}");
+        }
+    };
+
+    var config = server_types.ServerConfig.init(EchoHeaders.handle);
+    config.port = types.Port.init(0);
+    var http3_config = server_types.Http3ListenerConfig.init();
+    http3_config.port = types.Port.init(0);
+    config.http3 = http3_config;
+
+    var server = try runtime.Server.init(std.testing.allocator, config);
+    defer server.deinit();
+    try server.start();
+
+    const port = types.Port.init(server.http3Port().?);
+    var session = try http3_client.RuntimeSession.init(std.testing.allocator, "127.0.0.1", port);
+    defer session.deinit();
+
+    var first_request = types.Request.init(
+        std.testing.allocator,
+        .get,
+        types.Uri.init(.https, "127.0.0.1", port, "/echo", null, null),
+    );
+    defer first_request.deinit();
+    try first_request.headers.append("Host", "127.0.0.1");
+    try first_request.headers.append("X-State", "alpha");
+    try first_request.headers.append("X-Variant", "one");
+
+    var first_response = try session.executeRequest(&first_request);
+    defer first_response.deinit();
+    defer if (first_response.body) |body| body.close();
+    try std.testing.expectEqual(types.Status.ok, first_response.status);
+    try std.testing.expectEqualStrings("alpha", first_response.headers.get("x-state").?);
+    try std.testing.expectEqualStrings("one", first_response.headers.get("x-variant").?);
+
+    var second_request = types.Request.init(
+        std.testing.allocator,
+        .get,
+        types.Uri.init(.https, "127.0.0.1", port, "/echo", null, null),
+    );
+    defer second_request.deinit();
+    try second_request.headers.append("Host", "127.0.0.1");
+    try second_request.headers.append("X-State", "beta");
+    try second_request.headers.append("X-Variant", "two");
+
+    var second_response = try session.executeRequest(&second_request);
+    defer second_response.deinit();
+    defer if (second_response.body) |body| body.close();
+    try std.testing.expectEqualStrings("beta", second_response.headers.get("x-state").?);
+    try std.testing.expectEqualStrings("two", second_response.headers.get("x-variant").?);
+
+    try std.testing.expect(session.qpack_state.encoder_stream.stream_id != null);
+    try std.testing.expect(session.qpack_state.decoder_stream.stream_id != null);
+    try std.testing.expect(session.qpack_state.encoder_table.entries.items.len >= 8);
+    try std.testing.expect(session.qpack_state.decoder_table.entries.items.len >= 4);
+
+    if (server.http3_runtime) |*http3_runtime| {
+        try std.testing.expectEqual(@as(usize, 1), http3_runtime.sessions.items.len);
+        const listener_session = &http3_runtime.sessions.items[0].session;
+        try std.testing.expectEqual(http3.CriticalStreamStatus.ready, listener_session.control_plane.critical_stream_status);
+        try std.testing.expect(listener_session.qpack_state.encoder_stream.stream_id != null);
+        try std.testing.expect(listener_session.qpack_state.decoder_stream.stream_id != null);
+        try std.testing.expect(listener_session.qpack_state.decoder_table.entries.items.len >= 8);
+        try std.testing.expect(listener_session.qpack_state.encoder_table.entries.items.len >= 6);
+    } else {
+        return error.TestUnexpectedResult;
+    }
 }

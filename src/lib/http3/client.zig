@@ -132,7 +132,13 @@ pub fn executeHarnessRequest(
         .host = request.uri.host,
         .port = request.uri.effectivePort(),
     });
-    const response_packet = try harness_server.handleDatagram(&server_conn, request_packet);
+    var harness_session = server.SessionState.init(allocator, 4 * 1024, 8);
+    defer harness_session.deinit();
+    const response_packet = try harness_server.handleDatagramWithSession(
+        &server_conn,
+        &harness_session,
+        request_packet,
+    );
     defer allocator.free(response_packet);
 
     return try decodeResponse(allocator, &client_conn, response_packet);
@@ -148,6 +154,18 @@ pub const RuntimeSession = struct {
     connection: quic.Connection,
     /// Connection-scoped QPACK state retained across repeated exchanges.
     qpack_state: qpack.PeerState,
+    /// Local control stream identifier.
+    control_stream_id: u64,
+    /// Local QPACK encoder stream identifier.
+    qpack_encoder_stream_id: u64,
+    /// Local QPACK decoder stream identifier.
+    qpack_decoder_stream_id: u64,
+    /// Negotiated maximum QPACK table capacity.
+    qpack_max_table_capacity: usize,
+    /// Negotiated maximum blocked-stream count.
+    qpack_blocked_stream_limit: usize,
+    /// Whether critical control-stream setup completed for the session.
+    control_stream_ready: bool,
 
     /// Connects a new loopback HTTP/3 runtime session.
     pub fn init(
@@ -174,12 +192,24 @@ pub const RuntimeSession = struct {
         );
         connection.beginHandshake();
         connection.establish();
+        const control_stream_id = try connection.openStream(.unidirectional);
+        const qpack_encoder_stream_id = try connection.openStream(.unidirectional);
+        const qpack_decoder_stream_id = try connection.openStream(.unidirectional);
+        var qpack_state = qpack.PeerState.init(allocator, 4 * 1024, 8);
+        qpack_state.encoder_stream.stream_id = qpack_encoder_stream_id;
+        qpack_state.decoder_stream.stream_id = qpack_decoder_stream_id;
 
         return .{
             .allocator = allocator,
             .socket = socket,
             .connection = connection,
-            .qpack_state = qpack.PeerState.init(allocator, 4 * 1024, 8),
+            .qpack_state = qpack_state,
+            .control_stream_id = control_stream_id,
+            .qpack_encoder_stream_id = qpack_encoder_stream_id,
+            .qpack_decoder_stream_id = qpack_decoder_stream_id,
+            .qpack_max_table_capacity = 4 * 1024,
+            .qpack_blocked_stream_limit = 8,
+            .control_stream_ready = true,
         };
     }
 
@@ -193,6 +223,7 @@ pub const RuntimeSession = struct {
 
     /// Executes one HTTP/3 request against the connected runtime.
     pub fn executeRequest(self: *RuntimeSession, request: *const types.Request) Error!types.Response {
+        try self.applyNegotiatedSettings();
         var plan = try prepareRuntimeRequest(
             self.allocator,
             &self.connection,
@@ -219,6 +250,19 @@ pub const RuntimeSession = struct {
             &self.connection,
             &self.qpack_state,
             buffer[0..read_len],
+        );
+    }
+
+    /// Applies the negotiated SETTINGS values to the retained QPACK state.
+    fn applyNegotiatedSettings(self: *RuntimeSession) Error!void {
+        if (!self.control_stream_ready) {
+            return error.InvalidControlStreamState;
+        }
+        self.qpack_state.encoder_stream.stream_id = self.qpack_encoder_stream_id;
+        self.qpack_state.decoder_stream.stream_id = self.qpack_decoder_stream_id;
+        self.qpack_state.configureLimits(
+            self.qpack_max_table_capacity,
+            self.qpack_blocked_stream_limit,
         );
     }
 };

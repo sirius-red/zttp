@@ -22,6 +22,47 @@ pub const Options = struct {
     port: types.Port = types.Port.init(4433),
 };
 
+/// Connection-scoped HTTP/3 compression state retained by the harness server path.
+pub const SessionState = struct {
+    /// Connection-scoped QPACK state reused across repeated exchanges.
+    qpack_state: qpack.PeerState,
+    /// Negotiated maximum dynamic-table capacity for the peer.
+    qpack_max_table_capacity: usize,
+    /// Negotiated blocked-stream limit for the peer.
+    qpack_blocked_streams: usize,
+
+    /// Returns an empty per-session state for the provided QPACK limits.
+    pub fn init(
+        allocator: std.mem.Allocator,
+        qpack_max_table_capacity: usize,
+        qpack_blocked_streams: usize,
+    ) SessionState {
+        return .{
+            .qpack_state = qpack.PeerState.init(
+                allocator,
+                qpack_max_table_capacity,
+                qpack_blocked_streams,
+            ),
+            .qpack_max_table_capacity = qpack_max_table_capacity,
+            .qpack_blocked_streams = qpack_blocked_streams,
+        };
+    }
+
+    /// Releases the retained connection-scoped QPACK state.
+    pub fn deinit(self: *SessionState) void {
+        self.qpack_state.deinit();
+        self.* = undefined;
+    }
+
+    /// Applies the currently negotiated QPACK limits to the retained peer state.
+    pub fn applyNegotiatedSettings(self: *SessionState) void {
+        self.qpack_state.configureLimits(
+            self.qpack_max_table_capacity,
+            self.qpack_blocked_streams,
+        );
+    }
+};
+
 /// One decoded HTTP/3 request.
 pub const DecodedRequest = struct {
     /// HTTP method derived from `:method`.
@@ -30,6 +71,8 @@ pub const DecodedRequest = struct {
     path: []u8,
     /// Query component derived from `:path`, if present.
     query: ?[]u8,
+    /// Decoded non-pseudo request headers preserved for the handler bridge.
+    headers: types.Headers,
     /// Observed `Cookie` header, if present.
     cookie_header: ?[]u8,
     /// Request body bytes.
@@ -41,6 +84,7 @@ pub const DecodedRequest = struct {
         if (self.query) |query| {
             allocator.free(query);
         }
+        self.headers.deinit();
         if (self.cookie_header) |cookie_header| {
             allocator.free(cookie_header);
         }
@@ -80,10 +124,22 @@ pub const Server = struct {
         connection: *quic.Connection,
         packet_bytes: []const u8,
     ) Error![]u8 {
+        var session_state = SessionState.init(self.allocator, 4 * 1024, 8);
+        defer session_state.deinit();
+        return self.handleDatagramWithSession(connection, &session_state, packet_bytes);
+    }
+
+    /// Handles one protected request datagram while reusing retained session state.
+    pub fn handleDatagramWithSession(
+        self: *Server,
+        connection: *quic.Connection,
+        session_state: *SessionState,
+        packet_bytes: []const u8,
+    ) Error![]u8 {
         var packet = try connection.unprotectPacket(self.allocator, packet_bytes);
         defer packet.deinit(self.allocator);
 
-        var request = try decodeRequest(self.allocator, packet.payload);
+        var request = try decodeRequestWithSession(self.allocator, session_state, packet.payload);
         defer request.deinit(self.allocator);
 
         var response = try interop_harness.buildSemanticResponse(self.allocator, .{
@@ -96,7 +152,7 @@ pub const Server = struct {
         });
         defer response.deinit();
 
-        const payload = try encodeResponse(self.allocator, response);
+        const payload = try encodeResponseWithSession(self.allocator, session_state, response);
         defer self.allocator.free(payload);
 
         return try connection.protectPacket(self.allocator, .application, payload);
@@ -110,6 +166,34 @@ pub fn init(allocator: std.mem.Allocator, options: Options) Server {
 
 /// Decodes request frames into a semantic request.
 pub fn decodeRequest(allocator: std.mem.Allocator, bytes: []const u8) Error!DecodedRequest {
+    var session_state = SessionState.init(allocator, 4 * 1024, 8);
+    defer session_state.deinit();
+    return decodeRequestWithSession(allocator, &session_state, bytes);
+}
+
+/// Decodes request frames into a semantic request using retained peer state.
+pub fn decodeRequestWithSession(
+    allocator: std.mem.Allocator,
+    session_state: *SessionState,
+    bytes: []const u8,
+) Error!DecodedRequest {
+    return decodeRequestWithPeerState(
+        allocator,
+        &session_state.qpack_state,
+        session_state.qpack_max_table_capacity,
+        session_state.qpack_blocked_streams,
+        bytes,
+    );
+}
+
+/// Decodes request frames into a semantic request using retained peer QPACK state.
+pub fn decodeRequestWithPeerState(
+    allocator: std.mem.Allocator,
+    qpack_state: *qpack.PeerState,
+    qpack_max_table_capacity: usize,
+    qpack_blocked_streams: usize,
+    bytes: []const u8,
+) Error!DecodedRequest {
     const frames = try qpack.decodeFrames(allocator, bytes);
     defer qpack.freeFrames(allocator, frames);
 
@@ -118,6 +202,8 @@ pub fn decodeRequest(allocator: std.mem.Allocator, bytes: []const u8) Error!Deco
     errdefer allocator.free(path);
     var query: ?[]u8 = null;
     errdefer if (query) |value| allocator.free(value);
+    var headers = types.Headers.init(allocator);
+    errdefer headers.deinit();
     var cookie_header: ?[]u8 = null;
     errdefer if (cookie_header) |value| allocator.free(value);
     var body = try allocator.alloc(u8, 0);
@@ -126,10 +212,11 @@ pub fn decodeRequest(allocator: std.mem.Allocator, bytes: []const u8) Error!Deco
     for (frames) |frame| {
         switch (frame.frame_type) {
             .headers => {
-                const headers = try qpack.decodeHeaderBlock(allocator, frame.payload);
-                defer qpack.freeHeaderFields(allocator, headers);
+                qpack_state.configureLimits(qpack_max_table_capacity, qpack_blocked_streams);
+                const decoded_headers = try qpack_state.decodeHeaders(frame.payload);
+                defer qpack.freeHeaderFields(allocator, decoded_headers);
 
-                for (headers) |header| {
+                for (decoded_headers) |header| {
                     if (std.mem.eql(u8, header.name, ":method")) {
                         method = parseMethod(header.value);
                         continue;
@@ -150,6 +237,11 @@ pub fn decodeRequest(allocator: std.mem.Allocator, bytes: []const u8) Error!Deco
                             allocator.free(value);
                         }
                         cookie_header = try allocator.dupe(u8, header.value);
+                        try headers.append(header.name, header.value);
+                        continue;
+                    }
+                    if (header.name.len > 0 and header.name[0] != ':') {
+                        try headers.append(header.name, header.value);
                     }
                 }
             },
@@ -165,6 +257,7 @@ pub fn decodeRequest(allocator: std.mem.Allocator, bytes: []const u8) Error!Deco
         .method = method orelse return error.MissingPseudoHeader,
         .path = path,
         .query = query,
+        .headers = headers,
         .cookie_header = cookie_header,
         .body = body,
     };
@@ -173,6 +266,34 @@ pub fn decodeRequest(allocator: std.mem.Allocator, bytes: []const u8) Error!Deco
 /// Encodes an interop-harness response into HTTP/3 frames.
 pub fn encodeResponse(
     allocator: std.mem.Allocator,
+    response: interop_harness.SemanticResponse,
+) Error![]u8 {
+    var session_state = SessionState.init(allocator, 4 * 1024, 8);
+    defer session_state.deinit();
+    return encodeResponseWithSession(allocator, &session_state, response);
+}
+
+/// Encodes an interop-harness response using retained peer compression state.
+pub fn encodeResponseWithSession(
+    allocator: std.mem.Allocator,
+    session_state: *SessionState,
+    response: interop_harness.SemanticResponse,
+) Error![]u8 {
+    return encodeResponseWithPeerState(
+        allocator,
+        &session_state.qpack_state,
+        session_state.qpack_max_table_capacity,
+        session_state.qpack_blocked_streams,
+        response,
+    );
+}
+
+/// Encodes an interop-harness response using retained peer QPACK state.
+pub fn encodeResponseWithPeerState(
+    allocator: std.mem.Allocator,
+    qpack_state: *qpack.PeerState,
+    qpack_max_table_capacity: usize,
+    qpack_blocked_streams: usize,
     response: interop_harness.SemanticResponse,
 ) Error![]u8 {
     var headers = std.ArrayListUnmanaged(qpack.HeaderField){};
@@ -195,7 +316,8 @@ pub fn encodeResponse(
         try appendOwnedHeader(allocator, &headers, header.name, header.value, false);
     }
 
-    const header_block = try qpack.encodeHeaderBlock(allocator, headers.items);
+    qpack_state.configureLimits(qpack_max_table_capacity, qpack_blocked_streams);
+    const header_block = try qpack_state.encodeHeaders(headers.items);
     defer allocator.free(header_block);
     const header_frame = try qpack.encodeFrame(allocator, .headers, header_block);
     defer allocator.free(header_frame);
