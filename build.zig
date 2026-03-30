@@ -30,6 +30,26 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const websocket = b.addModule("zttp_websocket", .{
+        .root_source_file = b.path("src/lib/websocket/websocket.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const compression = b.addModule("zttp_compression", .{
+        .root_source_file = b.path("src/lib/compression/encoding.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const multipart = b.addModule("zttp_multipart", .{
+        .root_source_file = b.path("src/lib/multipart/form_data.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const cache = b.addModule("zttp_cache", .{
+        .root_source_file = b.path("src/lib/cache/http_cache.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const testing = b.addModule("zttp_testing", .{
         .root_source_file = b.path("src/lib/testing/testing.zig"),
         .target = target,
@@ -40,6 +60,10 @@ pub fn build(b: *std.Build) void {
     lib.addImport("zttp_http2", http2);
     lib.addImport("zttp_http3", http3);
     lib.addImport("zttp_server", server);
+    lib.addImport("zttp_websocket", websocket);
+    lib.addImport("zttp_compression", compression);
+    lib.addImport("zttp_multipart", multipart);
+    lib.addImport("zttp_cache", cache);
     lib.addImport("zttp_testing", testing);
 
     const readiness_smoke = b.addExecutable(.{

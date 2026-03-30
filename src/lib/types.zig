@@ -299,6 +299,42 @@ pub const NegotiatedProtocol = enum {
     }
 };
 
+/// Support classification for one feature and protocol pairing.
+pub const FeatureSupportLevel = enum {
+    /// The full first-party feature is available on the negotiated protocol.
+    supported,
+    /// The feature is available with documented protocol-specific limits.
+    degraded,
+    /// The feature must fail clearly on the negotiated protocol.
+    unsupported,
+};
+
+/// Higher-level surface that owns a protocol capability.
+pub const FeatureSurface = enum {
+    /// The capability is owned by a server-facing library surface.
+    server,
+    /// The capability is owned by a client-facing library surface.
+    client,
+    /// The capability is shared as a transport-neutral library primitive.
+    shared,
+    /// The capability is owned by hardening and verification coverage.
+    hardening,
+};
+
+/// One typed feature/protocol classification entry.
+pub const ProtocolFeatureCapability = struct {
+    /// Stable feature name surfaced by a capability matrix.
+    feature_name: []const u8,
+    /// Higher-level surface that owns the capability.
+    surface: FeatureSurface,
+    /// Negotiated protocol being classified.
+    protocol: NegotiatedProtocol,
+    /// Classification for the feature/protocol pairing.
+    support: FeatureSupportLevel,
+    /// Optional explanatory note for downgraded or unsupported entries.
+    notes: ?[]const u8,
+};
+
 /// Request target format used for connection pooling decisions.
 pub const ConnectionTargetMode = enum {
     /// Origin-form request target.
@@ -675,4 +711,18 @@ test "protocol plan narrows routed tls identity to the offered alpn set" {
 test "negotiated protocol exposes ALPN token" {
     try std.testing.expectEqualStrings("h2", NegotiatedProtocol.h2.asAlpnBytes());
     try std.testing.expectEqual(Version.http_3, NegotiatedProtocol.h3.asVersion());
+}
+
+test "protocol feature capability keeps typed support metadata" {
+    const capability = ProtocolFeatureCapability{
+        .feature_name = "server.websocket",
+        .surface = .server,
+        .protocol = .h2,
+        .support = .degraded,
+        .notes = "extended CONNECT semantics apply",
+    };
+
+    try std.testing.expectEqual(FeatureSurface.server, capability.surface);
+    try std.testing.expectEqual(FeatureSupportLevel.degraded, capability.support);
+    try std.testing.expectEqual(NegotiatedProtocol.h2, capability.protocol);
 }

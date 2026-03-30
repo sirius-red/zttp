@@ -58,6 +58,57 @@ pub const Endpoint = struct {
     protocol: types.NegotiatedProtocol,
 };
 
+/// Stable M6 capability identifier used by the local interoperability matrix.
+pub const CapabilityFeatureId = enum {
+    /// Server-side exact routing and fallback.
+    server_routing,
+    /// Server-side shared middleware execution.
+    server_middleware,
+    /// Server-side static file publication.
+    server_static_files,
+    /// Server-side response compression.
+    server_compression,
+    /// Server-side WebSocket endpoints.
+    server_websocket,
+    /// Client-side automatic decompression.
+    client_decompression,
+    /// Client-side multipart form submission.
+    client_multipart,
+    /// Client-side retry policy handling.
+    client_retry,
+    /// Client-side cache policy handling.
+    client_cache,
+    /// Client-side WebSocket sessions.
+    client_websocket,
+    /// Cross-protocol hardening and isolation coverage.
+    hardening_matrix,
+};
+
+/// Typed capability entry for one higher-level feature and protocol pairing.
+pub const CapabilityMatrixEntry = struct {
+    /// Stable M6 feature identifier.
+    feature: CapabilityFeatureId,
+    /// Higher-level surface that owns the feature.
+    surface: types.FeatureSurface,
+    /// Negotiated protocol being classified.
+    protocol: types.NegotiatedProtocol,
+    /// Support classification for the pairing.
+    support: types.FeatureSupportLevel,
+    /// Optional explanatory note for downgraded or unsupported pairings.
+    notes: ?[]const u8,
+
+    /// Returns the generic protocol capability view for the entry.
+    pub fn asProtocolCapability(self: CapabilityMatrixEntry) types.ProtocolFeatureCapability {
+        return .{
+            .feature_name = @tagName(self.feature),
+            .surface = self.surface,
+            .protocol = self.protocol,
+            .support = self.support,
+            .notes = self.notes,
+        };
+    }
+};
+
 /// Declarative local harness scenario used across client, server, and CLI tests.
 pub const Scenario = struct {
     /// Stable route identifier.
@@ -435,6 +486,41 @@ const health_echo_routes = [_]RouteId{ .health, .echo_get };
 const large_body_routes = [_]RouteId{ .stream_large, .health };
 const rst_stream_routes = [_]RouteId{ .stream_chunked, .health };
 const goaway_routes = [_]RouteId{ .health, .echo_get };
+const default_capability_matrix = [_]CapabilityMatrixEntry{
+    .{ .feature = .server_routing, .surface = .server, .protocol = .http_1_1, .support = .supported, .notes = null },
+    .{ .feature = .server_routing, .surface = .server, .protocol = .h2, .support = .supported, .notes = null },
+    .{ .feature = .server_routing, .surface = .server, .protocol = .h3, .support = .supported, .notes = null },
+    .{ .feature = .server_middleware, .surface = .server, .protocol = .http_1_1, .support = .supported, .notes = null },
+    .{ .feature = .server_middleware, .surface = .server, .protocol = .h2, .support = .supported, .notes = null },
+    .{ .feature = .server_middleware, .surface = .server, .protocol = .h3, .support = .supported, .notes = null },
+    .{ .feature = .server_static_files, .surface = .server, .protocol = .http_1_1, .support = .supported, .notes = null },
+    .{ .feature = .server_static_files, .surface = .server, .protocol = .h2, .support = .supported, .notes = null },
+    .{ .feature = .server_static_files, .surface = .server, .protocol = .h3, .support = .supported, .notes = null },
+    .{ .feature = .server_compression, .surface = .server, .protocol = .http_1_1, .support = .supported, .notes = null },
+    .{ .feature = .server_compression, .surface = .server, .protocol = .h2, .support = .supported, .notes = null },
+    .{ .feature = .server_compression, .surface = .server, .protocol = .h3, .support = .supported, .notes = null },
+    .{ .feature = .server_websocket, .surface = .server, .protocol = .http_1_1, .support = .supported, .notes = "upgrade handshake" },
+    .{ .feature = .server_websocket, .surface = .server, .protocol = .h2, .support = .supported, .notes = "extended CONNECT handshake" },
+    .{ .feature = .server_websocket, .surface = .server, .protocol = .h3, .support = .supported, .notes = "extended CONNECT handshake" },
+    .{ .feature = .client_decompression, .surface = .client, .protocol = .http_1_1, .support = .supported, .notes = null },
+    .{ .feature = .client_decompression, .surface = .client, .protocol = .h2, .support = .supported, .notes = null },
+    .{ .feature = .client_decompression, .surface = .client, .protocol = .h3, .support = .supported, .notes = null },
+    .{ .feature = .client_multipart, .surface = .client, .protocol = .http_1_1, .support = .supported, .notes = null },
+    .{ .feature = .client_multipart, .surface = .client, .protocol = .h2, .support = .supported, .notes = null },
+    .{ .feature = .client_multipart, .surface = .client, .protocol = .h3, .support = .supported, .notes = null },
+    .{ .feature = .client_retry, .surface = .client, .protocol = .http_1_1, .support = .supported, .notes = "replay safety remains explicit" },
+    .{ .feature = .client_retry, .surface = .client, .protocol = .h2, .support = .supported, .notes = "replay safety remains explicit" },
+    .{ .feature = .client_retry, .surface = .client, .protocol = .h3, .support = .supported, .notes = "replay safety remains explicit" },
+    .{ .feature = .client_cache, .surface = .client, .protocol = .http_1_1, .support = .supported, .notes = null },
+    .{ .feature = .client_cache, .surface = .client, .protocol = .h2, .support = .supported, .notes = null },
+    .{ .feature = .client_cache, .surface = .client, .protocol = .h3, .support = .supported, .notes = null },
+    .{ .feature = .client_websocket, .surface = .client, .protocol = .http_1_1, .support = .supported, .notes = "upgrade handshake" },
+    .{ .feature = .client_websocket, .surface = .client, .protocol = .h2, .support = .supported, .notes = "extended CONNECT handshake" },
+    .{ .feature = .client_websocket, .surface = .client, .protocol = .h3, .support = .supported, .notes = "extended CONNECT handshake" },
+    .{ .feature = .hardening_matrix, .surface = .hardening, .protocol = .http_1_1, .support = .supported, .notes = "loopback plus multi-process coverage" },
+    .{ .feature = .hardening_matrix, .surface = .hardening, .protocol = .h2, .support = .supported, .notes = "loopback plus multiplexed coverage" },
+    .{ .feature = .hardening_matrix, .surface = .hardening, .protocol = .h3, .support = .supported, .notes = "loopback plus UDP runtime coverage" },
+};
 const default_http3_runtime_expectations = Http3RuntimeExpectations{
     .sequential_requests_without_restart = 10,
     .concurrent_sessions_minimum = types.ConnectionCount.init(2),
@@ -865,6 +951,24 @@ pub fn defaultReadinessScenarios() []const ReadinessScenario {
     return &default_readiness_scenarios;
 }
 
+/// Returns the typed higher-level capability matrix for M6 planning and tests.
+pub fn defaultCapabilityMatrix() []const CapabilityMatrixEntry {
+    return &default_capability_matrix;
+}
+
+/// Returns the capability entry for one feature and protocol, if any.
+pub fn capabilityFor(
+    feature: CapabilityFeatureId,
+    protocol: types.NegotiatedProtocol,
+) ?CapabilityMatrixEntry {
+    for (default_capability_matrix) |entry| {
+        if (entry.feature == feature and entry.protocol == protocol) {
+            return entry;
+        }
+    }
+    return null;
+}
+
 /// Returns the default HTTP/2 multiplexing validation scenarios.
 pub fn defaultMultiplexingScenarios() []const MultiplexingScenario {
     return &default_multiplexing_scenarios;
@@ -1268,4 +1372,22 @@ test "multiplexing catalog captures shared-connection and scope diagnostics" {
     const goaway = multiplexingScenarioForId(.goaway_drains_connection).?;
     try std.testing.expectEqual(FailureScope.connection, goaway.diagnostics.expected_failure_scope.?);
     try std.testing.expect(goaway.diagnostics.new_requests_rejected_after_drain);
+}
+
+test "capability matrix classifies M6 features across all targeted protocols" {
+    try std.testing.expectEqual(@as(usize, 33), defaultCapabilityMatrix().len);
+
+    const server_websocket_h2 = capabilityFor(.server_websocket, .h2).?;
+    try std.testing.expectEqual(types.FeatureSurface.server, server_websocket_h2.surface);
+    try std.testing.expectEqual(types.FeatureSupportLevel.supported, server_websocket_h2.support);
+    try std.testing.expect(std.mem.containsAtLeast(u8, server_websocket_h2.notes.?, 1, "CONNECT"));
+
+    const client_cache_h3 = capabilityFor(.client_cache, .h3).?;
+    try std.testing.expectEqual(types.FeatureSurface.client, client_cache_h3.surface);
+    try std.testing.expectEqual(types.FeatureSupportLevel.supported, client_cache_h3.support);
+
+    const hardening_h1 = capabilityFor(.hardening_matrix, .http_1_1).?;
+    const protocol_capability = hardening_h1.asProtocolCapability();
+    try std.testing.expectEqual(types.FeatureSurface.hardening, protocol_capability.surface);
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, protocol_capability.protocol);
 }

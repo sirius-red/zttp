@@ -13,6 +13,11 @@ const redirects = @import("redirects/redirects.zig");
 const cookies = @import("cookies/cookie_jar.zig");
 const proxy_env = @import("proxy/proxy_env.zig");
 const http3_client = @import("http3/client.zig");
+const compression_encoding = @import("compression/encoding.zig");
+const compression_decoder = @import("compression/decoder.zig");
+const multipart_form_data = @import("multipart/form_data.zig");
+const http_cache = @import("cache/http_cache.zig");
+const websocket = @import("websocket/websocket.zig");
 const interop_harness = @import("testing/interop_harness.zig");
 
 /// Typed client errors.
@@ -69,6 +74,30 @@ pub const TlsVerifyMode = types.TlsVerifyMode;
 pub const TlsRootStoreMode = types.TlsRootStoreMode;
 /// TLS configuration.
 pub const TlsConfig = types.TlsConfig;
+/// Generic support classification for higher-level features.
+pub const FeatureSupportLevel = types.FeatureSupportLevel;
+/// Generic capability-matrix entry for higher-level features.
+pub const ProtocolFeatureCapability = types.ProtocolFeatureCapability;
+/// Shared content-encoding identifier.
+pub const ContentEncoding = compression_encoding.ContentEncoding;
+/// Shared response-decoder primitive.
+pub const Decoder = compression_decoder.Decoder;
+/// Shared decoded-body result.
+pub const DecodedBody = compression_decoder.DecodedBody;
+/// Typed multipart form payload.
+pub const FormData = multipart_form_data.FormData;
+/// Multipart replayability classification.
+pub const MultipartReplayability = multipart_form_data.Replayability;
+/// Typed in-memory HTTP cache surface.
+pub const HttpCache = http_cache.HttpCache;
+/// Stored cache entry metadata.
+pub const CacheEntry = http_cache.CacheEntry;
+/// Shared WebSocket module entrypoint.
+pub const WebSocket = websocket;
+/// Shared WebSocket session metadata.
+pub const WebSocketSessionMetadata = websocket.SessionMetadata;
+/// Shared WebSocket session placeholder.
+pub const WebSocketSession = websocket.Session;
 /// Shared origin key used for pool lookups.
 const OriginKey = types.OriginKey;
 

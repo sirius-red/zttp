@@ -284,6 +284,61 @@ pub const RouteCatalog = struct {
     }
 };
 
+/// Server-owned higher-level capability tracked during M6.
+pub const ServerFeature = enum {
+    /// Exact route dispatch and fallback behavior.
+    routing,
+    /// Shared middleware execution before handler dispatch.
+    middleware,
+    /// Static file publication owned by the server surface.
+    static_files,
+    /// Response compression policy owned by the server surface.
+    compression,
+    /// Server-owned WebSocket endpoint behavior.
+    websocket,
+};
+
+/// Policy preference for one optional server feature.
+pub const ServerPolicyPreference = enum {
+    /// Inherit the enclosing application or route default.
+    inherit,
+    /// Require the feature when the route is eligible.
+    required,
+    /// Disable the feature for the route or application.
+    disabled,
+};
+
+/// Shared server feature-policy placeholder for the M6 surface.
+pub const ServerFeaturePolicy = struct {
+    /// Static file publication preference.
+    static_files: ServerPolicyPreference,
+    /// Compression preference for eligible responses.
+    compression: ServerPolicyPreference,
+    /// WebSocket preference for the route or endpoint.
+    websocket: ServerPolicyPreference,
+
+    /// Returns the default inheriting feature policy.
+    pub fn default() ServerFeaturePolicy {
+        return .{
+            .static_files = .inherit,
+            .compression = .inherit,
+            .websocket = .inherit,
+        };
+    }
+};
+
+/// Server-facing capability classification for one protocol pair.
+pub const ServerCapability = struct {
+    /// Server feature being classified.
+    feature: ServerFeature,
+    /// Negotiated protocol being classified.
+    protocol: core.NegotiatedProtocol,
+    /// Support classification for the feature and protocol.
+    support: core.FeatureSupportLevel,
+    /// Optional explanatory note for downgraded semantics.
+    notes: ?[]const u8,
+};
+
 /// Public server configuration for the runtime and CLI.
 pub const ServerConfig = struct {
     /// Host or IPv4 literal to bind.
@@ -614,4 +669,12 @@ test "route catalog rejects duplicate exact identities by default" {
     };
 
     try std.testing.expectError(error.InvalidRouteCatalog, router.validate());
+}
+
+test "server feature policy defaults to inherit across optional surfaces" {
+    const policy = ServerFeaturePolicy.default();
+
+    try std.testing.expectEqual(ServerPolicyPreference.inherit, policy.static_files);
+    try std.testing.expectEqual(ServerPolicyPreference.inherit, policy.compression);
+    try std.testing.expectEqual(ServerPolicyPreference.inherit, policy.websocket);
 }

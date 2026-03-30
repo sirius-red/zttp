@@ -1,5 +1,8 @@
 //! Entry point for server support.
 
+const types = @import("../types.zig");
+const websocket = @import("../websocket/websocket.zig");
+
 /// Server-side public configuration and message types.
 pub const Types = @import("types.zig");
 /// HTTP/1.1 request parsing and response writing helpers.
@@ -28,6 +31,20 @@ pub const MiddlewareDecision = Types.MiddlewareDecision;
 pub const RouteCatalog = Types.RouteCatalog;
 /// Public fallback handler alias.
 pub const FallbackHandler = Types.FallbackHandler;
+/// Public higher-level server feature identifier.
+pub const ServerFeature = Types.ServerFeature;
+/// Public server feature-policy placeholder.
+pub const ServerFeaturePolicy = Types.ServerFeaturePolicy;
+/// Public server capability classification entry.
+pub const ServerCapability = Types.ServerCapability;
+/// Public generic feature-support classification.
+pub const FeatureSupportLevel = types.FeatureSupportLevel;
+/// Public shared WebSocket module entrypoint.
+pub const WebSocket = websocket;
+/// Public shared WebSocket session metadata.
+pub const WebSocketSessionMetadata = websocket.SessionMetadata;
+/// Public shared WebSocket session placeholder.
+pub const WebSocketSession = websocket.Session;
 /// Public HTTP/3 listener configuration alias.
 pub const Http3ListenerConfig = Types.Http3ListenerConfig;
 /// Public HTTP/3 session-limit alias.

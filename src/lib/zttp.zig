@@ -6,6 +6,13 @@ const tls = @import("tls/tls.zig");
 const http2 = @import("http2/http2.zig");
 const server = @import("server/server.zig");
 const http3 = @import("http3/http3.zig");
+const websocket = @import("websocket/websocket.zig");
+const websocket_frame = @import("websocket/frame.zig");
+const compression_encoding = @import("compression/encoding.zig");
+const compression_decoder = @import("compression/decoder.zig");
+const compression_encoder = @import("compression/encoder.zig");
+const multipart_form_data = @import("multipart/form_data.zig");
+const http_cache = @import("cache/http_cache.zig");
 const testing = @import("testing/testing.zig");
 
 /// HTTP method type.
@@ -22,6 +29,12 @@ pub const Port = types.Port;
 pub const Duration = types.Duration;
 /// Byte-size type with explicit units.
 pub const ByteSize = types.ByteSize;
+/// Higher-level feature support classification.
+pub const FeatureSupportLevel = types.FeatureSupportLevel;
+/// Higher-level feature surface classification.
+pub const FeatureSurface = types.FeatureSurface;
+/// Typed feature/protocol capability entry.
+pub const ProtocolFeatureCapability = types.ProtocolFeatureCapability;
 /// Parsed URI type.
 pub const Uri = types.Uri;
 /// TLS verification mode.
@@ -84,6 +97,22 @@ pub const Http3FailureCategory = server.Http3FailureCategory;
 pub const Http3Runtime = server.Http3Runtime;
 /// Bound server runtime type.
 pub const ServerRuntime = server.Server;
+/// Shared WebSocket module entrypoint.
+pub const WebSocket = websocket;
+/// Shared WebSocket frame type.
+pub const WebSocketFrame = websocket_frame.Frame;
+/// Shared WebSocket close-reason type.
+pub const WebSocketCloseReason = websocket_frame.CloseReason;
+/// Shared content-encoding type.
+pub const ContentEncoding = compression_encoding.ContentEncoding;
+/// Shared response-decoder primitive.
+pub const ContentDecoder = compression_decoder.Decoder;
+/// Shared response-encoder primitive.
+pub const ContentEncoder = compression_encoder.Encoder;
+/// Typed multipart form-data payload.
+pub const FormData = multipart_form_data.FormData;
+/// Typed in-memory HTTP cache surface.
+pub const HttpCache = http_cache.HttpCache;
 /// HTTP/3 module entrypoint.
 pub const Http3 = http3;
 /// Shared testing module entrypoint.
@@ -106,6 +135,13 @@ test {
     _ = @import("http2/connection_test.zig");
     _ = @import("http2/test_peer.zig");
     _ = @import("server/server_test.zig");
+    _ = @import("websocket/frame.zig");
+    _ = @import("websocket/websocket.zig");
+    _ = @import("compression/encoding.zig");
+    _ = @import("compression/decoder.zig");
+    _ = @import("compression/encoder.zig");
+    _ = @import("multipart/form_data.zig");
+    _ = @import("cache/http_cache.zig");
     _ = @import("cookies/cookie_jar.zig");
     _ = @import("redirects/redirects.zig");
     _ = @import("proxy/proxy_env.zig");

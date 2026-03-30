@@ -10,10 +10,73 @@ pub const FixtureGroup = enum {
     http,
     /// HTTP/3 and QUIC fixture payloads.
     http3,
+    /// Static assets and cached payload fixtures for M6.
+    m6_assets,
+    /// Peer descriptors for M6 loopback and multi-process profiles.
+    m6_peers,
+    /// Capability and protocol profile metadata for M6.
+    m6_profiles,
 
     /// Returns the relative directory name for the fixture group.
     pub fn dirName(self: FixtureGroup) []const u8 {
         return @tagName(self);
+    }
+};
+
+/// Stable M6 asset fixture identifier.
+pub const M6AssetFixtureId = enum {
+    /// Static stylesheet used by server publication coverage.
+    site_css,
+    /// Binary upload payload used by multipart coverage.
+    upload_bin,
+    /// Cached JSON payload used by revalidation coverage.
+    cached_config,
+
+    /// Returns the fixture path relative to the root fixture directory.
+    pub fn relativePath(self: M6AssetFixtureId) []const u8 {
+        return switch (self) {
+            .site_css => "m6-assets/site.css",
+            .upload_bin => "m6-assets/upload.bin",
+            .cached_config => "m6-assets/cached-config.json",
+        };
+    }
+};
+
+/// Stable M6 peer descriptor identifier.
+pub const M6PeerFixtureId = enum {
+    /// Loopback first-party server application persona.
+    server_app,
+    /// Controlled multi-process HTTP/2 peer persona.
+    h2_peer,
+    /// Controlled multi-process HTTP/3 peer persona.
+    h3_peer,
+
+    /// Returns the fixture path relative to the root fixture directory.
+    pub fn relativePath(self: M6PeerFixtureId) []const u8 {
+        return switch (self) {
+            .server_app => "m6-peers/server-app.json",
+            .h2_peer => "m6-peers/h2-peer.json",
+            .h3_peer => "m6-peers/h3-peer.json",
+        };
+    }
+};
+
+/// Stable M6 protocol profile identifier.
+pub const M6ProtocolProfileId = enum {
+    /// HTTP/1.1 baseline profile.
+    http1_baseline,
+    /// HTTP/2 multiplexing profile.
+    h2_multiplexed,
+    /// HTTP/3 QUIC runtime profile.
+    h3_quic,
+
+    /// Returns the fixture path relative to the root fixture directory.
+    pub fn relativePath(self: M6ProtocolProfileId) []const u8 {
+        return switch (self) {
+            .http1_baseline => "m6-profiles/http1-baseline.json",
+            .h2_multiplexed => "m6-profiles/h2-multiplexed.json",
+            .h3_quic => "m6-profiles/h3-quic.json",
+        };
     }
 };
 
@@ -275,6 +338,60 @@ pub const Loader = struct {
         return try self.loadFromGroup(allocator, .http3, relative_path);
     }
 
+    /// Returns the full path for one named M6 asset fixture.
+    pub fn pathForM6Asset(
+        self: Loader,
+        allocator: std.mem.Allocator,
+        fixture: M6AssetFixtureId,
+    ) LoadError![]u8 {
+        return try self.pathFor(allocator, fixture.relativePath());
+    }
+
+    /// Returns the full path for one named M6 peer fixture.
+    pub fn pathForM6Peer(
+        self: Loader,
+        allocator: std.mem.Allocator,
+        fixture: M6PeerFixtureId,
+    ) LoadError![]u8 {
+        return try self.pathFor(allocator, fixture.relativePath());
+    }
+
+    /// Returns the full path for one named M6 protocol profile fixture.
+    pub fn pathForM6ProtocolProfile(
+        self: Loader,
+        allocator: std.mem.Allocator,
+        fixture: M6ProtocolProfileId,
+    ) LoadError![]u8 {
+        return try self.pathFor(allocator, fixture.relativePath());
+    }
+
+    /// Loads one named M6 asset fixture.
+    pub fn loadM6Asset(
+        self: Loader,
+        allocator: std.mem.Allocator,
+        fixture: M6AssetFixtureId,
+    ) LoadError![]u8 {
+        return try self.load(allocator, fixture.relativePath());
+    }
+
+    /// Loads one named M6 peer fixture.
+    pub fn loadM6Peer(
+        self: Loader,
+        allocator: std.mem.Allocator,
+        fixture: M6PeerFixtureId,
+    ) LoadError![]u8 {
+        return try self.load(allocator, fixture.relativePath());
+    }
+
+    /// Loads one named M6 protocol profile fixture.
+    pub fn loadM6ProtocolProfile(
+        self: Loader,
+        allocator: std.mem.Allocator,
+        fixture: M6ProtocolProfileId,
+    ) LoadError![]u8 {
+        return try self.load(allocator, fixture.relativePath());
+    }
+
     /// Returns the full path for one named QUIC runtime fixture.
     pub fn pathForQuicRuntimeFixture(
         self: Loader,
@@ -472,6 +589,31 @@ test "fixture loader resolves loopback quic runtime fixture paths" {
     try std.testing.expect(
         std.mem.endsWith(u8, paths.runtime_stream_large_path, "http3/quic/runtime/stream-large.bin") or
             std.mem.endsWith(u8, paths.runtime_stream_large_path, "http3\\quic\\runtime\\stream-large.bin"),
+    );
+}
+
+test "fixture loader resolves M6 fixture paths" {
+    const loader = Loader.init();
+
+    const asset = try loader.pathForM6Asset(std.testing.allocator, .site_css);
+    defer std.testing.allocator.free(asset);
+    try std.testing.expect(
+        std.mem.endsWith(u8, asset, "m6-assets/site.css") or
+            std.mem.endsWith(u8, asset, "m6-assets\\site.css"),
+    );
+
+    const peer = try loader.pathForM6Peer(std.testing.allocator, .h2_peer);
+    defer std.testing.allocator.free(peer);
+    try std.testing.expect(
+        std.mem.endsWith(u8, peer, "m6-peers/h2-peer.json") or
+            std.mem.endsWith(u8, peer, "m6-peers\\h2-peer.json"),
+    );
+
+    const profile = try loader.pathForM6ProtocolProfile(std.testing.allocator, .h3_quic);
+    defer std.testing.allocator.free(profile);
+    try std.testing.expect(
+        std.mem.endsWith(u8, profile, "m6-profiles/h3-quic.json") or
+            std.mem.endsWith(u8, profile, "m6-profiles\\h3-quic.json"),
     );
 }
 
