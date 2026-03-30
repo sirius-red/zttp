@@ -119,9 +119,9 @@ What is next:
 
 Longer-term goals:
 
-- [ ] Expand higher-level server features further with static files, compression, and broader framework conveniences.
-- [ ] Add higher-level client conveniences such as multipart/form-data helpers, retries, caching, and automatic decompression.
-- [ ] Add WebSocket support.
+- [X] Expand higher-level server features further with static files, compression, and broader framework conveniences.
+- [X] Add higher-level client conveniences such as multipart/form-data helpers, retries, caching, and automatic decompression.
+- [X] Add WebSocket support.
 - [ ] Bring HTTP/2 and HTTP/3 interoperability and production hardening closer to the maturity of the current HTTP/1.1 path.
 
 ## Build and Test

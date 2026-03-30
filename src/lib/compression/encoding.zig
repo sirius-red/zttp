@@ -67,6 +67,18 @@ pub const EncodingCapability = struct {
     notes: ?[]const u8,
 };
 
+/// Metadata preserved while one response body is decoded transparently.
+pub const ResponseEncodingMetadata = struct {
+    /// Original header value surfaced by the response, when present.
+    header_value: ?[]const u8,
+    /// Parsed content encoding, when the header is recognized.
+    content_encoding: ?ContentEncoding,
+    /// Whether automatic decoding is active for the response body.
+    decoded: bool,
+    /// Whether the original response headers remain intact.
+    preserves_metadata: bool,
+};
+
 /// Parses a content-encoding token into the typed representation.
 pub fn parseEncoding(value: []const u8) ?ContentEncoding {
     if (std.ascii.eqlIgnoreCase(value, "identity")) {
@@ -84,8 +96,35 @@ pub fn parseEncoding(value: []const u8) ?ContentEncoding {
     return null;
 }
 
+/// Returns typed encoding metadata for one response header value.
+pub fn responseMetadataFromHeader(value: ?[]const u8) ResponseEncodingMetadata {
+    if (value) |header_value| {
+        return .{
+            .header_value = header_value,
+            .content_encoding = parseEncoding(header_value),
+            .decoded = false,
+            .preserves_metadata = true,
+        };
+    }
+    return .{
+        .header_value = null,
+        .content_encoding = null,
+        .decoded = false,
+        .preserves_metadata = true,
+    };
+}
+
 test "content encoding round-trips header tokens" {
     try std.testing.expectEqualStrings("gzip", ContentEncoding.gzip.asHeaderValue());
     try std.testing.expectEqual(ContentEncoding.br, parseEncoding("Br").?);
     try std.testing.expect(parseEncoding("compress") == null);
+}
+
+test "response metadata preserves the original encoding header" {
+    const metadata = responseMetadataFromHeader("gzip");
+
+    try std.testing.expectEqualStrings("gzip", metadata.header_value.?);
+    try std.testing.expectEqual(ContentEncoding.gzip, metadata.content_encoding.?);
+    try std.testing.expect(!metadata.decoded);
+    try std.testing.expect(metadata.preserves_metadata);
 }

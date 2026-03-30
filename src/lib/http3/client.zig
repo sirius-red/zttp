@@ -6,12 +6,24 @@ const types = @import("../types.zig");
 const qpack = @import("qpack.zig");
 const quic = @import("quic.zig");
 const server = @import("server.zig");
+const websocket_client = @import("../websocket/client.zig");
 
 /// Monotonic seed used to derive distinct loopback runtime session identifiers.
 var runtime_session_seed = std.atomic.Value(u64).init(0);
 
 /// Error set returned by the local HTTP/3 client helpers.
 pub const Error = anyerror;
+
+/// Creates a client-owned WebSocket session for the HTTP/3 adapter path.
+pub fn openWebSocketSession(
+    uri: types.Uri,
+    options: websocket_client.DialOptions,
+) websocket_client.Error!websocket_client.Session {
+    return websocket_client.connect(.{
+        .path = uri.path,
+        .subprotocol = options.subprotocol,
+    }, .h3, options);
+}
 
 /// One decoded runtime stream envelope retained long enough to parse a response.
 const StreamEnvelope = struct {

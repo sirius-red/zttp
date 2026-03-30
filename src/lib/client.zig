@@ -17,7 +17,7 @@ const compression_encoding = @import("compression/encoding.zig");
 const compression_decoder = @import("compression/decoder.zig");
 const multipart_form_data = @import("multipart/form_data.zig");
 const http_cache = @import("cache/http_cache.zig");
-const websocket = @import("websocket/websocket.zig");
+const websocket = @import("websocket/client.zig");
 const interop_harness = @import("testing/interop_harness.zig");
 
 /// Typed client errors.
@@ -84,14 +84,26 @@ pub const ContentEncoding = compression_encoding.ContentEncoding;
 pub const Decoder = compression_decoder.Decoder;
 /// Shared decoded-body result.
 pub const DecodedBody = compression_decoder.DecodedBody;
+/// Fully buffered decoded response with preserved metadata.
+pub const DecodedResponse = compression_decoder.DecodedResponse;
+/// Preserved response-encoding metadata.
+pub const ResponseEncodingMetadata = compression_encoding.ResponseEncodingMetadata;
 /// Typed multipart form payload.
 pub const FormData = multipart_form_data.FormData;
+/// Typed multipart payload builder.
+pub const FormDataBuilder = multipart_form_data.Builder;
 /// Multipart replayability classification.
 pub const MultipartReplayability = multipart_form_data.Replayability;
+/// Multipart content-length strategy.
+pub const MultipartContentLengthMode = multipart_form_data.ContentLengthMode;
 /// Typed in-memory HTTP cache surface.
 pub const HttpCache = http_cache.HttpCache;
 /// Stored cache entry metadata.
 pub const CacheEntry = http_cache.CacheEntry;
+/// Cache source marker for cache-aware responses.
+pub const CacheSource = http_cache.CacheSource;
+/// Typed cache lookup result.
+pub const CacheLookupResult = http_cache.LookupResult;
 /// Shared WebSocket module entrypoint.
 pub const WebSocket = websocket;
 /// Shared WebSocket session metadata.
@@ -330,6 +342,153 @@ pub const RequestOptions = struct {
         };
     }
 };
+
+/// Retry mode used by the first-party client convenience surface.
+pub const RetryMode = enum {
+    /// Automatic retries are disabled.
+    disabled,
+    /// Retry only when replay safety is explicit.
+    replay_safe,
+};
+
+/// Replay-safety classification used by retry policies.
+pub const RetryReplaySafety = enum {
+    /// Infer replay safety from the request method and body shape.
+    automatic,
+    /// Treat the request as replay-safe.
+    replayable,
+    /// Treat the request as one-shot and ineligible for retry.
+    one_shot,
+};
+
+/// Failure classes that may be retried by the first-party client helpers.
+pub const RetryFailureClass = enum {
+    /// Transport failure before a definitive response completed.
+    transport,
+    /// Timeout before a definitive response completed.
+    timeout,
+    /// Retryable 5xx response class.
+    retryable_5xx,
+};
+
+/// Backoff strategy used between retry attempts.
+pub const BackoffStrategy = union(enum) {
+    /// Retry immediately.
+    immediate,
+    /// Sleep for a fixed duration before retrying.
+    fixed: Duration,
+};
+
+/// Typed retry policy for the higher-level client surface.
+pub const RetryPolicy = struct {
+    /// Retry mode for the request flow.
+    mode: RetryMode,
+    /// Maximum total attempts, including the first request.
+    max_attempts: u8,
+    /// Replay-safety classification for the request.
+    replay_safety: RetryReplaySafety,
+    /// Failure classes allowed by the policy.
+    retryable_failures: []const RetryFailureClass,
+    /// Backoff strategy between attempts.
+    backoff: BackoffStrategy,
+
+    /// Returns the default replay-safe retry policy.
+    pub fn default() RetryPolicy {
+        return .{
+            .mode = .replay_safe,
+            .max_attempts = 3,
+            .replay_safety = .automatic,
+            .retryable_failures = &.{ .transport, .timeout, .retryable_5xx },
+            .backoff = .immediate,
+        };
+    }
+
+    /// Returns true when the provided failure should be retried.
+    pub fn shouldRetry(
+        self: RetryPolicy,
+        request_value: *const types.Request,
+        failure_class: RetryFailureClass,
+        attempt: u8,
+    ) bool {
+        if (self.mode == .disabled or attempt >= self.max_attempts) {
+            return false;
+        }
+        if (!self.isReplaySafe(request_value)) {
+            return false;
+        }
+        for (self.retryable_failures) |candidate| {
+            if (candidate == failure_class) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Applies the configured backoff before the next attempt.
+    pub fn sleepBeforeRetry(self: RetryPolicy) void {
+        switch (self.backoff) {
+            .immediate => {},
+            .fixed => |duration| std.Thread.sleep(duration.toNanos()),
+        }
+    }
+
+    /// Returns true when the policy considers the request replay-safe.
+    fn isReplaySafe(self: RetryPolicy, request_value: *const types.Request) bool {
+        return switch (self.replay_safety) {
+            .replayable => true,
+            .one_shot => false,
+            .automatic => inferRetryReplaySafety(request_value) == .replayable,
+        };
+    }
+};
+
+/// Cache mode used by the first-party client convenience surface.
+pub const CacheMode = enum {
+    /// Disable cache reuse and validation.
+    disabled,
+    /// Reuse fresh entries and revalidate stale entries.
+    use_if_available,
+};
+
+/// Typed cache policy for the higher-level client surface.
+pub const CachePolicy = struct {
+    /// Cache mode for the request flow.
+    mode: CacheMode,
+    /// Optional fixed timestamp used by tests.
+    now_ns: ?i128,
+    /// Whether non-cacheable writes invalidate matching entries.
+    invalidate_on_write: bool,
+
+    /// Returns the default cache policy.
+    pub fn default() CachePolicy {
+        return .{
+            .mode = .use_if_available,
+            .now_ns = null,
+            .invalidate_on_write = true,
+        };
+    }
+};
+
+/// Response returned by the cache-aware client convenience surface.
+pub const CachedResponse = struct {
+    /// Response metadata and body visible to the caller.
+    response: types.Response,
+    /// Cache source marker for the response.
+    source: CacheSource,
+
+    /// Releases the response body and metadata.
+    pub fn deinit(self: *CachedResponse) void {
+        if (self.response.body) |body_reader| {
+            body_reader.close();
+            self.response.body = null;
+        }
+        self.response.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Client-owned WebSocket dial options alias.
+pub const WebSocketDialOptions = websocket.DialOptions;
 
 /// Future type for response completion.
 pub const ResponseFuture = future.RequestFuture(types.Response, Error);
@@ -1489,6 +1648,300 @@ pub const Client = struct {
         return self.requestInternal(request_value, follow_redirects, request_options);
     }
 
+    /// Executes a request and applies automatic response decoding when possible.
+    pub fn requestDecoded(
+        self: *Client,
+        request_value: *const types.Request,
+    ) ResponseFuture.WaitError!types.Response {
+        return self.requestDecodedWithOptions(request_value, RequestOptions.default());
+    }
+
+    /// Executes a request with per-request overrides and applies automatic decoding.
+    pub fn requestDecodedWithOptions(
+        self: *Client,
+        request_value: *const types.Request,
+        request_options: RequestOptions,
+    ) ResponseFuture.WaitError!types.Response {
+        var handle = try self.requestWithOptions(request_value, request_options);
+        defer handle.deinit();
+
+        var response = try handle.wait();
+        _ = compression_decoder.applyAutomaticResponseDecoding(self.allocator, &response) catch {
+            if (response.body) |body_reader| {
+                body_reader.close();
+                response.body = null;
+            }
+            response.deinit();
+            return error.OutOfMemory;
+        };
+        return response;
+    }
+
+    /// Executes one multipart request using the typed form-data builder surface.
+    pub fn requestMultipart(
+        self: *Client,
+        method: types.Method,
+        uri: types.Uri,
+        form: FormData,
+    ) ResponseFuture.WaitError!types.Response {
+        return self.requestMultipartWithOptions(method, uri, form, RequestOptions.default());
+    }
+
+    /// Executes one multipart request with per-request overrides.
+    pub fn requestMultipartWithOptions(
+        self: *Client,
+        method: types.Method,
+        uri: types.Uri,
+        form: FormData,
+        request_options: RequestOptions,
+    ) ResponseFuture.WaitError!types.Response {
+        const rendered_body = form.renderAlloc(self.allocator) catch {
+            return error.OutOfMemory;
+        };
+        defer self.allocator.free(rendered_body);
+
+        const content_type = form.contentTypeAlloc(self.allocator) catch {
+            return error.OutOfMemory;
+        };
+        defer self.allocator.free(content_type);
+
+        var request_value = types.Request.init(self.allocator, method, uri);
+        defer request_value.deinit();
+        try appendHostHeader(&request_value.headers, uri);
+        request_value.headers.append("Content-Type", content_type) catch {
+            return error.OutOfMemory;
+        };
+        const content_length = std.fmt.allocPrint(self.allocator, "{d}", .{rendered_body.len}) catch {
+            return error.OutOfMemory;
+        };
+        defer self.allocator.free(content_length);
+        request_value.headers.append("Content-Length", content_length) catch {
+            return error.OutOfMemory;
+        };
+
+        const body_reader = OwnedBytesBody.init(self.allocator, rendered_body) catch {
+            return error.OutOfMemory;
+        };
+        defer body_reader.body.close();
+        request_value.body = body_reader.body;
+
+        var handle = try self.requestWithOptions(&request_value, request_options);
+        defer handle.deinit();
+        return try handle.wait();
+    }
+
+    /// Executes a request using the typed replay-safe retry policy.
+    pub fn requestWithRetryPolicy(
+        self: *Client,
+        request_value: *const types.Request,
+        retry_policy: RetryPolicy,
+        request_options: RequestOptions,
+    ) ResponseFuture.WaitError!types.Response {
+        var attempt: u8 = 0;
+        while (true) {
+            attempt += 1;
+            var handle = try self.requestWithOptions(request_value, request_options);
+            var response = handle.wait() catch |err| {
+                handle.deinit();
+                const failure_class = retryFailureClassForError(err) orelse return err;
+                if (!retry_policy.shouldRetry(request_value, failure_class, attempt)) {
+                    return err;
+                }
+                retry_policy.sleepBeforeRetry();
+                continue;
+            };
+            handle.deinit();
+
+            const status_code = @intFromEnum(response.status);
+            if (status_code >= 500 and status_code < 600 and
+                retry_policy.shouldRetry(request_value, .retryable_5xx, attempt))
+            {
+                if (response.body) |body_reader| {
+                    body_reader.close();
+                    response.body = null;
+                }
+                response.deinit();
+                retry_policy.sleepBeforeRetry();
+                continue;
+            }
+
+            return response;
+        }
+    }
+
+    /// Executes a request using the typed retry policy and default request options.
+    pub fn requestWithRetry(
+        self: *Client,
+        request_value: *const types.Request,
+        retry_policy: RetryPolicy,
+    ) ResponseFuture.WaitError!types.Response {
+        return self.requestWithRetryPolicy(request_value, retry_policy, RequestOptions.default());
+    }
+
+    /// Executes a request using the typed cache policy and cache store.
+    pub fn requestWithCachePolicy(
+        self: *Client,
+        request_value: *const types.Request,
+        cache: *HttpCache,
+        cache_policy: CachePolicy,
+        request_options: RequestOptions,
+    ) ResponseFuture.WaitError!CachedResponse {
+        if (cache_policy.mode == .disabled) {
+            const response = try self.requestDecodedWithOptions(request_value, request_options);
+            return .{
+                .response = response,
+                .source = .origin,
+            };
+        }
+
+        const now_ns = cache_policy.now_ns orelse std.time.nanoTimestamp();
+        if (!isCacheableMethod(request_value.method)) {
+            if (cache_policy.invalidate_on_write) {
+                cache.invalidate(request_value.uri.host, request_value.uri.path);
+            }
+            const response = try self.requestDecodedWithOptions(request_value, request_options);
+            return .{
+                .response = response,
+                .source = .origin,
+            };
+        }
+
+        const lookup = cache.lookup(
+            request_value.method,
+            request_value.uri.scheme,
+            request_value.uri.host,
+            request_value.uri.effectivePort(),
+            request_value.uri.path,
+            request_value.uri.query,
+            now_ns,
+        );
+
+        switch (lookup.action) {
+            .serve_cached => {
+                return .{
+                    .response = try responseFromCacheEntry(
+                        self.allocator,
+                        lookup.entry.?,
+                        request_value.version,
+                    ),
+                    .source = .cache,
+                };
+            },
+            .revalidate => {
+                _ = cache.beginRevalidation(
+                    request_value.method,
+                    request_value.uri.scheme,
+                    request_value.uri.host,
+                    request_value.uri.effectivePort(),
+                    request_value.uri.path,
+                    request_value.uri.query,
+                );
+
+                var conditional_request = try buildConditionalRequest(
+                    self.allocator,
+                    request_value,
+                    lookup.entry.?,
+                );
+                defer {
+                    if (conditional_request.body) |body_reader| {
+                        body_reader.close();
+                        conditional_request.body = null;
+                    }
+                    conditional_request.deinit();
+                    self.allocator.destroy(conditional_request);
+                }
+
+                var response = try self.requestDecodedWithOptions(conditional_request, request_options);
+                if (response.status == .not_modified) {
+                    if (response.body) |body_reader| {
+                        body_reader.close();
+                        response.body = null;
+                    }
+                    response.deinit();
+                    _ = cache.finishRevalidation(
+                        request_value.method,
+                        request_value.uri.scheme,
+                        request_value.uri.host,
+                        request_value.uri.effectivePort(),
+                        request_value.uri.path,
+                        request_value.uri.query,
+                        now_ns,
+                        lookup.entry.?.max_age,
+                    );
+                    return .{
+                        .response = try responseFromCacheEntry(
+                            self.allocator,
+                            cache.getForRequest(
+                                request_value.method,
+                                request_value.uri.scheme,
+                                request_value.uri.host,
+                                request_value.uri.effectivePort(),
+                                request_value.uri.path,
+                                request_value.uri.query,
+                            ).?,
+                            request_value.version,
+                        ),
+                        .source = .revalidated,
+                    };
+                }
+
+                return .{
+                    .response = try storeCacheableResponse(
+                        self.allocator,
+                        cache,
+                        request_value,
+                        &response,
+                        now_ns,
+                    ),
+                    .source = .revalidated,
+                };
+            },
+            .miss, .unusable => {
+                var response = try self.requestDecodedWithOptions(request_value, request_options);
+                return .{
+                    .response = try storeCacheableResponse(
+                        self.allocator,
+                        cache,
+                        request_value,
+                        &response,
+                        now_ns,
+                    ),
+                    .source = .origin,
+                };
+            },
+        }
+    }
+
+    /// Executes a request using the typed cache policy and default request options.
+    pub fn requestWithCache(
+        self: *Client,
+        request_value: *const types.Request,
+        cache: *HttpCache,
+        cache_policy: CachePolicy,
+    ) ResponseFuture.WaitError!CachedResponse {
+        return self.requestWithCachePolicy(
+            request_value,
+            cache,
+            cache_policy,
+            RequestOptions.default(),
+        );
+    }
+
+    /// Opens one unified first-party WebSocket session for the requested protocol.
+    pub fn openWebSocket(
+        self: *Client,
+        uri: types.Uri,
+        protocol: types.NegotiatedProtocol,
+        options: WebSocketDialOptions,
+    ) websocket.Error!WebSocketSession {
+        _ = self;
+        return switch (protocol) {
+            .http_1_1 => connection_h1.openWebSocketSession(uri, options),
+            .h2 => connection_h2.openWebSocketSession(uri, options),
+            .h3 => http3_client.openWebSocketSession(uri, options),
+        };
+    }
+
     /// Submits a request with explicit redirect handling behavior.
     fn requestInternal(
         self: *Client,
@@ -1970,6 +2423,233 @@ fn http1CompatibilityProtocolPlan() types.ProtocolPlan {
         .expected_protocol = .http_1_1,
         .offered_protocols = &http_1_1_only_protocols,
     };
+}
+
+/// Returns the inferred replay-safety classification for one request.
+fn inferRetryReplaySafety(request_value: *const types.Request) RetryReplaySafety {
+    if (request_value.body != null) {
+        return .one_shot;
+    }
+    return switch (request_value.method) {
+        .get,
+        .head,
+        .put,
+        .delete,
+        .options,
+        .trace,
+        => .replayable,
+        else => .one_shot,
+    };
+}
+
+/// Maps one wait error into a retry failure class when applicable.
+fn retryFailureClassForError(err: ResponseFuture.WaitError) ?RetryFailureClass {
+    return switch (err) {
+        error.Timeout => .timeout,
+        error.Transport => .transport,
+        else => null,
+    };
+}
+
+/// Returns true when the method is eligible for cache reuse.
+fn isCacheableMethod(method: types.Method) bool {
+    return switch (method) {
+        .get, .head => true,
+        else => false,
+    };
+}
+
+/// Request or response body backed by owned in-memory bytes.
+const OwnedBytesBody = struct {
+    /// Allocator used to destroy the state.
+    allocator: std.mem.Allocator,
+    /// Owned payload bytes.
+    bytes: []u8,
+    /// Current read offset.
+    offset: usize,
+    /// Body reader surfaced to callers.
+    body: types.BodyReader,
+
+    /// Creates an owned body reader from copied bytes.
+    fn init(allocator: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error!OwnedBytesBody {
+        const state = try allocator.create(OwnedBytesBodyState);
+        errdefer allocator.destroy(state);
+        state.* = .{
+            .allocator = allocator,
+            .bytes = try allocator.dupe(u8, bytes),
+            .offset = 0,
+        };
+        return .{
+            .allocator = allocator,
+            .bytes = state.bytes,
+            .offset = 0,
+            .body = .{
+                .ctx = state,
+                .read_fn = OwnedBytesBodyState.read,
+                .close_fn = OwnedBytesBodyState.close,
+            },
+        };
+    }
+};
+
+/// State object that implements an owned in-memory body reader.
+const OwnedBytesBodyState = struct {
+    /// Allocator used to release the state.
+    allocator: std.mem.Allocator,
+    /// Owned payload bytes.
+    bytes: []u8,
+    /// Current read offset.
+    offset: usize,
+
+    /// Reads one chunk from the owned payload.
+    fn read(ctx: ?*anyopaque, dest: []u8) anyerror!usize {
+        const self: *OwnedBytesBodyState = @ptrCast(@alignCast(ctx.?));
+        if (self.offset >= self.bytes.len) {
+            return 0;
+        }
+        const remaining = self.bytes.len - self.offset;
+        const to_copy = @min(dest.len, remaining);
+        std.mem.copyForwards(u8, dest[0..to_copy], self.bytes[self.offset .. self.offset + to_copy]);
+        self.offset += to_copy;
+        return to_copy;
+    }
+
+    /// Releases the owned payload bytes and the reader state.
+    fn close(ctx: ?*anyopaque) void {
+        const self: *OwnedBytesBodyState = @ptrCast(@alignCast(ctx.?));
+        self.allocator.free(self.bytes);
+        self.allocator.destroy(self);
+    }
+};
+
+/// Reads an entire response body into one owned byte buffer and closes the reader.
+fn readAllBodyAlloc(allocator: std.mem.Allocator, reader: types.BodyReader) ResponseFuture.WaitError![]u8 {
+    var bytes = std.ArrayListUnmanaged(u8){};
+    defer bytes.deinit(allocator);
+    defer reader.close();
+
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const read_len = try reader.read(buffer[0..]);
+        if (read_len == 0) {
+            break;
+        }
+        try bytes.appendSlice(allocator, buffer[0..read_len]);
+    }
+    return bytes.toOwnedSlice(allocator);
+}
+
+/// Builds a conditional request using the validators stored in one cache entry.
+fn buildConditionalRequest(
+    allocator: std.mem.Allocator,
+    request_value: *const types.Request,
+    entry: *const CacheEntry,
+) Error!*types.Request {
+    const request_copy = allocator.create(types.Request) catch {
+        return error.OutOfMemory;
+    };
+    errdefer allocator.destroy(request_copy);
+
+    request_copy.* = types.Request.init(allocator, request_value.method, request_value.uri);
+    errdefer request_copy.deinit();
+    request_copy.version = request_value.version;
+    request_copy.body = request_value.body;
+
+    var iter = request_value.headers.iterator();
+    while (iter.next()) |header| {
+        try request_copy.headers.append(header.name, header.value);
+    }
+    if (entry.etag) |etag| {
+        try request_copy.headers.append("If-None-Match", etag);
+    }
+    if (entry.last_modified) |last_modified| {
+        try request_copy.headers.append("If-Modified-Since", last_modified);
+    }
+    return request_copy;
+}
+
+/// Creates a response object from one cached entry.
+fn responseFromCacheEntry(
+    allocator: std.mem.Allocator,
+    entry: *const CacheEntry,
+    version: types.Version,
+) ResponseFuture.WaitError!types.Response {
+    var response = types.Response.init(allocator, version, entry.status);
+    errdefer response.deinit();
+
+    if (entry.content_type) |content_type| {
+        try response.headers.append("Content-Type", content_type);
+    }
+    if (entry.etag) |etag| {
+        try response.headers.append("ETag", etag);
+    }
+    if (entry.last_modified) |last_modified| {
+        try response.headers.append("Last-Modified", last_modified);
+    }
+
+    const body_reader = try OwnedBytesBody.init(allocator, entry.body);
+    response.body = body_reader.body;
+    return response;
+}
+
+/// Stores one cacheable response and returns a rewrapped response for the caller.
+fn storeCacheableResponse(
+    allocator: std.mem.Allocator,
+    cache: *HttpCache,
+    request_value: *const types.Request,
+    response: *types.Response,
+    stored_at_ns: i128,
+) ResponseFuture.WaitError!types.Response {
+    const body_bytes = if (response.body) |body_reader|
+        try readAllBodyAlloc(allocator, body_reader)
+    else
+        try allocator.alloc(u8, 0);
+    errdefer allocator.free(body_bytes);
+    response.body = null;
+
+    const cacheable = response.status == .ok;
+    if (cacheable) {
+        try cache.put(.{
+            .key = .{
+                .method = request_value.method,
+                .scheme = request_value.uri.scheme,
+                .host = try allocator.dupe(u8, request_value.uri.host),
+                .port = request_value.uri.effectivePort(),
+                .path = try allocator.dupe(u8, request_value.uri.path),
+                .query = if (request_value.uri.query) |query| try allocator.dupe(u8, query) else null,
+            },
+            .status = response.status,
+            .body = try allocator.dupe(u8, body_bytes),
+            .content_type = if (response.headers.get("Content-Type")) |value| try allocator.dupe(u8, value) else null,
+            .etag = if (response.headers.get("ETag")) |value| try allocator.dupe(u8, value) else null,
+            .last_modified = if (response.headers.get("Last-Modified")) |value| try allocator.dupe(u8, value) else null,
+            .stored_at_ns = stored_at_ns,
+            .max_age = parseMaxAge(response.headers.get("Cache-Control")),
+            .state = .fresh,
+        });
+    }
+
+    const body_reader = try OwnedBytesBody.init(allocator, body_bytes);
+    allocator.free(body_bytes);
+    response.body = body_reader.body;
+    return response.*;
+}
+
+/// Parses a `Cache-Control` header and returns `max-age` when present.
+fn parseMaxAge(value: ?[]const u8) ?Duration {
+    const header_value = value orelse return null;
+    var iter = std.mem.tokenizeScalar(u8, header_value, ',');
+    while (iter.next()) |token| {
+        const trimmed = std.mem.trim(u8, token, " \t");
+        if (!std.mem.startsWith(u8, trimmed, "max-age=")) {
+            continue;
+        }
+        const seconds = std.fmt.parseUnsigned(u64, trimmed["max-age=".len..], 10) catch {
+            return null;
+        };
+        return Duration.fromSeconds(seconds);
+    }
+    return null;
 }
 
 /// Returns true when the client can route the request through the HTTP/2 transport path.
@@ -3616,4 +4296,63 @@ test "client rejects redirect when body is not repeatable" {
     defer handle.deinit();
 
     try std.testing.expectError(error.RedirectBodyNotRepeatable, handle.wait());
+}
+
+test "retry policy keeps replay safety explicit for one-shot bodies" {
+    const uri = types.Uri.init(.https, "127.0.0.1", types.Port.init(18443), "/unstable/health", null, null);
+    var request = types.Request.init(std.testing.allocator, .post, uri);
+    defer request.deinit();
+
+    var body_state = TestBodyState{
+        .data = "payload",
+        .offset = 0,
+    };
+    request.body = .{
+        .ctx = &body_state,
+        .read_fn = TestBodyState.read,
+        .close_fn = TestBodyState.close,
+    };
+
+    const policy = RetryPolicy.default();
+    try std.testing.expect(!policy.shouldRetry(&request, .transport, 1));
+    try std.testing.expectEqual(RetryReplaySafety.one_shot, inferRetryReplaySafety(&request));
+}
+
+test "cache policy helpers parse max age and serve stored responses" {
+    var cache = HttpCache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    try cache.put(.{
+        .key = .{
+            .method = .get,
+            .scheme = .https,
+            .host = try std.testing.allocator.dupe(u8, "127.0.0.1"),
+            .port = types.Port.init(18443),
+            .path = try std.testing.allocator.dupe(u8, "/cached/config"),
+            .query = null,
+        },
+        .status = .ok,
+        .body = try std.testing.allocator.dupe(u8, "{\"source\":\"cache\"}"),
+        .content_type = try std.testing.allocator.dupe(u8, "application/json"),
+        .etag = try std.testing.allocator.dupe(u8, "\"cfg-v1\""),
+        .last_modified = null,
+        .stored_at_ns = 0,
+        .max_age = parseMaxAge("public, max-age=5"),
+        .state = .fresh,
+    });
+
+    const lookup = cache.lookup(.get, .https, "127.0.0.1", types.Port.init(18443), "/cached/config", null, std.time.ns_per_s);
+    try std.testing.expectEqual(http_cache.LookupAction.serve_cached, lookup.action);
+
+    var response = try responseFromCacheEntry(std.testing.allocator, lookup.entry.?, .http_2);
+    defer {
+        if (response.body) |body_reader| {
+            body_reader.close();
+            response.body = null;
+        }
+        response.deinit();
+    }
+
+    try std.testing.expectEqual(types.Status.ok, response.status);
+    try std.testing.expectEqualStrings("application/json", response.headers.get("Content-Type").?);
 }

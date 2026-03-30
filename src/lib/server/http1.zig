@@ -441,6 +441,7 @@ fn reasonPhrase(status: core.Status) []const u8 {
         .moved_permanently => "Moved Permanently",
         .found => "Found",
         .see_other => "See Other",
+        .not_modified => "Not Modified",
         .temporary_redirect => "Temporary Redirect",
         .permanent_redirect => "Permanent Redirect",
         .bad_request => "Bad Request",

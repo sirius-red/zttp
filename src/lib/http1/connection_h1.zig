@@ -12,6 +12,7 @@ const response_parser = @import("response_parser.zig");
 const tls_client = @import("../tls/client.zig");
 const connection_h2 = @import("../http2/connection_h2.zig");
 const interop_harness = @import("../testing/interop_harness.zig");
+const websocket_client = @import("../websocket/client.zig");
 
 /// Error set returned by connection operations.
 pub const Error = error{
@@ -127,6 +128,17 @@ pub const StartError = error{AlreadyStarted} || std.Thread.SpawnError;
 
 /// Error set returned by `submit`.
 pub const SubmitError = Mailbox.SendError || error{NotStarted};
+
+/// Creates a client-owned WebSocket session for the HTTP/1.1 adapter path.
+pub fn openWebSocketSession(
+    uri: types.Uri,
+    options: websocket_client.DialOptions,
+) websocket_client.Error!websocket_client.Session {
+    return websocket_client.connect(.{
+        .path = uri.path,
+        .subprotocol = options.subprotocol,
+    }, .http_1_1, options);
+}
 
 /// Command mailbox type.
 const Mailbox = mailbox.Mailbox(Command);

@@ -6,6 +6,7 @@ const mailbox = @import("../util/mailbox.zig");
 const body_pipe = @import("../util/body_pipe.zig");
 const connection_state = @import("connection.zig");
 const test_peer = @import("test_peer.zig");
+const websocket_client = @import("../websocket/client.zig");
 
 /// Error set returned by runtime operations.
 pub const Error = error{
@@ -70,6 +71,17 @@ pub const Options = struct {
 pub const StartError = error{AlreadyStarted} || std.Thread.SpawnError;
 /// Error set returned by `submit`.
 pub const SubmitError = Mailbox.SendError || error{NotStarted};
+
+/// Creates a client-owned WebSocket session for the HTTP/2 adapter path.
+pub fn openWebSocketSession(
+    uri: types.Uri,
+    options: websocket_client.DialOptions,
+) websocket_client.Error!websocket_client.Session {
+    return websocket_client.connect(.{
+        .path = uri.path,
+        .subprotocol = options.subprotocol,
+    }, .h2, options);
+}
 
 /// Snapshot of runtime state used by targeted tests.
 pub const Snapshot = struct {

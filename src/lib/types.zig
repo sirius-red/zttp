@@ -488,6 +488,8 @@ pub const Status = enum(u16) {
     found = 302,
     /// 303 See Other.
     see_other = 303,
+    /// 304 Not Modified.
+    not_modified = 304,
     /// 307 Temporary Redirect.
     temporary_redirect = 307,
     /// 308 Permanent Redirect.

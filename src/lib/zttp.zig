@@ -7,6 +7,7 @@ const http2 = @import("http2/http2.zig");
 const server = @import("server/server.zig");
 const http3 = @import("http3/http3.zig");
 const websocket = @import("websocket/websocket.zig");
+const websocket_client = @import("websocket/client.zig");
 const websocket_frame = @import("websocket/frame.zig");
 const compression_encoding = @import("compression/encoding.zig");
 const compression_decoder = @import("compression/decoder.zig");
@@ -121,12 +122,24 @@ pub const ServerWebSocketSession = server.ServerWebSocketSession;
 pub const ContentEncoding = compression_encoding.ContentEncoding;
 /// Shared response-decoder primitive.
 pub const ContentDecoder = compression_decoder.Decoder;
+/// Fully buffered decoded response type.
+pub const DecodedResponse = compression_decoder.DecodedResponse;
 /// Shared response-encoder primitive.
 pub const ContentEncoder = compression_encoder.Encoder;
 /// Typed multipart form-data payload.
 pub const FormData = multipart_form_data.FormData;
+/// Typed multipart form-data builder.
+pub const FormDataBuilder = multipart_form_data.Builder;
 /// Typed in-memory HTTP cache surface.
 pub const HttpCache = http_cache.HttpCache;
+/// Typed retry policy surface.
+pub const RetryPolicy = client.RetryPolicy;
+/// Typed cache policy surface.
+pub const CachePolicy = client.CachePolicy;
+/// Cache-aware response wrapper.
+pub const CachedResponse = client.CachedResponse;
+/// Client-owned WebSocket helper module.
+pub const ClientWebSocket = websocket_client;
 /// HTTP/3 module entrypoint.
 pub const Http3 = http3;
 /// Shared testing module entrypoint.
@@ -154,6 +167,7 @@ test {
     _ = @import("server/compression.zig");
     _ = @import("websocket/frame.zig");
     _ = @import("websocket/websocket.zig");
+    _ = @import("websocket/client.zig");
     _ = @import("websocket/server.zig");
     _ = @import("compression/encoding.zig");
     _ = @import("compression/decoder.zig");
