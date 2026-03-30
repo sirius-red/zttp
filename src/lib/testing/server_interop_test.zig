@@ -5,6 +5,7 @@ const server = @import("../server/server.zig");
 const types = @import("../types.zig");
 const socket_io = @import("../util/socket_io.zig");
 const interop_harness = @import("interop_harness.zig");
+const fixture_loader = @import("fixture_loader.zig");
 const server_http2 = @import("../server/http2.zig");
 
 /// Declarative expectation for one server interop route.
@@ -79,6 +80,72 @@ const required_routes = [_]RouteExpectation{
         .tls_supported = true,
     },
 };
+
+/// Declarative expectation for one first-party static asset publication.
+const StaticAssetExpectation = struct {
+    /// Request path served by the server application surface.
+    path: []const u8,
+    /// Expected content type when the asset is served successfully.
+    content_type: []const u8,
+    /// Relative fixture suffix that backs the published asset.
+    fixture_suffix: []const u8,
+    /// Supported content encodings advertised by the contract.
+    supported_encodings: []const []const u8,
+};
+
+/// Declarative negative case for the static asset publication surface.
+const StaticAssetNegativeExpectation = struct {
+    /// Method used by the rejected request.
+    method: types.Method,
+    /// Request target covered by the negative-path case.
+    target: []const u8,
+    /// Expected rejection status code for the case.
+    expected_status_code: u16,
+    /// Stable reason describing why the request is rejected.
+    rejection_reason: []const u8,
+};
+
+/// Shared M6 static asset expectation for `/assets/site.css`.
+const static_asset_expectation = StaticAssetExpectation{
+    .path = "/assets/site.css",
+    .content_type = "text/css",
+    .fixture_suffix = "m6-assets/site.css",
+    .supported_encodings = &.{ "identity", "gzip" },
+};
+
+/// Dedicated static-file negative cases required by the M6 contract.
+const static_asset_negative_expectations = [_]StaticAssetNegativeExpectation{
+    .{
+        .method = .get,
+        .target = "/assets/../secrets.txt",
+        .expected_status_code = 404,
+        .rejection_reason = "path traversal stays outside the published content root",
+    },
+    .{
+        .method = .get,
+        .target = "/assets/missing.css",
+        .expected_status_code = 404,
+        .rejection_reason = "missing asset preserves a clear not-found result",
+    },
+    .{
+        .method = .post,
+        .target = "/assets/site.css",
+        .expected_status_code = 405,
+        .rejection_reason = "method gating rejects non-download verbs for static publication",
+    },
+};
+
+/// Expected protocol coverage for the first-party M6 static asset surface.
+const static_asset_protocols = [_]types.NegotiatedProtocol{ .http_1_1, .h2, .h3 };
+
+/// Expects one capability matrix entry to report supported behavior.
+fn expectSupportedCapability(
+    feature: interop_harness.CapabilityFeatureId,
+    protocol: types.NegotiatedProtocol,
+) !void {
+    const capability = interop_harness.capabilityFor(feature, protocol) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(types.FeatureSupportLevel.supported, capability.support);
+}
 
 /// Sends one raw HTTP request to the loopback server and returns the full response bytes.
 fn runRawExchange(
@@ -207,4 +274,49 @@ test "server interop secure listener serves the shared health route over h2" {
 
     try std.testing.expectEqual(types.Status.ok, response.status);
     try std.testing.expect(std.mem.containsAtLeast(u8, response.body, 1, "\"protocol\":\"h2\""));
+}
+
+test "server interop aligns health and static asset coverage with the M6 contract" {
+    const health = interop_harness.scenarioForRoute(.health).?;
+    try std.testing.expectEqualStrings("/health", health.path_template);
+    try std.testing.expectEqual(types.Status.ok, health.success_status);
+
+    for (static_asset_protocols) |protocol| {
+        try std.testing.expect(health.supportsProtocol(protocol));
+        try expectSupportedCapability(.server_static_files, protocol);
+        try expectSupportedCapability(.server_compression, protocol);
+    }
+
+    const loader = fixture_loader.Loader.init();
+    const asset_path = try loader.pathForM6Asset(std.testing.allocator, .site_css);
+    defer std.testing.allocator.free(asset_path);
+
+    try std.testing.expectEqualStrings("/assets/site.css", static_asset_expectation.path);
+    try std.testing.expectEqualStrings("text/css", static_asset_expectation.content_type);
+    try std.testing.expectEqual(@as(usize, 2), static_asset_expectation.supported_encodings.len);
+    try std.testing.expectEqualStrings("identity", static_asset_expectation.supported_encodings[0]);
+    try std.testing.expectEqualStrings("gzip", static_asset_expectation.supported_encodings[1]);
+    try std.testing.expect(
+        std.mem.endsWith(u8, asset_path, static_asset_expectation.fixture_suffix) or
+            std.mem.endsWith(u8, asset_path, "m6-assets\\site.css"),
+    );
+}
+
+test "server interop static asset negatives cover traversal missing assets and method gating" {
+    const loader = fixture_loader.Loader.init();
+    try std.testing.expectError(
+        error.PathTraversalNotAllowed,
+        loader.pathFor(std.testing.allocator, "m6-assets/../secrets.txt"),
+    );
+
+    try std.testing.expectEqual(@as(usize, 3), static_asset_negative_expectations.len);
+    for (static_asset_negative_expectations) |expectation| {
+        try std.testing.expect(std.mem.startsWith(u8, expectation.target, "/assets/"));
+        if (expectation.method == .post) {
+            try std.testing.expectEqual(@as(u16, 405), expectation.expected_status_code);
+        } else {
+            try std.testing.expectEqual(@as(u16, 404), expectation.expected_status_code);
+        }
+        try std.testing.expect(expectation.rejection_reason.len > 0);
+    }
 }

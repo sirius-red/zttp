@@ -84,6 +84,59 @@ const regression_cases = [_]RegressionCase{
     },
 };
 
+/// Helper callbacks used to verify deterministic middleware, route, and fallback dispatch.
+const OrderedRoutingHandlers = struct {
+    /// Writes a matched health-route response with an ordered trace marker.
+    fn health(
+        _: ?*anyopaque,
+        _: *server_types.ServerRequest,
+        writer: *server_types.ServerResponseWriter,
+    ) !void {
+        try writer.appendHeader("X-Dispatch-Trace", "03-route-health");
+        try writer.appendHeader("Content-Type", "application/json");
+        try writer.writeAll("{\"route\":\"health\"}");
+    }
+
+    /// Writes a fallback response for unmatched or method-mismatched requests.
+    fn fallback(
+        _: ?*anyopaque,
+        request: *server_types.ServerRequest,
+        writer: *server_types.ServerResponseWriter,
+    ) !void {
+        try writer.appendHeader("X-Dispatch-Trace", "03-fallback");
+        try writer.appendHeader("Content-Type", "application/json");
+
+        if (std.mem.eql(u8, request.uri.path, "/health")) {
+            writer.setStatus(.bad_request);
+            try writer.writeAll("{\"error\":\"method_mismatch\"}");
+            return;
+        }
+
+        writer.setStatus(.not_found);
+        try writer.writeAll("{\"error\":\"fallback_not_found\"}");
+    }
+
+    /// Appends the first middleware trace header before dispatch continues.
+    fn middlewareFirst(
+        _: ?*anyopaque,
+        _: *server_types.ServerRequest,
+        writer: *server_types.ServerResponseWriter,
+    ) !server_types.MiddlewareDecision {
+        try writer.appendHeader("X-Dispatch-Trace", "01-middleware-first");
+        return .continue_processing;
+    }
+
+    /// Appends the second middleware trace header before dispatch continues.
+    fn middlewareSecond(
+        _: ?*anyopaque,
+        _: *server_types.ServerRequest,
+        writer: *server_types.ServerResponseWriter,
+    ) !server_types.MiddlewareDecision {
+        try writer.appendHeader("X-Dispatch-Trace", "02-middleware-second");
+        return .continue_processing;
+    }
+};
+
 /// Initializes the shared interop-harness server on an ephemeral loopback port.
 fn initInteropServer() !runtime.Server {
     var config = server_types.ServerConfig.init(interop_harness.handleServerRequest);
@@ -155,6 +208,42 @@ fn initRoutedInteropServer() !runtime.Server {
             },
         },
         .fallback = null,
+        .ambiguity_policy = .reject_duplicates,
+    };
+
+    return runtime.Server.init(std.testing.allocator, config);
+}
+
+/// Initializes the server with ordered middleware and an explicit fallback handler.
+fn initOrderedRoutedInteropServer() !runtime.Server {
+    var config = server_types.ServerConfig.init(interop_harness.handleServerRequest);
+    config.port = types.Port.init(0);
+    config.router = .{
+        .routes = &.{
+            .{
+                .name = "health",
+                .method = .get,
+                .path = "/health",
+                .handler = OrderedRoutingHandlers.health,
+                .handler_context = null,
+            },
+        },
+        .middleware = &.{
+            .{
+                .name = "trace-first",
+                .context = null,
+                .handler = OrderedRoutingHandlers.middlewareFirst,
+            },
+            .{
+                .name = "trace-second",
+                .context = null,
+                .handler = OrderedRoutingHandlers.middlewareSecond,
+            },
+        },
+        .fallback = .{
+            .handler = OrderedRoutingHandlers.fallback,
+            .handler_context = null,
+        },
         .ambiguity_policy = .reject_duplicates,
     };
 
@@ -370,6 +459,62 @@ test "route catalog applies shared middleware and default 404 fallback" {
 
     try std.testing.expect(std.mem.containsAtLeast(u8, missing_response, 1, "HTTP/1.1 404 Not Found"));
     try std.testing.expect(std.mem.containsAtLeast(u8, missing_response, 1, "{\"error\":\"not_found\"}"));
+}
+
+test "route catalog preserves deterministic middleware order on matched routes" {
+    var server = try initOrderedRoutedInteropServer();
+    defer server.deinit();
+    try server.start();
+
+    const response = try runRawExchange(
+        std.testing.allocator,
+        server.port(),
+        &.{
+            "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        },
+    );
+    defer std.testing.allocator.free(response);
+
+    const first = std.mem.indexOf(u8, response, "X-Dispatch-Trace: 01-middleware-first") orelse return error.TestUnexpectedResult;
+    const second = std.mem.indexOf(u8, response, "X-Dispatch-Trace: 02-middleware-second") orelse return error.TestUnexpectedResult;
+    const route = std.mem.indexOf(u8, response, "X-Dispatch-Trace: 03-route-health") orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(first < second);
+    try std.testing.expect(second < route);
+    try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "HTTP/1.1 200 OK"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "{\"route\":\"health\"}"));
+}
+
+test "route catalog routes unmatched and method-mismatched requests through explicit fallback" {
+    var server = try initOrderedRoutedInteropServer();
+    defer server.deinit();
+    try server.start();
+
+    const missing_response = try runRawExchange(
+        std.testing.allocator,
+        server.port(),
+        &.{
+            "GET /missing HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        },
+    );
+    defer std.testing.allocator.free(missing_response);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, missing_response, 1, "X-Dispatch-Trace: 03-fallback"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, missing_response, 1, "HTTP/1.1 404 Not Found"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, missing_response, 1, "{\"error\":\"fallback_not_found\"}"));
+
+    const method_mismatch_response = try runRawExchange(
+        std.testing.allocator,
+        server.port(),
+        &.{
+            "POST /health HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
+        },
+    );
+    defer std.testing.allocator.free(method_mismatch_response);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, method_mismatch_response, 1, "X-Dispatch-Trace: 03-fallback"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, method_mismatch_response, 1, "HTTP/1.1 400 Bad Request"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, method_mismatch_response, 1, "{\"error\":\"method_mismatch\"}"));
 }
 
 test "server runtime exposes the bound http3 port when enabled" {

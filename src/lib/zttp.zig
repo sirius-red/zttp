@@ -147,5 +147,6 @@ test {
     _ = @import("proxy/proxy_env.zig");
     _ = @import("testing/client_interop_test.zig");
     _ = @import("testing/server_interop_test.zig");
+    _ = @import("testing/websocket_interop_test.zig");
     _ = testing;
 }
