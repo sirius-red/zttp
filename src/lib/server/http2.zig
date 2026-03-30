@@ -6,6 +6,7 @@ const shared_frame = @import("../http2/frame.zig");
 const shared_hpack = @import("../http2/hpack.zig");
 const socket_io = @import("../util/socket_io.zig");
 const server_types = @import("types.zig");
+const websocket_server = @import("../websocket/server.zig");
 
 /// Cleartext HTTP/2 client connection preface.
 pub const client_preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -206,6 +207,15 @@ pub fn decodeServerResponse(
         .headers = headers,
         .body = try response_body.toOwnedSlice(allocator),
     };
+}
+
+/// Dispatches one server-owned WebSocket endpoint through the HTTP/2 adapter.
+pub fn dispatchWebSocketEndpoint(
+    endpoint: websocket_server.Endpoint,
+    request: *server_types.ServerRequest,
+    writer: *server_types.ServerResponseWriter,
+) !void {
+    try websocket_server.dispatchEndpoint(endpoint, request, writer);
 }
 
 /// One parsed incoming HTTP/2 request plus its target stream.

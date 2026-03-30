@@ -2,6 +2,10 @@
 
 const types = @import("../types.zig");
 const websocket = @import("../websocket/websocket.zig");
+const app = @import("app.zig");
+const static_files = @import("static.zig");
+const compression = @import("compression.zig");
+const websocket_server = @import("../websocket/server.zig");
 
 /// Server-side public configuration and message types.
 pub const Types = @import("types.zig");
@@ -13,6 +17,14 @@ pub const Http2 = @import("http2.zig");
 pub const Http3 = @import("http3.zig");
 /// Bound runtime server implementation.
 pub const Runtime = @import("runtime.zig");
+/// Higher-level server application entrypoint.
+pub const App = app;
+/// Static-file publication entrypoint.
+pub const Static = static_files;
+/// Server-side compression entrypoint.
+pub const Compression = compression;
+/// Server-owned WebSocket endpoint entrypoint.
+pub const WebSocketServer = websocket_server;
 /// Public server configuration alias.
 pub const ServerConfig = Types.ServerConfig;
 /// Public server request alias.
@@ -29,6 +41,16 @@ pub const Middleware = Types.Middleware;
 pub const MiddlewareDecision = Types.MiddlewareDecision;
 /// Public route catalog alias.
 pub const RouteCatalog = Types.RouteCatalog;
+/// Public higher-level server application alias.
+pub const ServerApplication = App.Application;
+/// Public higher-level route binding alias.
+pub const RouteBinding = App.RouteBinding;
+/// Public higher-level route group alias.
+pub const RouteGroup = App.RouteGroup;
+/// Public static publication alias.
+pub const StaticPublication = Static.Publication;
+/// Public server compression policy alias.
+pub const CompressionPolicy = Compression.Policy;
 /// Public fallback handler alias.
 pub const FallbackHandler = Types.FallbackHandler;
 /// Public higher-level server feature identifier.
@@ -45,6 +67,10 @@ pub const WebSocket = websocket;
 pub const WebSocketSessionMetadata = websocket.SessionMetadata;
 /// Public shared WebSocket session placeholder.
 pub const WebSocketSession = websocket.Session;
+/// Public server-owned WebSocket endpoint alias.
+pub const ServerWebSocketEndpoint = WebSocketServer.Endpoint;
+/// Public server-owned WebSocket session facade alias.
+pub const ServerWebSocketSession = WebSocketServer.Session;
 /// Public HTTP/3 listener configuration alias.
 pub const Http3ListenerConfig = Types.Http3ListenerConfig;
 /// Public HTTP/3 session-limit alias.

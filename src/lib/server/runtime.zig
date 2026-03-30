@@ -5,6 +5,7 @@ const core = @import("../types.zig");
 const tls_server = @import("../tls/server.zig");
 const interop_harness = @import("../testing/interop_harness.zig");
 const server_types = @import("types.zig");
+const app = @import("app.zig");
 const http1 = @import("http1.zig");
 const http2 = @import("http2.zig");
 const http3 = @import("http3.zig");
@@ -35,6 +36,7 @@ pub const Server = struct {
     /// Binds a server to the configured listen address.
     pub fn init(allocator: std.mem.Allocator, config: server_types.ServerConfig) Error!Server {
         try config.validate();
+        try app.validateConfiguredHandler(config.handler, config.handler_context);
 
         const secure_listener_plan = if (config.effectiveTlsConfig()) |tls|
             try buildSecureListenerPlan(allocator, tls)

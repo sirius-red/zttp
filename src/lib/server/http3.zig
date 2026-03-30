@@ -8,6 +8,7 @@ const h3_qpack = @import("../http3/qpack.zig");
 const h3_quic = @import("../http3/quic.zig");
 const h3_server = @import("../http3/server.zig");
 const server_types = @import("types.zig");
+const websocket_server = @import("../websocket/server.zig");
 
 /// Error set returned by the HTTP/3 runtime bridge.
 pub const Error = anyerror;
@@ -427,7 +428,7 @@ pub const Runtime = struct {
             if (headers.get("cookie") != null) {
                 // The decoded header collection already preserved the cookie.
             } else {
-            try headers.append("Cookie", cookie_header);
+                try headers.append("Cookie", cookie_header);
             }
         }
 
@@ -483,6 +484,15 @@ pub const Runtime = struct {
         };
     }
 };
+
+/// Dispatches one server-owned WebSocket endpoint through the HTTP/3 adapter.
+pub fn dispatchWebSocketEndpoint(
+    endpoint: websocket_server.Endpoint,
+    request: *server_types.ServerRequest,
+    writer: *server_types.ServerResponseWriter,
+) !void {
+    try websocket_server.dispatchEndpoint(endpoint, request, writer);
+}
 
 /// Encodes a buffered writer state into HTTP/3 HEADERS and DATA frames.
 fn encodeWriterResponse(

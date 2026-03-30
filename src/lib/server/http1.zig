@@ -4,6 +4,7 @@ const std = @import("std");
 const core = @import("../types.zig");
 const socket_io = @import("../util/socket_io.zig");
 const server_types = @import("types.zig");
+const websocket_server = @import("../websocket/server.zig");
 
 /// Error set returned while parsing an HTTP/1.1 request.
 pub const ParseError = error{
@@ -200,6 +201,15 @@ pub fn initResponseWriter(
         finishResponse,
         destroyResponseState,
     );
+}
+
+/// Dispatches one server-owned WebSocket endpoint through the HTTP/1.1 upgrade path.
+pub fn dispatchWebSocketEndpoint(
+    endpoint: websocket_server.Endpoint,
+    request: *server_types.ServerRequest,
+    writer: *server_types.ServerResponseWriter,
+) !void {
+    try websocket_server.dispatchEndpoint(endpoint, request, writer);
 }
 
 /// Splits a request target into path and query components.
@@ -424,6 +434,7 @@ fn destroyResponseState(ctx: ?*anyopaque) void {
 fn reasonPhrase(status: core.Status) []const u8 {
     return switch (status) {
         .continue_ => "Continue",
+        .switching_protocols => "Switching Protocols",
         .ok => "OK",
         .created => "Created",
         .no_content => "No Content",
@@ -436,6 +447,7 @@ fn reasonPhrase(status: core.Status) []const u8 {
         .unauthorized => "Unauthorized",
         .forbidden => "Forbidden",
         .not_found => "Not Found",
+        .method_not_allowed => "Method Not Allowed",
         .request_timeout => "Request Timeout",
         .payload_too_large => "Payload Too Large",
         .uri_too_long => "URI Too Long",

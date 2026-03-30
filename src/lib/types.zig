@@ -474,6 +474,8 @@ pub const OriginKey = struct {
 pub const Status = enum(u16) {
     /// 100 Continue.
     continue_ = 100,
+    /// 101 Switching Protocols.
+    switching_protocols = 101,
     /// 200 OK.
     ok = 200,
     /// 201 Created.
@@ -498,6 +500,8 @@ pub const Status = enum(u16) {
     forbidden = 403,
     /// 404 Not Found.
     not_found = 404,
+    /// 405 Method Not Allowed.
+    method_not_allowed = 405,
     /// 408 Request Timeout.
     request_timeout = 408,
     /// 413 Payload Too Large.

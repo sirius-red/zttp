@@ -83,6 +83,16 @@ pub const Middleware = server.Middleware;
 pub const MiddlewareDecision = server.MiddlewareDecision;
 /// Higher-level route catalog surface.
 pub const RouteCatalog = server.RouteCatalog;
+/// Higher-level server application surface.
+pub const ServerApplication = server.ServerApplication;
+/// Higher-level server route binding surface.
+pub const ServerRouteBinding = server.RouteBinding;
+/// Higher-level server route group surface.
+pub const ServerRouteGroup = server.RouteGroup;
+/// Static publication surface.
+pub const StaticPublication = server.StaticPublication;
+/// Server compression policy surface.
+pub const CompressionPolicy = server.CompressionPolicy;
 /// Optional fallback handler for unmatched routes.
 pub const FallbackHandler = server.FallbackHandler;
 /// HTTP/3 UDP listener configuration type.
@@ -103,6 +113,10 @@ pub const WebSocket = websocket;
 pub const WebSocketFrame = websocket_frame.Frame;
 /// Shared WebSocket close-reason type.
 pub const WebSocketCloseReason = websocket_frame.CloseReason;
+/// Server-owned WebSocket endpoint surface.
+pub const ServerWebSocketEndpoint = server.ServerWebSocketEndpoint;
+/// Server-owned WebSocket session facade.
+pub const ServerWebSocketSession = server.ServerWebSocketSession;
 /// Shared content-encoding type.
 pub const ContentEncoding = compression_encoding.ContentEncoding;
 /// Shared response-decoder primitive.
@@ -135,8 +149,12 @@ test {
     _ = @import("http2/connection_test.zig");
     _ = @import("http2/test_peer.zig");
     _ = @import("server/server_test.zig");
+    _ = @import("server/app.zig");
+    _ = @import("server/static.zig");
+    _ = @import("server/compression.zig");
     _ = @import("websocket/frame.zig");
     _ = @import("websocket/websocket.zig");
+    _ = @import("websocket/server.zig");
     _ = @import("compression/encoding.zig");
     _ = @import("compression/decoder.zig");
     _ = @import("compression/encoder.zig");
