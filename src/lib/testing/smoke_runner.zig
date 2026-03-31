@@ -47,7 +47,7 @@ pub const RoundTripStatus = enum {
     unexpected_failure,
 };
 
-/// Options for the CLI round-trip smoke runner.
+/// Options for the CLI round-trip readiness runner.
 pub const CliRoundTripOptions = struct {
     /// Working directory used for the spawned `zig` commands.
     cwd: ?[]const u8 = null,
@@ -177,15 +177,15 @@ pub const RoundTripResult = struct {
     }
 };
 
-/// Structured hardening summary used by SC-004 smoke validation.
+/// Structured hardening summary used by local reliability-threshold validation.
 pub const HardeningSummary = struct {
     /// Aggregated workload metrics captured from the local hardening matrix.
     metrics: interop_harness.HardeningWorkloadMetrics,
-    /// Whether the workload satisfies SC-004.
-    passes_sc004: bool,
+    /// Whether the workload satisfies the local reliability threshold.
+    passes_reliability_threshold: bool,
 };
 
-/// Reusable CLI smoke runner for the shared server/request loopback scenario.
+/// Reusable CLI readiness runner for the shared server/request loopback scenario.
 pub const CliRoundTripRunner = struct {
     /// Allocator used for child-process capture buffers.
     allocator: std.mem.Allocator,
@@ -347,7 +347,7 @@ pub const CliRoundTripRunner = struct {
     }
 };
 
-/// Callback type used by the smoke runner.
+/// Callback type used by the local validation runner.
 pub const ExecuteFn = *const fn (ctx: ?*anyopaque, scenario: Scenario) anyerror!void;
 
 /// Callback-based runner for build, CLI, and harness smoke scenarios.
@@ -470,15 +470,15 @@ pub fn writeRoundTripSummary(writer: anytype, result: RoundTripResult) !void {
     }
 }
 
-/// Returns a structured SC-004 summary for one hardening workload.
+/// Returns a structured reliability summary for one hardening workload.
 pub fn summarizeHardening(metrics: interop_harness.HardeningWorkloadMetrics) HardeningSummary {
     return .{
         .metrics = metrics,
-        .passes_sc004 = metrics.passesSc004(),
+        .passes_reliability_threshold = metrics.passesReliabilityThreshold(),
     };
 }
 
-/// Writes the SC-004 hardening summary to the provided writer.
+/// Writes the hardening reliability summary to the provided writer.
 pub fn writeHardeningSummary(
     writer: anytype,
     summary: HardeningSummary,
@@ -487,7 +487,10 @@ pub fn writeHardeningSummary(
     try writer.print("excluded_flows: {d}\n", .{summary.metrics.excluded_flows});
     try writer.print("failure_count: {d}\n", .{summary.metrics.failure_count});
     try writer.print("success_ratio: {d:.4}\n", .{summary.metrics.successRatio()});
-    try writer.print("sc004: {s}\n", .{if (summary.passes_sc004) "pass" else "fail"});
+    try writer.print(
+        "reliability_threshold: {s}\n",
+        .{if (summary.passes_reliability_threshold) "pass" else "fail"},
+    );
     for (summary.metrics.protocol_mix) |entry| {
         try writer.print(
             "protocol[{s}]: eligible={d} excluded={d} failures={d}\n",
@@ -496,7 +499,7 @@ pub fn writeHardeningSummary(
     }
 }
 
-/// Entrypoint for `zig build smoke`.
+/// Entrypoint for the readiness runner executable.
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -608,7 +611,7 @@ test "round trip classification preserves known socket failures" {
     try std.testing.expectEqual(.known_socket_failure, classifyRoundTripResult(scenario, request, failure));
 }
 
-test "hardening summary reports SC-004 workload metrics" {
+test "hardening summary reports reliability-threshold workload metrics" {
     const summary = summarizeHardening(.{
         .protocol_mix = .{
             .{ .protocol = .http_1_1, .eligible_flows = 320, .excluded_flows = 8, .failure_count = 2 },
@@ -620,13 +623,13 @@ test "hardening summary reports SC-004 workload metrics" {
         .failure_count = 9,
     });
 
-    try std.testing.expect(summary.passes_sc004);
+    try std.testing.expect(summary.passes_reliability_threshold);
 
-    var bytes = std.ArrayList(u8).init(std.testing.allocator);
-    defer bytes.deinit();
-    try writeHardeningSummary(bytes.writer(), summary);
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(std.testing.allocator);
+    try writeHardeningSummary(bytes.writer(std.testing.allocator), summary);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "eligible_flows: 1020"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "sc004: pass"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "reliability_threshold: pass"));
     try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "protocol[h3]: eligible=360"));
 }

@@ -10,7 +10,7 @@ const types = @import("../types.zig");
 /// Expected protocol coverage for the client retry and cache matrix.
 const matrix_protocols = [_]types.NegotiatedProtocol{ .http_1_1, .h2, .h3 };
 
-/// Explicit retry failure classes declared by the M6 contract.
+/// Explicit retry failure classes declared by the shared local contract.
 const RetryFailureClass = enum {
     /// Transport-level failure before a definitive response completes.
     transport,
@@ -110,7 +110,7 @@ test "production matrix retry coverage keeps replay safety explicit for unstable
 
 test "production matrix cache coverage preserves freshness revalidation and invalidation for cached config" {
     const loader = fixture_loader.Loader.init();
-    const config_body = try loader.loadM6Asset(std.testing.allocator, .cached_config);
+    const config_body = try loader.loadHigherLevelAsset(std.testing.allocator, .cached_config);
     defer std.testing.allocator.free(config_body);
 
     var cache = client.HttpCache.init(std.testing.allocator);
@@ -197,12 +197,12 @@ test "production matrix client failure surfaces keep protocol and scope explicit
     try std.testing.expectEqual(types.NegotiatedProtocol.h3, h3_failure.protocol.?);
 }
 
-test "production matrix SC-004 metrics capture exceeds one thousand eligible flows" {
+test "production matrix hardening metrics capture exceeds one thousand eligible flows" {
     const loader = fixture_loader.Loader.init();
-    const metrics = try interop_harness.captureSc004Metrics(std.testing.allocator, loader);
+    const metrics = try interop_harness.captureHardeningMetrics(std.testing.allocator, loader);
 
     try std.testing.expectEqual(@as(usize, 1020), metrics.total_eligible_flows);
     try std.testing.expectEqual(@as(usize, 9), metrics.failure_count);
     try std.testing.expect(metrics.successRatio() > 0.99);
-    try std.testing.expect(metrics.passesSc004());
+    try std.testing.expect(metrics.passesReliabilityThreshold());
 }

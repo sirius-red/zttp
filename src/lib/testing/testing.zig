@@ -163,7 +163,7 @@ test "http3 runtime helpers expose loopback fixture paths" {
 test "readiness entrypoint exposes the windows loopback scenario" {
     const readiness = Readiness.scenarioForId(.windows_loopback_cli_roundtrip).?;
 
-    try @import("std").testing.expectEqualStrings("windows-loopback-cli-roundtrip", readiness.name);
+    try @import("std").testing.expectEqualStrings("windows-cli-loopback-roundtrip", readiness.name);
     try @import("std").testing.expectEqualStrings("request", readiness.request_command.name);
     try @import("std").testing.expect(Readiness.smokeScenarios().len >= 4);
 }

@@ -134,8 +134,10 @@ pub fn uriKey(allocator: std.mem.Allocator, uri: types.Uri) std.mem.Allocator.Er
     const query_extra: usize = if (uri.query != null) 1 else 0;
     const path = if (uri.path.len == 0) "/" else uri.path;
     const scheme_bytes = uri.scheme.asBytes();
+    var port_buf: [5]u8 = undefined;
+    const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
 
-    const length: usize = scheme_bytes.len + 3 + host_len + 1 + 5 + path.len + query_extra + query_len;
+    const length: usize = scheme_bytes.len + 3 + host_len + 1 + port_str.len + path.len + query_extra + query_len;
     var buffer = try allocator.alloc(u8, length);
 
     var index: usize = 0;
@@ -154,8 +156,6 @@ pub fn uriKey(allocator: std.mem.Allocator, uri: types.Uri) std.mem.Allocator.Er
     buffer[index] = ':';
     index += 1;
 
-    var port_buf: [5]u8 = undefined;
-    const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
     std.mem.copyForwards(u8, buffer[index .. index + port_str.len], port_str);
     index += port_str.len;
 
@@ -511,4 +511,12 @@ test "resolve absolute location" {
     try std.testing.expectEqualStrings("example.com", uri.host);
     try std.testing.expectEqualStrings("/path", uri.path);
     try std.testing.expectEqualStrings("x=1", uri.query.?);
+}
+
+test "uri key allocates the exact slice length" {
+    const uri = types.Uri.init(.http, "example.com", types.Port.init(8080), "/path", "x=1", null);
+    const key = try uriKey(std.testing.allocator, uri);
+    defer std.testing.allocator.free(key);
+
+    try std.testing.expectEqualStrings("http://example.com:8080/path?x=1", key);
 }

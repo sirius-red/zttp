@@ -111,7 +111,7 @@ test "smoke scenarios retain request coverage for http and https" {
 test "client interop preserves the windows loopback readiness probe contract" {
     const readiness = interop_harness.readinessScenarioForId(.windows_loopback_cli_roundtrip).?;
 
-    try std.testing.expectEqualStrings("windows-loopback-cli-roundtrip", readiness.name);
+    try std.testing.expectEqualStrings("windows-cli-loopback-roundtrip", readiness.name);
     try std.testing.expectEqual(interop_harness.RouteId.health, readiness.route);
     try std.testing.expectEqualStrings("request", readiness.request_command.name);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080/health", readiness.request_command.argv[5]);
@@ -139,9 +139,9 @@ test "client interop loopback identities resolve to repository fixtures" {
     );
 }
 
-test "client interop aligns multipart upload coverage with the M6 contract" {
+test "client interop aligns multipart upload coverage with the shared local contract" {
     const loader = fixture_loader.Loader.init();
-    const upload_bytes = try loader.loadM6Asset(std.testing.allocator, .upload_bin);
+    const upload_bytes = try loader.loadHigherLevelAsset(std.testing.allocator, .upload_bin);
     defer std.testing.allocator.free(upload_bytes);
 
     var form = client.FormData.init(
@@ -193,9 +193,9 @@ test "client interop aligns multipart upload coverage with the M6 contract" {
     }
 }
 
-test "client interop aligns automatic decompression coverage with the M6 contract" {
+test "client interop aligns automatic decompression coverage with the shared local contract" {
     const loader = fixture_loader.Loader.init();
-    const encoded_payload = try loader.loadM6Asset(std.testing.allocator, .upload_bin);
+    const encoded_payload = try loader.loadHigherLevelAsset(std.testing.allocator, .upload_bin);
     defer std.testing.allocator.free(encoded_payload);
 
     const decoder = client.Decoder.init(decompression_acceptance.content_encoding);

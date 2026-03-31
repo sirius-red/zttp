@@ -1,4 +1,4 @@
-//! Server-side WebSocket interop coverage tied to the shared M6 contract.
+//! Server-side WebSocket interop coverage tied to the shared local contract.
 
 const std = @import("std");
 const client = @import("../client.zig");

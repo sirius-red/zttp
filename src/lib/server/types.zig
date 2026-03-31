@@ -309,7 +309,7 @@ pub const RouteCatalog = struct {
     }
 };
 
-/// Server-owned higher-level capability tracked during M6.
+/// Server-owned higher-level capability tracked by local interop coverage.
 pub const ServerFeature = enum {
     /// Exact route dispatch and fallback behavior.
     routing,
@@ -333,7 +333,7 @@ pub const ServerPolicyPreference = enum {
     disabled,
 };
 
-/// Shared server feature-policy placeholder for the M6 surface.
+/// Shared server feature-policy placeholder for the higher-level surface.
 pub const ServerFeaturePolicy = struct {
     /// Static file publication preference.
     static_files: ServerPolicyPreference,

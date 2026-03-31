@@ -11,8 +11,8 @@ const help_text =
     \\  zttp <command> [options]
     \\
     \\Commands:
-    \\  request   HTTP client request
-    \\  server    HTTP server harness
+    \\  request   HTTP client request with first-party response decoding
+    \\  server    HTTP server application built on the library-owned surface
     \\
     \\Flags:
     \\  -h, --help  Show help
@@ -38,6 +38,7 @@ const request_help =
     \\
     \\Notes:
     \\  http:// and https:// URLs are accepted.
+    \\  Supported encoded responses are decoded through the library-owned client surface.
     \\
 ;
 
@@ -50,7 +51,7 @@ const request_help_http3 =
 
 /// Help text for the server subcommand.
 const server_help =
-    \\zttp server - HTTP server harness
+    \\zttp server - HTTP server application
     \\
     \\Usage:
     \\  zttp server [options]
@@ -63,6 +64,13 @@ const server_help =
     \\      --http2             Enable minimal HTTP/2 negotiation planning
     \\  -h, --help              Show help
     \\
+    \\Serves:
+    \\  GET  /health
+    \\  GET  /echo
+    \\  POST /echo
+    \\  GET  /assets/site.css
+    \\  GET  /ws/chat
+    \\
 ;
 
 /// Extra help text for HTTP/3-enabled server builds.
@@ -71,6 +79,106 @@ const server_help_http3 =
     \\      --http3             Enable the UDP-backed HTTP/3 runtime on the same library-owned server
     \\
 ;
+
+/// Shared route bindings used by the CLI server application.
+const application_route_bindings = [_]zttp.ServerRouteBinding{
+    zttp.ServerRouteBinding.init("health", .get, "/health", ApplicationHandlers.health),
+    zttp.ServerRouteBinding.init("echo-get", .get, "/echo", ApplicationHandlers.echo),
+    zttp.ServerRouteBinding.init("echo-post", .post, "/echo", ApplicationHandlers.echo),
+};
+
+/// Shared static publication served by the CLI server application.
+const application_static_publications = [_]zttp.StaticPublication{
+    blk: {
+        var publication = zttp.StaticPublication.init("assets", "/assets", "src/lib/testing/fixtures/higher-level-assets");
+        publication.cache_control = "public, max-age=60";
+        break :blk publication;
+    },
+};
+
+/// Shared WebSocket endpoint surfaced by the CLI server application.
+const application_websocket_endpoints = [_]zttp.ServerWebSocketEndpoint{
+    zttp.ServerWebSocketEndpoint.init("chat", "/ws/chat", ApplicationHandlers.chatWebSocket),
+};
+
+/// Shared higher-level application configured for the CLI server command.
+const server_application = blk: {
+    var application = zttp.ServerApplication.init();
+    application.routes = &application_route_bindings;
+    application.static_publications = &application_static_publications;
+    application.websocket_endpoints = &application_websocket_endpoints;
+    application.fallback = .{
+        .handler = ApplicationHandlers.notFound,
+        .handler_context = null,
+    };
+    break :blk application;
+};
+
+/// Thin CLI-owned wrappers around the library server APIs.
+const ApplicationHandlers = struct {
+    /// Writes the shared `/health` JSON response for the server application.
+    fn health(
+        _: ?*anyopaque,
+        request: *zttp.ServerRequest,
+        writer: *zttp.ServerResponseWriter,
+    ) !void {
+        writer.setStatus(.ok);
+        try writer.appendHeader("Content-Type", "application/json");
+        var body_buffer: [128]u8 = undefined;
+        const body = try std.fmt.bufPrint(
+            &body_buffer,
+            "{{\"status\":\"ok\",\"protocol\":\"{s}\"}}",
+            .{request.negotiated_protocol.asAlpnBytes()},
+        );
+        try writer.writeAll(body);
+    }
+
+    /// Echoes the negotiated protocol and request metadata through the shared route.
+    fn echo(
+        _: ?*anyopaque,
+        request: *zttp.ServerRequest,
+        writer: *zttp.ServerResponseWriter,
+    ) !void {
+        const body_bytes = try request.readBodyAlloc(request.allocator, 256 * 1024);
+        defer request.allocator.free(body_bytes);
+
+        writer.setStatus(.ok);
+        try writer.appendHeader("Content-Type", "application/json");
+        var body_buffer: [192]u8 = undefined;
+        const body = try std.fmt.bufPrint(
+            &body_buffer,
+            "{{\"method\":\"{s}\",\"path\":\"{s}\",\"protocol\":\"{s}\",\"body_bytes\":{d}}}",
+            .{
+                request.method.asBytes(),
+                request.uri.path,
+                request.negotiated_protocol.asAlpnBytes(),
+                body_bytes.len,
+            },
+        );
+        try writer.writeAll(body);
+    }
+
+    /// Completes one WebSocket handshake without duplicating transport logic in the CLI.
+    fn chatWebSocket(
+        _: ?*anyopaque,
+        session: *zttp.ServerWebSocketSession,
+        _: *zttp.ServerRequest,
+        writer: *zttp.ServerResponseWriter,
+    ) !void {
+        try writer.appendHeader("X-WebSocket-Endpoint", session.endpoint_path);
+    }
+
+    /// Returns the explicit JSON fallback used by the server application.
+    fn notFound(
+        _: ?*anyopaque,
+        _: *zttp.ServerRequest,
+        writer: *zttp.ServerResponseWriter,
+    ) !void {
+        writer.setStatus(.not_found);
+        try writer.appendHeader("Content-Type", "application/json");
+        try writer.writeAll("{\"error\":\"fallback_not_found\"}");
+    }
+};
 
 /// CLI application wrapper.
 const Cli = struct {
@@ -177,13 +285,7 @@ const Cli = struct {
         var client = zttp.Client.init(self.allocator, client_options);
         defer client.deinit();
 
-        var handle = client.request(&request) catch |err| {
-            try self.reportRequestFailure(parsed, err);
-            return err;
-        };
-        defer handle.deinit();
-
-        var response = handle.wait() catch |err| {
+        var response = client.requestDecoded(&request) catch |err| {
             try self.reportRequestFailure(parsed, err);
             return err;
         };
@@ -224,10 +326,12 @@ const Cli = struct {
 
     /// Builds the loopback runtime configuration used by the server command.
     fn buildServerConfig(server_args: ServerArgs) !zttp.ServerConfig {
-        var config = zttp.ServerConfig.init(zttp.Testing.InteropHarness.handleServerRequest);
+        var config = zttp.ServerConfig.init(ApplicationHandlers.notFound);
         config.listen_host = server_args.listen;
         config.port = zttp.Port.init(server_args.port);
         config.http2_enabled = server_args.http2;
+        server_application.configure(&config);
+        try zttp.Server.App.validateConfiguredHandler(config.handler, config.handler_context);
         if (server_args.http3) {
             var http3 = zttp.Http3ListenerConfig.init();
             http3.listen_host = server_args.listen;
@@ -961,10 +1065,28 @@ test "server command builds the interop-harness runtime config" {
 
     try std.testing.expectEqualStrings("127.0.0.1", config.listen_host);
     try std.testing.expectEqual(@as(u16, 9090), config.port.toInt());
-    try std.testing.expect(config.handler == zttp.Testing.InteropHarness.handleServerRequest);
+    try zttp.Server.App.validateConfiguredHandler(config.handler, config.handler_context);
     try std.testing.expect(config.http2_enabled);
     try std.testing.expectEqualStrings("server.pem", config.tls.?.certificate_chain_path.?);
     try std.testing.expectEqualStrings("server.key", config.tls.?.private_key_path.?);
+}
+
+test "server command configures the shared server application" {
+    const config = try Cli.buildServerConfig(.{
+        .listen = "127.0.0.1",
+        .port = 18080,
+        .tls_cert = null,
+        .tls_key = null,
+        .http2 = false,
+        .http3 = false,
+    });
+
+    const application: *const zttp.ServerApplication = @ptrCast(@alignCast(config.handler_context.?));
+    try std.testing.expectEqual(@as(usize, 3), application.routes.len);
+    try std.testing.expectEqual(@as(usize, 1), application.static_publications.len);
+    try std.testing.expectEqual(@as(usize, 1), application.websocket_endpoints.len);
+    try std.testing.expectEqualStrings("/assets", application.static_publications[0].mount_path);
+    try std.testing.expectEqualStrings("/ws/chat", application.websocket_endpoints[0].path);
 }
 
 test "request failure hint targets loopback transport regressions" {

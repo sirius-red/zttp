@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-03-31
+
+### Changed
+
+- Moved the CLI request path onto the first-party decoded-response surface and
+  switched the CLI server command to a library-owned server application that
+  exposes `/health`, `/echo`, `/assets/site.css`, and `/ws/chat`.
+- Folded the readiness round-trip and hardening-threshold execution into
+  `zig build test`, removing the separate smoke/signoff command split from the
+  user-facing build workflow.
+
 ## [0.10.0] - 2026-03-30
 
 ### Added

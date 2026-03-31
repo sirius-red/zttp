@@ -94,8 +94,8 @@ pick `h2` or `http/1.1` per request.
   silent downgrade.
 - Verification for this feature is local-first: `zig build test` covers the
   dual-ALPN, `http1_only`, omitted-ALPN, and unsupported-protocol personas in
-  `src/lib/testing/interop_harness.zig`, and `zig build smoke` remains an
-  optional CLI-oriented follow-up.
+  `src/lib/testing/interop_harness.zig`, including the CLI-oriented readiness
+  round-trip coverage.
 
 ## Roadmap
 
@@ -122,12 +122,11 @@ Longer-term goals:
 - [X] Expand higher-level server features further with static files, compression, and broader framework conveniences.
 - [X] Add higher-level client conveniences such as multipart/form-data helpers, retries, caching, and automatic decompression.
 - [X] Add WebSocket support.
-- [ ] Bring HTTP/2 and HTTP/3 interoperability and production hardening closer to the maturity of the current HTTP/1.1 path.
+- [X] Bring HTTP/2 and HTTP/3 interoperability and production hardening closer to the maturity of the current HTTP/1.1 path.
 
 ## Build and Test
 
 ```shell
 zig build
 zig build test
-zig build smoke
 ```

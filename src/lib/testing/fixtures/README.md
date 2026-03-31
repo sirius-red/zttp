@@ -22,40 +22,40 @@ tests.
   - Returns selected token: `spdy/3`
   - Expected client outcome: reject before HTTP handling
 
-These personas must stay aligned with the local contract in
-`.specify/specs/feat/alpn-auto-protocol-selection/contracts/alpn-loopback.openapi.yaml`
-and the typed metadata in `src/lib/testing/interop_harness.zig`.
+These personas must stay aligned with the typed metadata in
+`src/lib/testing/interop_harness.zig`.
 
 ## Intended layout
 
 - `certs/`: loopback certificates, keys, and trust roots for TLS and ALPN tests
 - `http/`: raw request and response payload fixtures for HTTP/1.1 and HTTP/2
 - `http3/`: UDP or QUIC payload samples used by HTTP/3 harness tests
-- `m6-assets/`: local static files and cached payload samples used by the M6
-  server and client convenience tests
-- `m6-peers/`: repository-owned peer descriptors for loopback and multi-process
-  hardening personas
-- `m6-profiles/`: protocol capability and production-matrix profile metadata
+- `higher-level-assets/`: local static files and cached payload samples used by
+  the higher-level server and client convenience tests
+- `interop-peers/`: repository-owned peer descriptors for loopback and
+  multi-process hardening personas
+- `interop-profiles/`: protocol capability and production-matrix profile
+  metadata
 
-## M6 inventory
+## Fixture inventory
 
-- `m6-assets/site.css`
+- `higher-level-assets/site.css`
   - Intended for static file publication and compression eligibility checks
-- `m6-assets/upload.bin`
+- `higher-level-assets/upload.bin`
   - Intended for multipart upload fixture coverage
-- `m6-assets/cached-config.json`
+- `higher-level-assets/cached-config.json`
   - Intended for cache freshness and revalidation coverage
-- `m6-peers/server-app.json`
+- `interop-peers/server-app.json`
   - Intended for the local first-party server application persona
-- `m6-peers/h2-peer.json`
+- `interop-peers/h2-peer.json`
   - Intended for the controlled multi-process HTTP/2 persona
-- `m6-peers/h3-peer.json`
+- `interop-peers/h3-peer.json`
   - Intended for the controlled multi-process HTTP/3 persona
-- `m6-profiles/http1-baseline.json`
+- `interop-profiles/http1-baseline.json`
   - Intended for HTTP/1.1 capability and fallback classification
-- `m6-profiles/h2-multiplexed.json`
+- `interop-profiles/h2-multiplexed.json`
   - Intended for HTTP/2 multiplexing and WebSocket capability classification
-- `m6-profiles/h3-quic.json`
+- `interop-profiles/h3-quic.json`
   - Intended for HTTP/3 runtime and disturbance classification
 
 ## Rules

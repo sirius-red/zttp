@@ -108,10 +108,8 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_cli_tests.step);
-
-    const smoke_step = b.step("smoke", "Run the readiness smoke scenario");
     run_readiness_smoke.step.dependOn(b.getInstallStep());
-    smoke_step.dependOn(&run_readiness_smoke.step);
+    test_step.dependOn(&run_readiness_smoke.step);
 
     const test_http3_step = b.step("test-http3", "Run the full test suite including the default HTTP/3 coverage");
     test_http3_step.dependOn(&run_lib_tests.step);

@@ -10,12 +10,12 @@ pub const FixtureGroup = enum {
     http,
     /// HTTP/3 and QUIC fixture payloads.
     http3,
-    /// Static assets and cached payload fixtures for M6.
-    m6_assets,
-    /// Peer descriptors for M6 loopback and multi-process profiles.
-    m6_peers,
-    /// Capability and protocol profile metadata for M6.
-    m6_profiles,
+    /// Higher-level server/client asset fixtures.
+    higher_level_assets,
+    /// Peer descriptors for local interop loopback and multi-process profiles.
+    interop_peers,
+    /// Capability and protocol profile metadata for local interop coverage.
+    interop_profiles,
 
     /// Returns the relative directory name for the fixture group.
     pub fn dirName(self: FixtureGroup) []const u8 {
@@ -23,8 +23,8 @@ pub const FixtureGroup = enum {
     }
 };
 
-/// Stable M6 asset fixture identifier.
-pub const M6AssetFixtureId = enum {
+/// Stable higher-level asset fixture identifier.
+pub const HigherLevelAssetFixtureId = enum {
     /// Static stylesheet used by server publication coverage.
     site_css,
     /// Binary upload payload used by multipart coverage.
@@ -33,17 +33,17 @@ pub const M6AssetFixtureId = enum {
     cached_config,
 
     /// Returns the fixture path relative to the root fixture directory.
-    pub fn relativePath(self: M6AssetFixtureId) []const u8 {
+    pub fn relativePath(self: HigherLevelAssetFixtureId) []const u8 {
         return switch (self) {
-            .site_css => "m6-assets/site.css",
-            .upload_bin => "m6-assets/upload.bin",
-            .cached_config => "m6-assets/cached-config.json",
+            .site_css => "higher-level-assets/site.css",
+            .upload_bin => "higher-level-assets/upload.bin",
+            .cached_config => "higher-level-assets/cached-config.json",
         };
     }
 };
 
-/// Stable M6 peer descriptor identifier.
-pub const M6PeerFixtureId = enum {
+/// Stable interop peer descriptor identifier.
+pub const InteropPeerFixtureId = enum {
     /// Loopback first-party server application persona.
     server_app,
     /// Controlled multi-process HTTP/2 peer persona.
@@ -52,17 +52,17 @@ pub const M6PeerFixtureId = enum {
     h3_peer,
 
     /// Returns the fixture path relative to the root fixture directory.
-    pub fn relativePath(self: M6PeerFixtureId) []const u8 {
+    pub fn relativePath(self: InteropPeerFixtureId) []const u8 {
         return switch (self) {
-            .server_app => "m6-peers/server-app.json",
-            .h2_peer => "m6-peers/h2-peer.json",
-            .h3_peer => "m6-peers/h3-peer.json",
+            .server_app => "interop-peers/server-app.json",
+            .h2_peer => "interop-peers/h2-peer.json",
+            .h3_peer => "interop-peers/h3-peer.json",
         };
     }
 };
 
-/// Stable M6 protocol profile identifier.
-pub const M6ProtocolProfileId = enum {
+/// Stable interop protocol profile identifier.
+pub const InteropProtocolProfileId = enum {
     /// HTTP/1.1 baseline profile.
     http1_baseline,
     /// HTTP/2 multiplexing profile.
@@ -71,11 +71,11 @@ pub const M6ProtocolProfileId = enum {
     h3_quic,
 
     /// Returns the fixture path relative to the root fixture directory.
-    pub fn relativePath(self: M6ProtocolProfileId) []const u8 {
+    pub fn relativePath(self: InteropProtocolProfileId) []const u8 {
         return switch (self) {
-            .http1_baseline => "m6-profiles/http1-baseline.json",
-            .h2_multiplexed => "m6-profiles/h2-multiplexed.json",
-            .h3_quic => "m6-profiles/h3-quic.json",
+            .http1_baseline => "interop-profiles/http1-baseline.json",
+            .h2_multiplexed => "interop-profiles/h2-multiplexed.json",
+            .h3_quic => "interop-profiles/h3-quic.json",
         };
     }
 };
@@ -338,56 +338,56 @@ pub const Loader = struct {
         return try self.loadFromGroup(allocator, .http3, relative_path);
     }
 
-    /// Returns the full path for one named M6 asset fixture.
-    pub fn pathForM6Asset(
+    /// Returns the full path for one named higher-level asset fixture.
+    pub fn pathForHigherLevelAsset(
         self: Loader,
         allocator: std.mem.Allocator,
-        fixture: M6AssetFixtureId,
+        fixture: HigherLevelAssetFixtureId,
     ) LoadError![]u8 {
         return try self.pathFor(allocator, fixture.relativePath());
     }
 
-    /// Returns the full path for one named M6 peer fixture.
-    pub fn pathForM6Peer(
+    /// Returns the full path for one named interop peer fixture.
+    pub fn pathForInteropPeer(
         self: Loader,
         allocator: std.mem.Allocator,
-        fixture: M6PeerFixtureId,
+        fixture: InteropPeerFixtureId,
     ) LoadError![]u8 {
         return try self.pathFor(allocator, fixture.relativePath());
     }
 
-    /// Returns the full path for one named M6 protocol profile fixture.
-    pub fn pathForM6ProtocolProfile(
+    /// Returns the full path for one named interop protocol profile fixture.
+    pub fn pathForInteropProtocolProfile(
         self: Loader,
         allocator: std.mem.Allocator,
-        fixture: M6ProtocolProfileId,
+        fixture: InteropProtocolProfileId,
     ) LoadError![]u8 {
         return try self.pathFor(allocator, fixture.relativePath());
     }
 
-    /// Loads one named M6 asset fixture.
-    pub fn loadM6Asset(
+    /// Loads one named higher-level asset fixture.
+    pub fn loadHigherLevelAsset(
         self: Loader,
         allocator: std.mem.Allocator,
-        fixture: M6AssetFixtureId,
+        fixture: HigherLevelAssetFixtureId,
     ) LoadError![]u8 {
         return try self.load(allocator, fixture.relativePath());
     }
 
-    /// Loads one named M6 peer fixture.
-    pub fn loadM6Peer(
+    /// Loads one named interop peer fixture.
+    pub fn loadInteropPeer(
         self: Loader,
         allocator: std.mem.Allocator,
-        fixture: M6PeerFixtureId,
+        fixture: InteropPeerFixtureId,
     ) LoadError![]u8 {
         return try self.load(allocator, fixture.relativePath());
     }
 
-    /// Loads one named M6 protocol profile fixture.
-    pub fn loadM6ProtocolProfile(
+    /// Loads one named interop protocol profile fixture.
+    pub fn loadInteropProtocolProfile(
         self: Loader,
         allocator: std.mem.Allocator,
-        fixture: M6ProtocolProfileId,
+        fixture: InteropProtocolProfileId,
     ) LoadError![]u8 {
         return try self.load(allocator, fixture.relativePath());
     }
@@ -592,40 +592,44 @@ test "fixture loader resolves loopback quic runtime fixture paths" {
     );
 }
 
-test "fixture loader resolves M6 fixture paths" {
+test "fixture loader resolves higher-level asset fixture paths" {
     const loader = Loader.init();
 
-    const asset = try loader.pathForM6Asset(std.testing.allocator, .site_css);
+    const asset = try loader.pathForHigherLevelAsset(std.testing.allocator, .site_css);
     defer std.testing.allocator.free(asset);
     try std.testing.expect(
-        std.mem.endsWith(u8, asset, "m6-assets/site.css") or
-            std.mem.endsWith(u8, asset, "m6-assets\\site.css"),
+        std.mem.endsWith(u8, asset, "higher-level-assets/site.css") or
+            std.mem.endsWith(u8, asset, "higher-level-assets\\site.css"),
     );
 
-    const peer = try loader.pathForM6Peer(std.testing.allocator, .h2_peer);
+    const peer = try loader.pathForInteropPeer(std.testing.allocator, .h2_peer);
     defer std.testing.allocator.free(peer);
     try std.testing.expect(
-        std.mem.endsWith(u8, peer, "m6-peers/h2-peer.json") or
-            std.mem.endsWith(u8, peer, "m6-peers\\h2-peer.json"),
+        std.mem.endsWith(u8, peer, "interop-peers/h2-peer.json") or
+            std.mem.endsWith(u8, peer, "interop-peers\\h2-peer.json"),
     );
 
-    const profile = try loader.pathForM6ProtocolProfile(std.testing.allocator, .h3_quic);
+    const profile = try loader.pathForInteropProtocolProfile(std.testing.allocator, .h3_quic);
     defer std.testing.allocator.free(profile);
     try std.testing.expect(
-        std.mem.endsWith(u8, profile, "m6-profiles/h3-quic.json") or
-            std.mem.endsWith(u8, profile, "m6-profiles\\h3-quic.json"),
+        std.mem.endsWith(u8, profile, "interop-profiles/h3-quic.json") or
+            std.mem.endsWith(u8, profile, "interop-profiles\\h3-quic.json"),
     );
 }
 
-test "fixture loader reads M6 peer and profile metadata fixtures" {
+test "fixture loader reads higher-level asset peer and profile metadata fixtures" {
     const loader = Loader.init();
 
-    const peer = try loader.loadM6Peer(std.testing.allocator, .server_app);
+    const asset = try loader.loadHigherLevelAsset(std.testing.allocator, .cached_config);
+    defer std.testing.allocator.free(asset);
+    try std.testing.expect(std.mem.containsAtLeast(u8, asset, 1, "\"version\""));
+
+    const peer = try loader.loadInteropPeer(std.testing.allocator, .server_app);
     defer std.testing.allocator.free(peer);
     try std.testing.expect(std.mem.containsAtLeast(u8, peer, 1, "\"network_mode\": \"loopback\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, peer, 1, "\"server_routing\""));
 
-    const profile = try loader.loadM6ProtocolProfile(std.testing.allocator, .h2_multiplexed);
+    const profile = try loader.loadInteropProtocolProfile(std.testing.allocator, .h2_multiplexed);
     defer std.testing.allocator.free(profile);
     try std.testing.expect(std.mem.containsAtLeast(u8, profile, 1, "\"eligible_flows\": 340"));
     try std.testing.expect(std.mem.containsAtLeast(u8, profile, 1, "\"hardening_matrix\""));

@@ -1,4 +1,4 @@
-//! Typed in-memory HTTP cache foundations for M6.
+//! Typed in-memory HTTP cache foundations for higher-level client flows.
 
 const std = @import("std");
 const types = @import("../types.zig");

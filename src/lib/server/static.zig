@@ -272,7 +272,7 @@ fn methodAllowed(allowed_methods: []const core.Method, method: core.Method) bool
 }
 
 test "static publication validates path confinement and default metadata" {
-    const publication = Publication.init("assets", "/assets", "src/lib/testing/fixtures/m6-assets");
+    const publication = Publication.init("assets", "/assets", "src/lib/testing/fixtures/higher-level-assets");
 
     try publication.validate();
     try std.testing.expect(publication.matchesPath("/assets/site.css"));

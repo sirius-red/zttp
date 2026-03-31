@@ -105,15 +105,15 @@ const StaticAssetNegativeExpectation = struct {
     rejection_reason: []const u8,
 };
 
-/// Shared M6 static asset expectation for `/assets/site.css`.
+/// Shared higher-level static asset expectation for `/assets/site.css`.
 const static_asset_expectation = StaticAssetExpectation{
     .path = "/assets/site.css",
     .content_type = "text/css",
-    .fixture_suffix = "m6-assets/site.css",
+    .fixture_suffix = "higher-level-assets/site.css",
     .supported_encodings = &.{ "identity", "gzip" },
 };
 
-/// Dedicated static-file negative cases required by the M6 contract.
+/// Dedicated static-file negative cases required by the shared local contract.
 const static_asset_negative_expectations = [_]StaticAssetNegativeExpectation{
     .{
         .method = .get,
@@ -135,7 +135,7 @@ const static_asset_negative_expectations = [_]StaticAssetNegativeExpectation{
     },
 };
 
-/// Expected protocol coverage for the first-party M6 static asset surface.
+/// Expected protocol coverage for the first-party static asset surface.
 const static_asset_protocols = [_]types.NegotiatedProtocol{ .http_1_1, .h2, .h3 };
 
 /// Expects one capability matrix entry to report supported behavior.
@@ -276,7 +276,7 @@ test "server interop secure listener serves the shared health route over h2" {
     try std.testing.expect(std.mem.containsAtLeast(u8, response.body, 1, "\"protocol\":\"h2\""));
 }
 
-test "server interop aligns health and static asset coverage with the M6 contract" {
+test "server interop aligns health and static asset coverage with the shared local contract" {
     const health = interop_harness.scenarioForRoute(.health).?;
     try std.testing.expectEqualStrings("/health", health.path_template);
     try std.testing.expectEqual(types.Status.ok, health.success_status);
@@ -288,7 +288,7 @@ test "server interop aligns health and static asset coverage with the M6 contrac
     }
 
     const loader = fixture_loader.Loader.init();
-    const asset_path = try loader.pathForM6Asset(std.testing.allocator, .site_css);
+    const asset_path = try loader.pathForHigherLevelAsset(std.testing.allocator, .site_css);
     defer std.testing.allocator.free(asset_path);
 
     try std.testing.expectEqualStrings("/assets/site.css", static_asset_expectation.path);
@@ -298,7 +298,7 @@ test "server interop aligns health and static asset coverage with the M6 contrac
     try std.testing.expectEqualStrings("gzip", static_asset_expectation.supported_encodings[1]);
     try std.testing.expect(
         std.mem.endsWith(u8, asset_path, static_asset_expectation.fixture_suffix) or
-            std.mem.endsWith(u8, asset_path, "m6-assets\\site.css"),
+            std.mem.endsWith(u8, asset_path, "higher-level-assets\\site.css"),
     );
 }
 
@@ -306,7 +306,7 @@ test "server interop static asset negatives cover traversal missing assets and m
     const loader = fixture_loader.Loader.init();
     try std.testing.expectError(
         error.PathTraversalNotAllowed,
-        loader.pathFor(std.testing.allocator, "m6-assets/../secrets.txt"),
+        loader.pathFor(std.testing.allocator, "higher-level-assets/../secrets.txt"),
     );
 
     try std.testing.expectEqual(@as(usize, 3), static_asset_negative_expectations.len);
