@@ -14,6 +14,16 @@ const socket_io = @import("../util/socket_io.zig");
 /// Error set returned by server startup and serving operations.
 pub const Error = anyerror;
 
+/// Snapshot of server-runtime diagnostics used by hardening tests.
+pub const Snapshot = struct {
+    /// Number of accepted connections currently being serviced.
+    active_connections: usize,
+    /// Number of failures that stayed scoped to one accepted connection.
+    connection_scoped_failures: usize,
+    /// Whether the UDP HTTP/3 runtime is enabled.
+    http3_enabled: bool,
+};
+
 /// Bound server runtime instance.
 pub const Server = struct {
     /// Allocator used for request and runtime state.
@@ -28,6 +38,8 @@ pub const Server = struct {
     stop_requested: std.atomic.Value(bool),
     /// Active connection count.
     active_connections: std.atomic.Value(usize),
+    /// Accepted-connection failures that stayed scoped to one connection.
+    connection_scoped_failures: std.atomic.Value(usize),
     /// Secure listener plan when TLS listener mode is configured.
     secure_listener_plan: ?server_types.SecureListenerPlan,
     /// Optional HTTP/3 UDP runtime bound alongside the TCP listener.
@@ -55,6 +67,7 @@ pub const Server = struct {
             .thread = null,
             .stop_requested = std.atomic.Value(bool).init(false),
             .active_connections = std.atomic.Value(usize).init(0),
+            .connection_scoped_failures = std.atomic.Value(usize).init(0),
             .secure_listener_plan = secure_listener_plan,
             .http3_runtime = if (config.http3 != null) try http3.Runtime.init(allocator, config) else null,
         };
@@ -114,6 +127,15 @@ pub const Server = struct {
         return null;
     }
 
+    /// Returns a snapshot of server-runtime isolation diagnostics.
+    pub fn snapshot(self: *const Server) Snapshot {
+        return .{
+            .active_connections = self.active_connections.load(.seq_cst),
+            .connection_scoped_failures = self.connection_scoped_failures.load(.seq_cst),
+            .http3_enabled = self.http3_runtime != null,
+        };
+    }
+
     /// Requests the accept loop to stop and wakes a blocked listener, if needed.
     pub fn requestStop(self: *Server) void {
         if (self.stop_requested.swap(true, .seq_cst)) {
@@ -160,6 +182,7 @@ pub const Server = struct {
             if (err == error.OutOfMemory) {
                 return err;
             }
+            _ = self.connection_scoped_failures.fetchAdd(1, .seq_cst);
         };
     }
 
@@ -376,6 +399,36 @@ fn writeDefaultNotFound(writer: *server_types.ServerResponseWriter) !void {
     try writer.writeAll("{\"error\":\"not_found\"}");
 }
 
+/// Sends one raw HTTP request to the provided loopback port and returns the full response bytes.
+fn runRawExchange(
+    allocator: std.mem.Allocator,
+    port: u16,
+    request_bytes: []const u8,
+) ![]u8 {
+    const address = try std.net.Address.parseIp("127.0.0.1", port);
+    var stream = try std.net.tcpConnectToAddress(address);
+    defer stream.close();
+
+    try stream.writeAll(request_bytes);
+
+    var response = std.ArrayListUnmanaged(u8){};
+    errdefer response.deinit(allocator);
+
+    var buffer: [1024]u8 = undefined;
+    while (true) {
+        const read_len = socket_io.read(stream, &buffer) catch |err| switch (err) {
+            error.ConnectionResetByPeer => break,
+            else => return err,
+        };
+        if (read_len == 0) {
+            break;
+        }
+        try response.appendSlice(allocator, buffer[0..read_len]);
+    }
+
+    return response.toOwnedSlice(allocator);
+}
+
 test "server runtime binds an ephemeral loopback port" {
     const noop = struct {
         fn handle(_: ?*anyopaque, _: *server_types.ServerRequest, _: *server_types.ServerResponseWriter) !void {}
@@ -408,4 +461,51 @@ test "server runtime validates secure listener fixtures during init" {
     defer server.deinit();
 
     try std.testing.expect(server.secure_listener_plan != null);
+}
+
+test "server runtime scopes a handler failure to one accepted connection" {
+    const State = struct {
+        request_count: usize = 0,
+    };
+
+    const Flaky = struct {
+        fn handle(
+            ctx: ?*anyopaque,
+            _: *server_types.ServerRequest,
+            writer: *server_types.ServerResponseWriter,
+        ) !void {
+            const state: *State = @ptrCast(@alignCast(ctx.?));
+            state.request_count += 1;
+            if (state.request_count == 1) {
+                return error.ForcedFailure;
+            }
+            writer.setStatus(.ok);
+            try writer.appendHeader("Content-Type", "text/plain");
+            try writer.writeAll("ok");
+        }
+    };
+
+    var state = State{};
+    var config = server_types.ServerConfig.init(Flaky.handle);
+    config.port = core.Port.init(0);
+    config.handler_context = &state;
+
+    var server = try Server.init(std.testing.allocator, config);
+    defer server.deinit();
+    try server.start();
+
+    const request_bytes =
+        "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+
+    const first = try runRawExchange(std.testing.allocator, server.port(), request_bytes);
+    defer std.testing.allocator.free(first);
+    try std.testing.expectEqual(@as(usize, 0), first.len);
+
+    const second = try runRawExchange(std.testing.allocator, server.port(), request_bytes);
+    defer std.testing.allocator.free(second);
+    try std.testing.expect(std.mem.containsAtLeast(u8, second, 1, "HTTP/1.1 200 OK"));
+
+    const snapshot = server.snapshot();
+    try std.testing.expectEqual(@as(usize, 1), snapshot.connection_scoped_failures);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.active_connections);
 }

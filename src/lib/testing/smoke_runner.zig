@@ -177,6 +177,14 @@ pub const RoundTripResult = struct {
     }
 };
 
+/// Structured hardening summary used by SC-004 smoke validation.
+pub const HardeningSummary = struct {
+    /// Aggregated workload metrics captured from the local hardening matrix.
+    metrics: interop_harness.HardeningWorkloadMetrics,
+    /// Whether the workload satisfies SC-004.
+    passes_sc004: bool,
+};
+
 /// Reusable CLI smoke runner for the shared server/request loopback scenario.
 pub const CliRoundTripRunner = struct {
     /// Allocator used for child-process capture buffers.
@@ -462,6 +470,32 @@ pub fn writeRoundTripSummary(writer: anytype, result: RoundTripResult) !void {
     }
 }
 
+/// Returns a structured SC-004 summary for one hardening workload.
+pub fn summarizeHardening(metrics: interop_harness.HardeningWorkloadMetrics) HardeningSummary {
+    return .{
+        .metrics = metrics,
+        .passes_sc004 = metrics.passesSc004(),
+    };
+}
+
+/// Writes the SC-004 hardening summary to the provided writer.
+pub fn writeHardeningSummary(
+    writer: anytype,
+    summary: HardeningSummary,
+) !void {
+    try writer.print("eligible_flows: {d}\n", .{summary.metrics.total_eligible_flows});
+    try writer.print("excluded_flows: {d}\n", .{summary.metrics.excluded_flows});
+    try writer.print("failure_count: {d}\n", .{summary.metrics.failure_count});
+    try writer.print("success_ratio: {d:.4}\n", .{summary.metrics.successRatio()});
+    try writer.print("sc004: {s}\n", .{if (summary.passes_sc004) "pass" else "fail"});
+    for (summary.metrics.protocol_mix) |entry| {
+        try writer.print(
+            "protocol[{s}]: eligible={d} excluded={d} failures={d}\n",
+            .{ @tagName(entry.protocol), entry.eligible_flows, entry.excluded_flows, entry.failure_count },
+        );
+    }
+}
+
 /// Entrypoint for `zig build smoke`.
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -572,4 +606,27 @@ test "round trip classification preserves known socket failures" {
 
     const failure = request.expectedSocketFailure(scenario.known_failure_signature).?;
     try std.testing.expectEqual(.known_socket_failure, classifyRoundTripResult(scenario, request, failure));
+}
+
+test "hardening summary reports SC-004 workload metrics" {
+    const summary = summarizeHardening(.{
+        .protocol_mix = .{
+            .{ .protocol = .http_1_1, .eligible_flows = 320, .excluded_flows = 8, .failure_count = 2 },
+            .{ .protocol = .h2, .eligible_flows = 340, .excluded_flows = 10, .failure_count = 3 },
+            .{ .protocol = .h3, .eligible_flows = 360, .excluded_flows = 12, .failure_count = 4 },
+        },
+        .total_eligible_flows = 1020,
+        .excluded_flows = 30,
+        .failure_count = 9,
+    });
+
+    try std.testing.expect(summary.passes_sc004);
+
+    var bytes = std.ArrayList(u8).init(std.testing.allocator);
+    defer bytes.deinit();
+    try writeHardeningSummary(bytes.writer(), summary);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "eligible_flows: 1020"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "sc004: pass"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "protocol[h3]: eligible=360"));
 }

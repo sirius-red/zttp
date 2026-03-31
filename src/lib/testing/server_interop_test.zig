@@ -320,3 +320,35 @@ test "server interop static asset negatives cover traversal missing assets and m
         try std.testing.expect(expectation.rejection_reason.len > 0);
     }
 }
+
+test "server interop loads loopback and multiprocess peer descriptors for server-facing coverage" {
+    const loader = fixture_loader.Loader.init();
+
+    var server_app = try interop_harness.loadPeerDescriptor(std.testing.allocator, loader, .server_app);
+    defer server_app.deinit();
+    try std.testing.expectEqual(interop_harness.NetworkMode.loopback, server_app.descriptor.network_mode);
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, server_app.descriptor.protocol);
+    try std.testing.expectEqual(interop_harness.Transport.tcp, server_app.descriptor.transport);
+    try std.testing.expectEqualStrings("server", server_app.descriptor.startup.argv[4]);
+
+    var h2_peer = try interop_harness.loadPeerDescriptor(std.testing.allocator, loader, .h2_peer);
+    defer h2_peer.deinit();
+    try std.testing.expectEqual(interop_harness.NetworkMode.multiprocess, h2_peer.descriptor.network_mode);
+    try std.testing.expectEqual(types.NegotiatedProtocol.h2, h2_peer.descriptor.protocol);
+    try std.testing.expectEqual(interop_harness.Transport.tcp, h2_peer.descriptor.transport);
+}
+
+test "server interop profile coverage keeps server features classified across loopback and h2 peers" {
+    const loader = fixture_loader.Loader.init();
+
+    var http1_profile = try interop_harness.loadProtocolProfile(std.testing.allocator, loader, .http1_baseline);
+    defer http1_profile.deinit();
+    try std.testing.expectEqual(interop_harness.NetworkMode.loopback, http1_profile.profile.network_mode);
+    try expectSupportedCapability(.server_routing, .http_1_1);
+
+    var h2_profile = try interop_harness.loadProtocolProfile(std.testing.allocator, loader, .h2_multiplexed);
+    defer h2_profile.deinit();
+    try std.testing.expectEqual(interop_harness.NetworkMode.multiprocess, h2_profile.profile.network_mode);
+    try expectSupportedCapability(.server_websocket, .h2);
+    try expectSupportedCapability(.hardening_matrix, .h2);
+}

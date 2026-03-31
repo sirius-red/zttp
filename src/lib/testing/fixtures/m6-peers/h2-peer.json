@@ -1,0 +1,30 @@
+{
+  "id": "h2_peer",
+  "name": "h2-multiprocess-peer",
+  "host": "127.0.0.1",
+  "port": 18443,
+  "transport": "tcp",
+  "protocol": "h2",
+  "network_mode": "multiprocess",
+  "capabilities": [
+    "server_websocket",
+    "client_retry",
+    "client_cache",
+    "client_websocket",
+    "hardening_matrix"
+  ],
+  "startup": {
+    "cwd": ".",
+    "argv": [
+      "zig",
+      "build",
+      "run",
+      "--",
+      "server",
+      "--listen",
+      "127.0.0.1",
+      "--port",
+      "18443"
+    ]
+  }
+}

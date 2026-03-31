@@ -1,0 +1,15 @@
+{
+  "id": "http1_baseline",
+  "protocol": "http/1.1",
+  "network_mode": "loopback",
+  "eligible_flows": 320,
+  "excluded_flows": 8,
+  "failure_count": 2,
+  "required_capabilities": [
+    "server_routing",
+    "client_retry",
+    "client_cache",
+    "hardening_matrix"
+  ],
+  "notes": "Loopback baseline for fallback, retry, cache, and request-scoped isolation."
+}

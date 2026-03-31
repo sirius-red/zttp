@@ -6,6 +6,7 @@ const types = @import("../types.zig");
 const qpack = @import("qpack.zig");
 const quic = @import("quic.zig");
 const server = @import("server.zig");
+const server_types = @import("../server/types.zig");
 const websocket_client = @import("../websocket/client.zig");
 
 /// Monotonic seed used to derive distinct loopback runtime session identifiers.
@@ -13,6 +14,16 @@ var runtime_session_seed = std.atomic.Value(u64).init(0);
 
 /// Error set returned by the local HTTP/3 client helpers.
 pub const Error = anyerror;
+
+/// Explicit HTTP/3 runtime failure classification for hardening diagnostics.
+pub const RuntimeFailureClassification = struct {
+    /// Isolation boundary preserved by the failure.
+    scope: types.FailureIsolationScope,
+    /// Typed HTTP/3 failure category.
+    category: server_types.Http3FailureCategory,
+    /// Optional explanatory note for the classification.
+    notes: ?[]const u8,
+};
 
 /// Creates a client-owned WebSocket session for the HTTP/3 adapter path.
 pub fn openWebSocketSession(
@@ -23,6 +34,50 @@ pub fn openWebSocketSession(
         .path = uri.path,
         .subprotocol = options.subprotocol,
     }, .h3, options);
+}
+
+/// Classifies one local HTTP/3 runtime error into a typed hardening outcome.
+pub fn classifyRuntimeError(err: anyerror) RuntimeFailureClassification {
+    return switch (err) {
+        error.InvalidScheme,
+        error.BodyReadFailed,
+        error.RequestBodyTooLarge,
+        => .{
+            .scope = .request,
+            .category = .route,
+            .notes = "request could not be prepared for the runtime session",
+        },
+        error.InvalidStreamEnvelope,
+        error.InvalidStatus,
+        error.MissingStatus,
+        => .{
+            .scope = .stream,
+            .category = .route,
+            .notes = "response decoding failed for one request stream",
+        },
+        error.InvalidControlStreamState,
+        => .{
+            .scope = .session,
+            .category = .compression,
+            .notes = "connection-scoped control or QPACK state was invalid",
+        },
+        error.ConnectionResetByPeer,
+        error.ConnectionTimedOut,
+        error.NetworkSubsystemFailed,
+        error.NetworkUnreachable,
+        error.SocketNotConnected,
+        error.WouldBlock,
+        => .{
+            .scope = .session,
+            .category = .transport,
+            .notes = "UDP or QUIC session transport failed",
+        },
+        else => .{
+            .scope = .session,
+            .category = .session,
+            .notes = "session-level fallback classification",
+        },
+    };
 }
 
 /// One decoded runtime stream envelope retained long enough to parse a response.

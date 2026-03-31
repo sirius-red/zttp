@@ -101,6 +101,10 @@ pub const Snapshot = struct {
     reusable: bool,
     /// Current typed connection state.
     state: connection_state.ConnectionState,
+    /// Most recent failure-isolation scope surfaced by the runtime.
+    last_failure_scope: ?types.FailureIsolationScope,
+    /// Optional diagnostic note for the most recent failure scope.
+    last_failure_note: ?[]const u8,
 };
 
 /// Command mailbox type.
@@ -226,6 +230,10 @@ pub const ConnectionH2 = struct {
     saw_connection_backpressure: bool,
     /// Whether the runtime remains reusable for new requests.
     reusable: bool,
+    /// Most recent failure-isolation scope surfaced by the runtime.
+    last_failure_scope: ?types.FailureIsolationScope,
+    /// Optional diagnostic note for the most recent failure scope.
+    last_failure_note: ?[]const u8,
 
     /// Initializes a runtime without starting the background thread.
     pub fn init(
@@ -250,6 +258,8 @@ pub const ConnectionH2 = struct {
             .saw_stream_backpressure = false,
             .saw_connection_backpressure = false,
             .reusable = true,
+            .last_failure_scope = null,
+            .last_failure_note = null,
         };
     }
 
@@ -286,6 +296,8 @@ pub const ConnectionH2 = struct {
             .saw_connection_backpressure = self.saw_connection_backpressure,
             .reusable = self.reusable,
             .state = self.connection.state,
+            .last_failure_scope = self.last_failure_scope,
+            .last_failure_note = self.last_failure_note,
         };
     }
 
@@ -565,6 +577,8 @@ pub const ConnectionH2 = struct {
                 .none => {},
                 .rst_stream => {
                     slot.action_fired = true;
+                    self.last_failure_scope = .stream;
+                    self.last_failure_note = "rst_stream remained isolated to one stream";
                     self.connection.resetStream(slot.stream_id) catch unreachable;
                     self.closeWriterLocked(slot, error.Protocol);
                     return;
@@ -572,6 +586,8 @@ pub const ConnectionH2 = struct {
                 .goaway => {
                     slot.action_fired = true;
                     self.reusable = false;
+                    self.last_failure_scope = .connection;
+                    self.last_failure_note = "goaway drained the shared connection";
                     self.connection.beginGoAway(slot.stream_id);
                 },
             }
@@ -917,6 +933,10 @@ test "http2 runtime isolates rst_stream from healthy streams" {
     defer health_response.deinit();
     defer if (health_response.body) |body| body.close();
     try std.testing.expectEqual(types.Status.ok, health_response.status);
+
+    const snapshot = runtime.snapshot();
+    try std.testing.expectEqual(@as(?types.FailureIsolationScope, .stream), snapshot.last_failure_scope);
+    try std.testing.expect(std.mem.containsAtLeast(u8, snapshot.last_failure_note.?, 1, "isolated"));
 }
 
 test "http2 runtime stops admitting requests after goaway" {
@@ -959,4 +979,6 @@ test "http2 runtime stops admitting requests after goaway" {
 
     try std.testing.expectEqual(connection_state.ConnectionState.draining, draining_snapshot.state);
     try std.testing.expect(!draining_snapshot.reusable);
+    try std.testing.expectEqual(@as(?types.FailureIsolationScope, .connection), draining_snapshot.last_failure_scope);
+    try std.testing.expect(std.mem.containsAtLeast(u8, draining_snapshot.last_failure_note.?, 1, "goaway"));
 }

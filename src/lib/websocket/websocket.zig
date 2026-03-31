@@ -54,6 +54,35 @@ pub const Capability = struct {
     notes: ?[]const u8,
 };
 
+/// Explicit failure category for a rejected or downgraded WebSocket operation.
+pub const FailureCategory = enum {
+    /// Endpoint path or request shape is invalid.
+    invalid_request,
+    /// The negotiated protocol does not support the requested operation.
+    unsupported_protocol,
+    /// The protocol-specific handshake could not be accepted.
+    invalid_handshake,
+    /// Negotiation failed before the session opened.
+    negotiation_failed,
+    /// The transport closed while the session was active.
+    transport_closed,
+};
+
+/// Explicit support and failure outcome for one WebSocket attempt.
+pub const Outcome = struct {
+    /// Capability classification for the negotiated protocol.
+    capability: Capability,
+    /// Failure isolation boundary when the attempt was rejected.
+    failure_scope: ?types.FailureIsolationScope,
+    /// Failure category when the attempt was rejected.
+    failure_category: ?FailureCategory,
+
+    /// Returns true when the outcome represents a failure.
+    pub fn failed(self: Outcome) bool {
+        return self.failure_category != null or self.capability.support == .unsupported;
+    }
+};
+
 /// Typed metadata attached to one first-party session.
 pub const SessionMetadata = struct {
     /// Negotiated protocol for the session.
@@ -102,6 +131,28 @@ pub const Session = struct {
 /// Re-exported close-reason type for session APIs.
 pub const CloseReason = frame.CloseReason;
 
+/// Returns a supported outcome for the provided capability.
+pub fn supportedOutcome(capability: Capability) Outcome {
+    return .{
+        .capability = capability,
+        .failure_scope = null,
+        .failure_category = null,
+    };
+}
+
+/// Returns a rejected outcome for the provided capability metadata.
+pub fn rejectedOutcome(
+    capability: Capability,
+    failure_scope: types.FailureIsolationScope,
+    failure_category: FailureCategory,
+) Outcome {
+    return .{
+        .capability = capability,
+        .failure_scope = failure_scope,
+        .failure_category = failure_category,
+    };
+}
+
 test "session lifecycle transitions preserve close metadata" {
     var session = Session.init(.{
         .protocol = .h2,
@@ -134,4 +185,18 @@ test "capability keeps typed protocol metadata" {
 
     try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, capability.protocol);
     try std.testing.expectEqual(types.FeatureSupportLevel.supported, capability.support);
+}
+
+test "websocket outcome keeps support and failure classification explicit" {
+    const capability = Capability{
+        .protocol = .h3,
+        .transport = .http3_connect,
+        .support = .unsupported,
+        .notes = "disabled for this endpoint",
+    };
+
+    const outcome = rejectedOutcome(capability, .session, .unsupported_protocol);
+    try std.testing.expect(outcome.failed());
+    try std.testing.expectEqual(types.FailureIsolationScope.session, outcome.failure_scope.?);
+    try std.testing.expectEqual(FailureCategory.unsupported_protocol, outcome.failure_category.?);
 }

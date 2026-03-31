@@ -346,3 +346,28 @@ test "http3 runtime keeps multi-session and multi-stream state isolated" {
         return error.TestUnexpectedResult;
     }
 }
+
+test "http3 interop loads multiprocess peer and profile metadata for h3 hardening" {
+    const loader = @import("fixture_loader.zig").Loader.init();
+
+    var peer = try interop_harness.loadPeerDescriptor(std.testing.allocator, loader, .h3_peer);
+    defer peer.deinit();
+    try std.testing.expectEqual(interop_harness.NetworkMode.multiprocess, peer.descriptor.network_mode);
+    try std.testing.expectEqual(interop_harness.Transport.udp, peer.descriptor.transport);
+    try std.testing.expectEqual(types.NegotiatedProtocol.h3, peer.descriptor.protocol);
+
+    var profile = try interop_harness.loadProtocolProfile(std.testing.allocator, loader, .h3_quic);
+    defer profile.deinit();
+    try std.testing.expectEqual(@as(usize, 360), profile.profile.eligible_flows);
+    try std.testing.expect(std.mem.containsAtLeast(u8, profile.profile.notes.?, 1, "disturbance"));
+}
+
+test "http3 interop exposes explicit runtime failure classification" {
+    const stream_failure = http3_client.classifyRuntimeError(error.InvalidStreamEnvelope);
+    try std.testing.expectEqual(types.FailureIsolationScope.stream, stream_failure.scope);
+    try std.testing.expectEqual(server_types.Http3FailureCategory.route, stream_failure.category);
+
+    const transport_failure = http3_client.classifyRuntimeError(error.ConnectionResetByPeer);
+    try std.testing.expectEqual(types.FailureIsolationScope.session, transport_failure.scope);
+    try std.testing.expectEqual(server_types.Http3FailureCategory.transport, transport_failure.category);
+}

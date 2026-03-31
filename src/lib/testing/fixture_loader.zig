@@ -617,6 +617,20 @@ test "fixture loader resolves M6 fixture paths" {
     );
 }
 
+test "fixture loader reads M6 peer and profile metadata fixtures" {
+    const loader = Loader.init();
+
+    const peer = try loader.loadM6Peer(std.testing.allocator, .server_app);
+    defer std.testing.allocator.free(peer);
+    try std.testing.expect(std.mem.containsAtLeast(u8, peer, 1, "\"network_mode\": \"loopback\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, peer, 1, "\"server_routing\""));
+
+    const profile = try loader.loadM6ProtocolProfile(std.testing.allocator, .h2_multiplexed);
+    defer std.testing.allocator.free(profile);
+    try std.testing.expect(std.mem.containsAtLeast(u8, profile, 1, "\"eligible_flows\": 340"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, profile, 1, "\"hardening_matrix\""));
+}
+
 test "fixture loader loads quic runtime fixtures from a custom base path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

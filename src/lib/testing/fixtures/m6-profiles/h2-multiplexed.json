@@ -1,0 +1,16 @@
+{
+  "id": "h2_multiplexed",
+  "protocol": "h2",
+  "network_mode": "multiprocess",
+  "eligible_flows": 340,
+  "excluded_flows": 10,
+  "failure_count": 3,
+  "required_capabilities": [
+    "server_websocket",
+    "client_retry",
+    "client_cache",
+    "client_websocket",
+    "hardening_matrix"
+  ],
+  "notes": "Shared-connection multiplexing profile covering backpressure, RST_STREAM, and GOAWAY isolation."
+}

@@ -1,0 +1,15 @@
+{
+  "id": "h3_quic",
+  "protocol": "h3",
+  "network_mode": "multiprocess",
+  "eligible_flows": 360,
+  "excluded_flows": 12,
+  "failure_count": 4,
+  "required_capabilities": [
+    "server_websocket",
+    "client_decompression",
+    "client_websocket",
+    "hardening_matrix"
+  ],
+  "notes": "UDP runtime profile covering multi-session isolation, disturbance classification, and explicit downgrade boundaries."
+}

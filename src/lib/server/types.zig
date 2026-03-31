@@ -179,6 +179,31 @@ pub const Http3FailureCategory = enum {
     route,
 };
 
+/// Re-exported isolation boundary for higher-level failure reporting.
+pub const FailureIsolationScope = core.FailureIsolationScope;
+
+/// Typed server failure category for negotiation and runtime surfaces.
+pub const ServerFailureCategory = union(enum) {
+    /// Secure-listener ALPN or negotiation failure.
+    negotiation: NegotiationFailureCategory,
+    /// HTTP/2 runtime or wire failure.
+    http2: Http2FailureCategory,
+    /// HTTP/3 runtime or transport failure.
+    http3: Http3FailureCategory,
+};
+
+/// Explicit server-side failure classification surfaced by hardening coverage.
+pub const ServerFailureClassification = struct {
+    /// Negotiated protocol associated with the failure.
+    protocol: core.NegotiatedProtocol,
+    /// Isolation boundary preserved by the failure.
+    scope: FailureIsolationScope,
+    /// Typed failure category for the server surface.
+    category: ServerFailureCategory,
+    /// Optional explanatory note for downgrade or rejection reporting.
+    notes: ?[]const u8,
+};
+
 /// Typed negotiated session metadata for one accepted server connection.
 pub const NegotiatedSession = struct {
     /// Peer address for the accepted socket.

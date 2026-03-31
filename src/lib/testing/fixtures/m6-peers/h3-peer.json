@@ -1,0 +1,27 @@
+{
+  "id": "h3_peer",
+  "name": "h3-quic-peer",
+  "host": "127.0.0.1",
+  "port": 4433,
+  "transport": "udp",
+  "protocol": "h3",
+  "network_mode": "multiprocess",
+  "capabilities": [
+    "server_websocket",
+    "client_decompression",
+    "client_websocket",
+    "hardening_matrix"
+  ],
+  "startup": {
+    "cwd": ".",
+    "argv": [
+      "zig",
+      "build",
+      "run",
+      "--",
+      "request",
+      "--http3",
+      "https://127.0.0.1:4433/health"
+    ]
+  }
+}

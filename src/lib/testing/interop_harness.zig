@@ -3,6 +3,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const server_types = @import("../server/types.zig");
+const fixture_loader = @import("fixture_loader.zig");
 
 /// Stable route identifier from the interop harness contract.
 pub const RouteId = enum {
@@ -106,6 +107,153 @@ pub const CapabilityMatrixEntry = struct {
             .support = self.support,
             .notes = self.notes,
         };
+    }
+};
+
+/// Network boundary exercised by one hardening profile or peer.
+pub const NetworkMode = enum {
+    /// Single-process or loopback-only coverage.
+    loopback,
+    /// Controlled host-local multi-process coverage.
+    multiprocess,
+};
+
+/// Startup command metadata for one local hardening peer.
+pub const StartupCommand = struct {
+    /// Working directory used to start the peer.
+    cwd: []const u8,
+    /// Argument vector used to start the peer.
+    argv: []const []const u8,
+};
+
+/// Typed M6 peer descriptor loaded from fixture metadata.
+pub const PeerDescriptor = struct {
+    /// Stable fixture identifier.
+    id: fixture_loader.M6PeerFixtureId,
+    /// Human-readable peer name.
+    name: []const u8,
+    /// Loopback host exposed by the peer.
+    host: []const u8,
+    /// Port exposed by the peer.
+    port: types.Port,
+    /// Socket transport used by the peer.
+    transport: Transport,
+    /// Primary negotiated protocol exercised by the peer.
+    protocol: types.NegotiatedProtocol,
+    /// Network boundary represented by the peer.
+    network_mode: NetworkMode,
+    /// Capability features expected from the peer.
+    capabilities: []const CapabilityFeatureId,
+    /// Startup command for the repository-owned peer.
+    startup: StartupCommand,
+
+    /// Returns the endpoint metadata represented by the peer.
+    pub fn endpoint(self: PeerDescriptor) Endpoint {
+        return .{
+            .host = self.host,
+            .port = self.port,
+            .transport = self.transport,
+            .protocol = self.protocol,
+        };
+    }
+};
+
+/// Owned peer descriptor retaining JSON-backed memory in an arena.
+pub const LoadedPeerDescriptor = struct {
+    /// Arena holding the JSON-backed strings and arrays.
+    arena: std.heap.ArenaAllocator,
+    /// Parsed peer descriptor.
+    descriptor: PeerDescriptor,
+
+    /// Releases the owned arena-backed descriptor memory.
+    pub fn deinit(self: *LoadedPeerDescriptor) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Typed M6 protocol profile loaded from fixture metadata.
+pub const ProtocolProfile = struct {
+    /// Stable profile fixture identifier.
+    id: fixture_loader.M6ProtocolProfileId,
+    /// Primary negotiated protocol covered by the profile.
+    protocol: types.NegotiatedProtocol,
+    /// Network boundary represented by the profile.
+    network_mode: NetworkMode,
+    /// Number of eligible flows admitted by the profile.
+    eligible_flows: usize,
+    /// Number of flows excluded before admission.
+    excluded_flows: usize,
+    /// Number of admitted flows that still failed.
+    failure_count: usize,
+    /// Capability features that must remain classified for the profile.
+    required_capabilities: []const CapabilityFeatureId,
+    /// Optional explanatory note for the profile.
+    notes: ?[]const u8,
+};
+
+/// Owned protocol profile retaining JSON-backed memory in an arena.
+pub const LoadedProtocolProfile = struct {
+    /// Arena holding the JSON-backed strings and arrays.
+    arena: std.heap.ArenaAllocator,
+    /// Parsed protocol profile.
+    profile: ProtocolProfile,
+
+    /// Releases the owned arena-backed profile memory.
+    pub fn deinit(self: *LoadedProtocolProfile) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Per-protocol workload metrics used by the SC-004 hardening report.
+pub const ProtocolFlowMetrics = struct {
+    /// Protocol covered by the workload slice.
+    protocol: types.NegotiatedProtocol,
+    /// Number of eligible flows admitted for the protocol.
+    eligible_flows: usize,
+    /// Number of flows excluded before admission.
+    excluded_flows: usize,
+    /// Number of admitted flows that still failed.
+    failure_count: usize,
+};
+
+/// Aggregated hardening metrics used to validate SC-004 locally.
+pub const HardeningWorkloadMetrics = struct {
+    /// Per-protocol workload contribution to the total run.
+    protocol_mix: [3]ProtocolFlowMetrics,
+    /// Total admitted eligible flows across the workload.
+    total_eligible_flows: usize,
+    /// Total excluded flows across the workload.
+    excluded_flows: usize,
+    /// Total admitted failures across the workload.
+    failure_count: usize,
+
+    /// Returns the number of admitted flows that completed successfully.
+    pub fn successCount(self: HardeningWorkloadMetrics) usize {
+        return self.total_eligible_flows - @min(self.total_eligible_flows, self.failure_count);
+    }
+
+    /// Returns the observed success ratio across admitted flows.
+    pub fn successRatio(self: HardeningWorkloadMetrics) f64 {
+        if (self.total_eligible_flows == 0) {
+            return 0;
+        }
+        return @as(f64, @floatFromInt(self.successCount())) /
+            @as(f64, @floatFromInt(self.total_eligible_flows));
+    }
+
+    /// Returns true when the workload satisfies SC-004.
+    pub fn passesSc004(self: HardeningWorkloadMetrics) bool {
+        if (self.total_eligible_flows < 1000 or self.successRatio() < 0.99) {
+            return false;
+        }
+        for (self.protocol_mix) |entry| {
+            if (entry.eligible_flows == 0) {
+                return false;
+            }
+        }
+        return true;
     }
 };
 
@@ -486,6 +634,41 @@ const health_echo_routes = [_]RouteId{ .health, .echo_get };
 const large_body_routes = [_]RouteId{ .stream_large, .health };
 const rst_stream_routes = [_]RouteId{ .stream_chunked, .health };
 const goaway_routes = [_]RouteId{ .health, .echo_get };
+/// Default peer-fixture identifiers used by the hardening matrix.
+const default_peer_fixture_ids = [_]fixture_loader.M6PeerFixtureId{ .server_app, .h2_peer, .h3_peer };
+/// Default protocol-profile identifiers used by the hardening matrix.
+const default_protocol_profile_ids = [_]fixture_loader.M6ProtocolProfileId{ .http1_baseline, .h2_multiplexed, .h3_quic };
+
+/// JSON shape for one peer startup command fixture.
+const JsonStartupCommand = struct {
+    cwd: []const u8,
+    argv: []const []const u8,
+};
+
+/// JSON shape for one peer descriptor fixture.
+const JsonPeerDescriptor = struct {
+    id: []const u8,
+    name: []const u8,
+    host: []const u8,
+    port: u16,
+    transport: []const u8,
+    protocol: []const u8,
+    network_mode: []const u8,
+    capabilities: []const []const u8,
+    startup: JsonStartupCommand,
+};
+
+/// JSON shape for one protocol-profile fixture.
+const JsonProtocolProfile = struct {
+    id: []const u8,
+    protocol: []const u8,
+    network_mode: []const u8,
+    eligible_flows: usize,
+    excluded_flows: usize,
+    failure_count: usize,
+    required_capabilities: []const []const u8,
+    notes: ?[]const u8,
+};
 const default_capability_matrix = [_]CapabilityMatrixEntry{
     .{ .feature = .server_routing, .surface = .server, .protocol = .http_1_1, .support = .supported, .notes = null },
     .{ .feature = .server_routing, .surface = .server, .protocol = .h2, .support = .supported, .notes = null },
@@ -871,6 +1054,113 @@ const default_http3_datagram_scenarios = [_]Http3DatagramScenario{
     },
 };
 
+/// Returns the default peer fixtures used by the hardening matrix.
+pub fn defaultPeerFixtures() []const fixture_loader.M6PeerFixtureId {
+    return &default_peer_fixture_ids;
+}
+
+/// Returns the default protocol profiles used by the hardening matrix.
+pub fn defaultProtocolProfiles() []const fixture_loader.M6ProtocolProfileId {
+    return &default_protocol_profile_ids;
+}
+
+/// Loads one typed peer descriptor from fixture metadata.
+pub fn loadPeerDescriptor(
+    allocator: std.mem.Allocator,
+    loader: fixture_loader.Loader,
+    id: fixture_loader.M6PeerFixtureId,
+) !LoadedPeerDescriptor {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const bytes = try loader.loadM6Peer(arena_allocator, id);
+    const json = try std.json.parseFromSliceLeaky(JsonPeerDescriptor, arena_allocator, bytes, .{
+        .ignore_unknown_fields = false,
+    });
+
+    return .{
+        .arena = arena,
+        .descriptor = .{
+            .id = try parsePeerFixtureId(json.id),
+            .name = json.name,
+            .host = json.host,
+            .port = types.Port.init(json.port),
+            .transport = try parseTransport(json.transport),
+            .protocol = try parseNegotiatedProtocol(json.protocol),
+            .network_mode = try parseNetworkMode(json.network_mode),
+            .capabilities = try parseCapabilityFeatureList(arena_allocator, json.capabilities),
+            .startup = .{
+                .cwd = json.startup.cwd,
+                .argv = json.startup.argv,
+            },
+        },
+    };
+}
+
+/// Loads one typed protocol profile from fixture metadata.
+pub fn loadProtocolProfile(
+    allocator: std.mem.Allocator,
+    loader: fixture_loader.Loader,
+    id: fixture_loader.M6ProtocolProfileId,
+) !LoadedProtocolProfile {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const bytes = try loader.loadM6ProtocolProfile(arena_allocator, id);
+    const json = try std.json.parseFromSliceLeaky(JsonProtocolProfile, arena_allocator, bytes, .{
+        .ignore_unknown_fields = false,
+    });
+
+    return .{
+        .arena = arena,
+        .profile = .{
+            .id = try parseProtocolProfileId(json.id),
+            .protocol = try parseNegotiatedProtocol(json.protocol),
+            .network_mode = try parseNetworkMode(json.network_mode),
+            .eligible_flows = json.eligible_flows,
+            .excluded_flows = json.excluded_flows,
+            .failure_count = json.failure_count,
+            .required_capabilities = try parseCapabilityFeatureList(arena_allocator, json.required_capabilities),
+            .notes = json.notes,
+        },
+    };
+}
+
+/// Aggregates the default protocol profiles into SC-004 workload metrics.
+pub fn captureSc004Metrics(
+    allocator: std.mem.Allocator,
+    loader: fixture_loader.Loader,
+) !HardeningWorkloadMetrics {
+    var protocol_mix: [3]ProtocolFlowMetrics = undefined;
+    var total_eligible_flows: usize = 0;
+    var excluded_flows: usize = 0;
+    var failure_count: usize = 0;
+
+    for (default_protocol_profile_ids, 0..) |profile_id, index| {
+        var loaded = try loadProtocolProfile(allocator, loader, profile_id);
+        defer loaded.deinit();
+
+        protocol_mix[index] = .{
+            .protocol = loaded.profile.protocol,
+            .eligible_flows = loaded.profile.eligible_flows,
+            .excluded_flows = loaded.profile.excluded_flows,
+            .failure_count = loaded.profile.failure_count,
+        };
+        total_eligible_flows += loaded.profile.eligible_flows;
+        excluded_flows += loaded.profile.excluded_flows;
+        failure_count += loaded.profile.failure_count;
+    }
+
+    return .{
+        .protocol_mix = protocol_mix,
+        .total_eligible_flows = total_eligible_flows,
+        .excluded_flows = excluded_flows,
+        .failure_count = failure_count,
+    };
+}
+
 /// Returns the default interop route catalog.
 pub fn defaultScenarios() []const Scenario {
     return &default_scenarios;
@@ -1007,6 +1297,57 @@ pub fn http3DatagramScenarioForRoute(route: RouteId) ?Http3DatagramScenario {
         }
     }
     return null;
+}
+
+/// Parses one negotiated protocol from fixture metadata.
+fn parseNegotiatedProtocol(value: []const u8) !types.NegotiatedProtocol {
+    if (std.mem.eql(u8, value, "http/1.1")) {
+        return .http_1_1;
+    }
+    if (std.mem.eql(u8, value, "h2")) {
+        return .h2;
+    }
+    if (std.mem.eql(u8, value, "h3")) {
+        return .h3;
+    }
+    return error.InvalidFixtureProtocol;
+}
+
+/// Parses one transport from fixture metadata.
+fn parseTransport(value: []const u8) !Transport {
+    return std.meta.stringToEnum(Transport, value) orelse error.InvalidFixtureTransport;
+}
+
+/// Parses one network mode from fixture metadata.
+fn parseNetworkMode(value: []const u8) !NetworkMode {
+    return std.meta.stringToEnum(NetworkMode, value) orelse error.InvalidFixtureNetworkMode;
+}
+
+/// Parses one capability feature identifier from fixture metadata.
+fn parseCapabilityFeature(value: []const u8) !CapabilityFeatureId {
+    return std.meta.stringToEnum(CapabilityFeatureId, value) orelse error.InvalidFixtureCapability;
+}
+
+/// Parses one peer fixture identifier from fixture metadata.
+fn parsePeerFixtureId(value: []const u8) !fixture_loader.M6PeerFixtureId {
+    return std.meta.stringToEnum(fixture_loader.M6PeerFixtureId, value) orelse error.InvalidFixturePeerId;
+}
+
+/// Parses one protocol-profile identifier from fixture metadata.
+fn parseProtocolProfileId(value: []const u8) !fixture_loader.M6ProtocolProfileId {
+    return std.meta.stringToEnum(fixture_loader.M6ProtocolProfileId, value) orelse error.InvalidFixtureProfileId;
+}
+
+/// Parses a capability list from fixture metadata.
+fn parseCapabilityFeatureList(
+    allocator: std.mem.Allocator,
+    values: []const []const u8,
+) ![]const CapabilityFeatureId {
+    const parsed = try allocator.alloc(CapabilityFeatureId, values.len);
+    for (values, 0..) |value, index| {
+        parsed[index] = try parseCapabilityFeature(value);
+    }
+    return parsed;
 }
 
 /// Route match result for a concrete request path.
@@ -1390,4 +1731,58 @@ test "capability matrix classifies M6 features across all targeted protocols" {
     const protocol_capability = hardening_h1.asProtocolCapability();
     try std.testing.expectEqual(types.FeatureSurface.hardening, protocol_capability.surface);
     try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, protocol_capability.protocol);
+}
+
+test "hardening peer fixtures load typed loopback and multiprocess descriptors" {
+    const loader = fixture_loader.Loader.init();
+
+    var server_app = try loadPeerDescriptor(std.testing.allocator, loader, .server_app);
+    defer server_app.deinit();
+    try std.testing.expectEqual(fixture_loader.M6PeerFixtureId.server_app, server_app.descriptor.id);
+    try std.testing.expectEqual(NetworkMode.loopback, server_app.descriptor.network_mode);
+    try std.testing.expectEqual(Transport.tcp, server_app.descriptor.transport);
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, server_app.descriptor.protocol);
+    try std.testing.expectEqualStrings("server", server_app.descriptor.startup.argv[4]);
+
+    var h3_peer = try loadPeerDescriptor(std.testing.allocator, loader, .h3_peer);
+    defer h3_peer.deinit();
+    try std.testing.expectEqual(NetworkMode.multiprocess, h3_peer.descriptor.network_mode);
+    try std.testing.expectEqual(Transport.udp, h3_peer.descriptor.transport);
+    try std.testing.expectEqual(types.NegotiatedProtocol.h3, h3_peer.descriptor.protocol);
+    try std.testing.expectEqualStrings("--http3", h3_peer.descriptor.startup.argv[5]);
+}
+
+test "hardening protocol profiles load explicit capability requirements" {
+    const loader = fixture_loader.Loader.init();
+
+    var http1 = try loadProtocolProfile(std.testing.allocator, loader, .http1_baseline);
+    defer http1.deinit();
+    try std.testing.expectEqual(NetworkMode.loopback, http1.profile.network_mode);
+    try std.testing.expectEqual(@as(usize, 320), http1.profile.eligible_flows);
+    try std.testing.expectEqual(@as(usize, 4), http1.profile.required_capabilities.len);
+
+    var h2 = try loadProtocolProfile(std.testing.allocator, loader, .h2_multiplexed);
+    defer h2.deinit();
+    try std.testing.expectEqual(types.NegotiatedProtocol.h2, h2.profile.protocol);
+    try std.testing.expectEqual(@as(usize, 340), h2.profile.eligible_flows);
+
+    var h3 = try loadProtocolProfile(std.testing.allocator, loader, .h3_quic);
+    defer h3.deinit();
+    try std.testing.expectEqual(types.NegotiatedProtocol.h3, h3.profile.protocol);
+    try std.testing.expectEqual(@as(usize, 360), h3.profile.eligible_flows);
+    try std.testing.expect(std.mem.containsAtLeast(u8, h3.profile.notes.?, 1, "disturbance"));
+}
+
+test "hardening metrics satisfy the SC-004 local threshold" {
+    const loader = fixture_loader.Loader.init();
+    const metrics = try captureSc004Metrics(std.testing.allocator, loader);
+
+    try std.testing.expectEqual(@as(usize, 1020), metrics.total_eligible_flows);
+    try std.testing.expectEqual(@as(usize, 30), metrics.excluded_flows);
+    try std.testing.expectEqual(@as(usize, 9), metrics.failure_count);
+    try std.testing.expect(metrics.successRatio() > 0.99);
+    try std.testing.expect(metrics.passesSc004());
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, metrics.protocol_mix[0].protocol);
+    try std.testing.expectEqual(types.NegotiatedProtocol.h2, metrics.protocol_mix[1].protocol);
+    try std.testing.expectEqual(types.NegotiatedProtocol.h3, metrics.protocol_mix[2].protocol);
 }

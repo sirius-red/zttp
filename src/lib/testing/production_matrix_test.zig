@@ -157,3 +157,52 @@ test "production matrix cache coverage preserves freshness revalidation and inva
         try std.testing.expectEqual(protocol, capability.protocol);
     }
 }
+
+test "production matrix hardening preserves concurrent isolation and negative-path scope" {
+    const slow_consumer = interop_harness.multiplexingScenarioForId(.slow_consumer_large_body).?;
+    try std.testing.expectEqual(@as(usize, 2), slow_consumer.diagnostics.expected_backpressure_scopes.len);
+    try std.testing.expectEqual(interop_harness.BackpressureScope.stream, slow_consumer.diagnostics.expected_backpressure_scopes[0]);
+    try std.testing.expectEqual(interop_harness.BackpressureScope.connection, slow_consumer.diagnostics.expected_backpressure_scopes[1]);
+    try std.testing.expect(slow_consumer.diagnostics.unrelated_streams_continue);
+
+    const rst_stream = interop_harness.multiplexingScenarioForId(.rst_stream_isolated).?;
+    try std.testing.expectEqual(interop_harness.FailureScope.stream, rst_stream.diagnostics.expected_failure_scope.?);
+    try std.testing.expect(rst_stream.diagnostics.unrelated_streams_continue);
+
+    const goaway = interop_harness.multiplexingScenarioForId(.goaway_drains_connection).?;
+    try std.testing.expectEqual(interop_harness.FailureScope.connection, goaway.diagnostics.expected_failure_scope.?);
+    try std.testing.expect(goaway.diagnostics.new_requests_rejected_after_drain);
+}
+
+test "production matrix client failure surfaces keep protocol and scope explicit" {
+    const h2_failure = client.classifyH2Snapshot(.{
+        .request_count = 2,
+        .max_overlapping_streams = 2,
+        .next_stream_id = 5,
+        .total_buffered_bytes = 0,
+        .saw_stream_backpressure = false,
+        .saw_connection_backpressure = false,
+        .reusable = false,
+        .state = .draining,
+        .last_failure_scope = .connection,
+        .last_failure_note = "goaway drained the shared connection",
+    }).?;
+    try std.testing.expectEqual(client.FailureIsolationScope.connection, h2_failure.scope);
+    try std.testing.expectEqual(client.ClientFailureCategory.connection, h2_failure.category);
+    try std.testing.expectEqual(types.NegotiatedProtocol.h2, h2_failure.protocol.?);
+
+    const h3_failure = client.classifyHttp3RuntimeError(error.InvalidStreamEnvelope);
+    try std.testing.expectEqual(client.FailureIsolationScope.stream, h3_failure.scope);
+    try std.testing.expectEqual(client.ClientFailureCategory.stream, h3_failure.category);
+    try std.testing.expectEqual(types.NegotiatedProtocol.h3, h3_failure.protocol.?);
+}
+
+test "production matrix SC-004 metrics capture exceeds one thousand eligible flows" {
+    const loader = fixture_loader.Loader.init();
+    const metrics = try interop_harness.captureSc004Metrics(std.testing.allocator, loader);
+
+    try std.testing.expectEqual(@as(usize, 1020), metrics.total_eligible_flows);
+    try std.testing.expectEqual(@as(usize, 9), metrics.failure_count);
+    try std.testing.expect(metrics.successRatio() > 0.99);
+    try std.testing.expect(metrics.passesSc004());
+}

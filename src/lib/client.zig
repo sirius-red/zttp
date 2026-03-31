@@ -78,6 +78,8 @@ pub const TlsConfig = types.TlsConfig;
 pub const FeatureSupportLevel = types.FeatureSupportLevel;
 /// Generic capability-matrix entry for higher-level features.
 pub const ProtocolFeatureCapability = types.ProtocolFeatureCapability;
+/// Re-exported isolation boundary for client-visible failures.
+pub const FailureIsolationScope = types.FailureIsolationScope;
 /// Shared content-encoding identifier.
 pub const ContentEncoding = compression_encoding.ContentEncoding;
 /// Shared response-decoder primitive.
@@ -110,8 +112,100 @@ pub const WebSocket = websocket;
 pub const WebSocketSessionMetadata = websocket.SessionMetadata;
 /// Shared WebSocket session placeholder.
 pub const WebSocketSession = websocket.Session;
+/// Shared WebSocket failure category.
+pub const WebSocketFailureCategory = websocket.FailureCategory;
+/// Shared WebSocket outcome classification.
+pub const WebSocketOutcome = websocket.Outcome;
 /// Shared origin key used for pool lookups.
 const OriginKey = types.OriginKey;
+
+/// Explicit client failure category used by the hardening matrix.
+pub const ClientFailureCategory = enum {
+    /// Secure negotiation failed before HTTP routing.
+    negotiation,
+    /// One multiplexed stream failed while the connection remained usable.
+    stream,
+    /// One shared connection entered a draining or terminal state.
+    connection,
+    /// One transport session failed at the HTTP/3 runtime layer.
+    session,
+    /// One WebSocket attempt failed before or during session establishment.
+    websocket,
+};
+
+/// Explicit client-visible failure classification for hardening diagnostics.
+pub const ClientFailureClassification = struct {
+    /// Isolation boundary preserved by the failure.
+    scope: FailureIsolationScope,
+    /// Typed client failure category.
+    category: ClientFailureCategory,
+    /// Negotiated protocol associated with the failure, when known.
+    protocol: ?types.NegotiatedProtocol,
+    /// Optional explanatory note for the classification.
+    notes: ?[]const u8,
+};
+
+/// Classifies one client-visible error into a typed hardening outcome.
+pub fn classifyError(err: Error, protocol: ?types.NegotiatedProtocol) ClientFailureClassification {
+    return switch (err) {
+        error.NegotiationFailed => .{
+            .scope = .connection,
+            .category = .negotiation,
+            .protocol = protocol,
+            .notes = "rejected before HTTP request routing",
+        },
+        error.LimitExceeded => .{
+            .scope = .connection,
+            .category = .connection,
+            .protocol = protocol,
+            .notes = "shared admission or buffering limit reached",
+        },
+        error.Protocol => .{
+            .scope = .stream,
+            .category = .stream,
+            .protocol = protocol,
+            .notes = "protocol-scoped failure remained isolated",
+        },
+        else => .{
+            .scope = .request,
+            .category = .session,
+            .protocol = protocol,
+            .notes = "request-scoped classification fallback",
+        },
+    };
+}
+
+/// Classifies one shared HTTP/2 runtime snapshot into an explicit failure outcome.
+pub fn classifyH2Snapshot(snapshot: connection_h2.Snapshot) ?ClientFailureClassification {
+    const scope = snapshot.last_failure_scope orelse return null;
+    return .{
+        .scope = scope,
+        .category = switch (scope) {
+            .stream => .stream,
+            .connection => .connection,
+            .request => .connection,
+            .session => .session,
+        },
+        .protocol = .h2,
+        .notes = snapshot.last_failure_note,
+    };
+}
+
+/// Classifies one HTTP/3 runtime error into an explicit failure outcome.
+pub fn classifyHttp3RuntimeError(err: anyerror) ClientFailureClassification {
+    const classification = http3_client.classifyRuntimeError(err);
+    return .{
+        .scope = classification.scope,
+        .category = switch (classification.scope) {
+            .request => .session,
+            .stream => .stream,
+            .connection => .connection,
+            .session => .session,
+        },
+        .protocol = .h3,
+        .notes = classification.notes,
+    };
+}
 
 /// ALPN list pinned to the HTTP/1.1 transport path.
 const http_1_1_only_protocols = [_]types.NegotiatedProtocol{.http_1_1};
@@ -3541,6 +3635,18 @@ test "client surfaces unsupported secure negotiation as a distinct error" {
     defer handle.deinit();
 
     try std.testing.expectError(error.NegotiationFailed, handle.wait());
+}
+
+test "client failure classification keeps connection and session scopes explicit" {
+    const negotiation = classifyError(error.NegotiationFailed, .h2);
+    try std.testing.expectEqual(FailureIsolationScope.connection, negotiation.scope);
+    try std.testing.expectEqual(ClientFailureCategory.negotiation, negotiation.category);
+    try std.testing.expectEqual(types.NegotiatedProtocol.h2, negotiation.protocol.?);
+
+    const runtime = classifyHttp3RuntimeError(error.ConnectionResetByPeer);
+    try std.testing.expectEqual(FailureIsolationScope.session, runtime.scope);
+    try std.testing.expectEqual(ClientFailureCategory.session, runtime.category);
+    try std.testing.expectEqual(types.NegotiatedProtocol.h3, runtime.protocol.?);
 }
 
 test "client reuses keep-alive connection" {

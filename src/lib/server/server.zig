@@ -59,6 +59,12 @@ pub const ServerFeature = Types.ServerFeature;
 pub const ServerFeaturePolicy = Types.ServerFeaturePolicy;
 /// Public server capability classification entry.
 pub const ServerCapability = Types.ServerCapability;
+/// Public failure-isolation boundary for server diagnostics.
+pub const FailureIsolationScope = Types.FailureIsolationScope;
+/// Public typed server failure category.
+pub const ServerFailureCategory = Types.ServerFailureCategory;
+/// Public typed server failure classification.
+pub const ServerFailureClassification = Types.ServerFailureClassification;
 /// Public generic feature-support classification.
 pub const FeatureSupportLevel = types.FeatureSupportLevel;
 /// Public shared WebSocket module entrypoint.

@@ -1,0 +1,30 @@
+{
+  "id": "server_app",
+  "name": "server-app",
+  "host": "127.0.0.1",
+  "port": 18080,
+  "transport": "tcp",
+  "protocol": "http/1.1",
+  "network_mode": "loopback",
+  "capabilities": [
+    "server_routing",
+    "server_middleware",
+    "server_static_files",
+    "server_compression",
+    "server_websocket"
+  ],
+  "startup": {
+    "cwd": ".",
+    "argv": [
+      "zig",
+      "build",
+      "run",
+      "--",
+      "server",
+      "--listen",
+      "127.0.0.1",
+      "--port",
+      "18080"
+    ]
+  }
+}

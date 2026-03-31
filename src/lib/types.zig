@@ -335,6 +335,18 @@ pub const ProtocolFeatureCapability = struct {
     notes: ?[]const u8,
 };
 
+/// Isolation boundary for one request, stream, connection, or session failure.
+pub const FailureIsolationScope = enum {
+    /// Failure is contained to one request.
+    request,
+    /// Failure is contained to one multiplexed stream.
+    stream,
+    /// Failure applies to one shared connection.
+    connection,
+    /// Failure applies to one transport session.
+    session,
+};
+
 /// Request target format used for connection pooling decisions.
 pub const ConnectionTargetMode = enum {
     /// Origin-form request target.
