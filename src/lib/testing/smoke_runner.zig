@@ -185,6 +185,74 @@ pub const HardeningSummary = struct {
     passes_reliability_threshold: bool,
 };
 
+/// Platform-scoped readiness evidence emitted by the smoke runner.
+pub const PlatformEvidenceReport = struct {
+    /// Platform evidence bundle attached to the blocking readiness gate.
+    evidence: interop_harness.PlatformReadinessEvidence,
+    /// CLI round-trip result classification captured for the current host, if any.
+    round_trip_status: ?RoundTripStatus,
+};
+
+/// Release-decision summary emitted by the readiness smoke runner.
+pub const ReleaseDecisionReport = struct {
+    /// Platform evidence bundles for the blocking Windows and Linux paths.
+    platforms: [interop_harness.blocking_readiness_platforms.len]PlatformEvidenceReport,
+    /// Protocol-scoped capability evidence across HTTP/1.1, HTTP/2, and HTTP/3.
+    protocols: [3]interop_harness.ProtocolCapabilityEvidence,
+    /// Dynamic hardening summary that contributes to the capability floor gate.
+    hardening: HardeningSummary,
+
+    /// Returns the blocking-gate status for platform readiness.
+    pub fn platformGateStatus(self: ReleaseDecisionReport) interop_harness.ReleaseGateStatus {
+        for (self.platforms) |entry| {
+            if (entry.evidence.blocksRelease()) {
+                return .blocked;
+            }
+        }
+        return .passed;
+    }
+
+    /// Returns the blocking-gate status for the protocol capability floor.
+    pub fn protocolGateStatus(self: ReleaseDecisionReport) interop_harness.ReleaseGateStatus {
+        if (!self.hardening.passes_reliability_threshold) {
+            return .blocked;
+        }
+        for (self.protocols) |entry| {
+            if (entry.overallStatus() != .verified) {
+                return .blocked;
+            }
+        }
+        return .passed;
+    }
+
+    /// Returns the current status for the public-story gate.
+    pub fn publicStoryGateStatus(_: ReleaseDecisionReport) interop_harness.ReleaseGateStatus {
+        return .blocked;
+    }
+
+    /// Returns the current status for the release-artifact gate.
+    pub fn releaseArtifactGateStatus(_: ReleaseDecisionReport) interop_harness.ReleaseGateStatus {
+        return .blocked;
+    }
+
+    /// Returns the overall release-decision status emitted by the smoke runner.
+    pub fn decisionStatus(self: ReleaseDecisionReport) interop_harness.ReleaseGateStatus {
+        if (self.platformGateStatus() == .blocked or
+            self.protocolGateStatus() == .blocked or
+            self.publicStoryGateStatus() == .blocked or
+            self.releaseArtifactGateStatus() == .blocked)
+        {
+            return .blocked;
+        }
+        return .passed;
+    }
+
+    /// Returns true when any blocking platform evidence remains partial or missing.
+    pub fn hasIncompletePlatformEvidence(self: ReleaseDecisionReport) bool {
+        return self.platformGateStatus() == .blocked;
+    }
+};
+
 /// Reusable CLI readiness runner for the shared server/request loopback scenario.
 pub const CliRoundTripRunner = struct {
     /// Allocator used for child-process capture buffers.
@@ -499,35 +567,139 @@ pub fn writeHardeningSummary(
     }
 }
 
+/// Captures the platform-scoped evidence bundle for the current host run.
+pub fn capturePlatformEvidence(
+    allocator: std.mem.Allocator,
+    runner: CliRoundTripRunner,
+    platform: interop_harness.ReadinessPlatform,
+    current_host: ?interop_harness.ReadinessPlatform,
+) !PlatformEvidenceReport {
+    const scenario = interop_harness.readinessScenarioForPlatform(platform).?;
+    if (current_host != null and current_host.? == platform) {
+        var round_trip = try runner.runReadinessScenario(scenario);
+        defer round_trip.deinit(allocator);
+
+        const cli_status = evidenceStatusForRoundTrip(round_trip.status);
+        return .{
+            .evidence = .{
+                .scenario = scenario,
+                .status = cli_status,
+                .cli_roundtrip_status = cli_status,
+                .summary = switch (round_trip.status) {
+                    .success => "current-host CLI round-trip verified",
+                    .known_socket_failure => "current-host CLI round-trip captured a known blocking failure",
+                    .unexpected_failure => "current-host CLI round-trip captured an unexpected blocking failure",
+                },
+                .failure_signature = if (round_trip.socket_failure) |failure| failure.signature else scenario.known_failure_signature,
+            },
+            .round_trip_status = round_trip.status,
+        };
+    }
+
+    return .{
+        .evidence = .{
+            .scenario = scenario,
+            .status = .missing,
+            .cli_roundtrip_status = .missing,
+            .summary = "platform evidence not captured on this host run",
+            .failure_signature = null,
+        },
+        .round_trip_status = null,
+    };
+}
+
+/// Captures the bounded release-decision summary for the current host run.
+pub fn captureReleaseDecisionReport(
+    allocator: std.mem.Allocator,
+) !ReleaseDecisionReport {
+    const current_host = currentReadinessPlatform();
+    const runner = CliRoundTripRunner.init(allocator, .{});
+    var platform_reports: [interop_harness.blocking_readiness_platforms.len]PlatformEvidenceReport = undefined;
+    for (interop_harness.blocking_readiness_platforms, 0..) |platform, index| {
+        platform_reports[index] = try capturePlatformEvidence(allocator, runner, platform, current_host);
+    }
+
+    const metrics = try interop_harness.captureHardeningMetrics(
+        allocator,
+        fixture_loader.Loader.init(),
+    );
+
+    return .{
+        .platforms = platform_reports,
+        .protocols = .{
+            interop_harness.protocolCapabilityEvidenceFor(.http_1_1),
+            interop_harness.protocolCapabilityEvidenceFor(.h2),
+            interop_harness.protocolCapabilityEvidenceFor(.h3),
+        },
+        .hardening = summarizeHardening(metrics),
+    };
+}
+
+/// Writes the bounded release-decision summary to the provided writer.
+pub fn writeReleaseDecisionSummary(
+    writer: anytype,
+    report: ReleaseDecisionReport,
+) !void {
+    for (report.platforms) |entry| {
+        try writer.print(
+            "platform[{s}]: gate={s} evidence={s} cli={s} cache={s} global_cache={s} summary={s}\n",
+            .{
+                @tagName(entry.evidence.scenario.platforms[0]),
+                @tagName(if (entry.evidence.blocksRelease()) interop_harness.ReleaseGateStatus.blocked else interop_harness.ReleaseGateStatus.passed),
+                @tagName(entry.evidence.status),
+                @tagName(entry.evidence.cli_roundtrip_status),
+                entry.evidence.scenario.workspace_cache_root,
+                entry.evidence.scenario.global_cache_root,
+                entry.evidence.summary,
+            },
+        );
+        if (entry.evidence.failure_signature) |signature| {
+            try writer.print("platform_failure[{s}]: {s}\n", .{ @tagName(entry.evidence.scenario.platforms[0]), signature });
+        }
+    }
+    for (report.protocols) |entry| {
+        try writer.print(
+            "protocol[{s}]: gate={s} capability={s} runtime={s} features={d}/{d}\n",
+            .{
+                @tagName(entry.protocol),
+                @tagName(if (entry.overallStatus() == .verified) interop_harness.ReleaseGateStatus.passed else interop_harness.ReleaseGateStatus.blocked),
+                @tagName(entry.capability_status),
+                @tagName(entry.runtime_status),
+                entry.satisfied_feature_count,
+                entry.required_features.len,
+            },
+        );
+    }
+    try writer.print("gate[platform_readiness]: {s}\n", .{@tagName(report.platformGateStatus())});
+    try writer.print("gate[protocol_capability_floor]: {s}\n", .{@tagName(report.protocolGateStatus())});
+    try writer.print("gate[public_story_alignment]: {s}\n", .{@tagName(report.publicStoryGateStatus())});
+    try writer.print("gate[release_artifact_completeness]: {s}\n", .{@tagName(report.releaseArtifactGateStatus())});
+    try writer.print("hardening_summary:\n", .{});
+    try writeHardeningSummary(writer, report.hardening);
+    try writer.print("release_decision: {s}\n", .{@tagName(report.decisionStatus())});
+}
+
 /// Entrypoint for the readiness runner executable.
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const scenario = interop_harness.readinessScenarioForId(.windows_loopback_cli_roundtrip).?;
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    const platform = currentReadinessPlatform() orelse {
-        try stdout.print("scenario: {s}\nstatus: skipped\nreason: unsupported host platform\n", .{scenario.name});
-        try stdout.flush();
-        return;
-    };
-    if (!scenario.supportsPlatform(platform)) {
-        try stdout.print("scenario: {s}\nstatus: skipped\nreason: scenario not targeted for this host\n", .{scenario.name});
-        try stdout.flush();
-        return;
-    }
-
-    var result = try CliRoundTripRunner.init(allocator, .{}).runReadinessScenario(scenario);
-    defer result.deinit(allocator);
-    try writeRoundTripSummary(stdout, result);
+    const report = try captureReleaseDecisionReport(allocator);
+    try writeReleaseDecisionSummary(stdout, report);
     try stdout.flush();
 
-    if (result.status == .unexpected_failure) {
-        return error.UnexpectedSmokeFailure;
+    for (report.platforms) |entry| {
+        if (entry.round_trip_status == .unexpected_failure) {
+            return error.UnexpectedSmokeFailure;
+        }
+    }
+    if (!report.hardening.passes_reliability_threshold) {
+        return error.HardeningCriteriaNotMet;
     }
 }
 
@@ -544,6 +716,14 @@ fn classifyRoundTripResult(
         return .known_socket_failure;
     }
     return .unexpected_failure;
+}
+
+/// Returns the evidence status implied by one round-trip result.
+fn evidenceStatusForRoundTrip(status: RoundTripStatus) interop_harness.ReleaseEvidenceStatus {
+    return switch (status) {
+        .success => .verified,
+        .known_socket_failure, .unexpected_failure => .partial,
+    };
 }
 
 /// Waits for a child command to finish or kills it after the timeout expires.
@@ -611,6 +791,24 @@ test "round trip classification preserves known socket failures" {
     try std.testing.expectEqual(.known_socket_failure, classifyRoundTripResult(scenario, request, failure));
 }
 
+test "release decision report keeps the missing platform gate explicit" {
+    const report = try captureReleaseDecisionReport(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), report.platforms.len);
+    try std.testing.expectEqual(.blocked, report.platformGateStatus());
+    try std.testing.expect(report.hasIncompletePlatformEvidence());
+}
+
+test "release decision summary prints blocking gate lines" {
+    const report = try captureReleaseDecisionReport(std.testing.allocator);
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(std.testing.allocator);
+
+    try writeReleaseDecisionSummary(bytes.writer(std.testing.allocator), report);
+    try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "gate[platform_readiness]:"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "release_decision:"));
+}
+
 test "hardening summary reports reliability-threshold workload metrics" {
     const summary = summarizeHardening(.{
         .protocol_mix = .{
@@ -632,4 +830,10 @@ test "hardening summary reports reliability-threshold workload metrics" {
     try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "eligible_flows: 1020"));
     try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "reliability_threshold: pass"));
     try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "protocol[h3]: eligible=360"));
+}
+
+test "round trip evidence status preserves verified and partial classifications" {
+    try std.testing.expectEqual(.verified, evidenceStatusForRoundTrip(.success));
+    try std.testing.expectEqual(.partial, evidenceStatusForRoundTrip(.known_socket_failure));
+    try std.testing.expectEqual(.partial, evidenceStatusForRoundTrip(.unexpected_failure));
 }

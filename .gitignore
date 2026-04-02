@@ -3,6 +3,7 @@
 .zig-global-cache
 .zig-local-cache
 zig-out
+.tmp/
 
 ### Common ###
 .DS_Store

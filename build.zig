@@ -77,6 +77,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    b.installArtifact(readiness_smoke);
 
     const cli = b.addExecutable(.{
         .name = "zttp",
@@ -104,14 +105,22 @@ pub fn build(b: *std.Build) void {
     const cli_tests = b.addTest(.{ .root_module = cli.root_module });
     const run_cli_tests = b.addRunArtifact(cli_tests);
     const run_readiness_smoke = b.addRunArtifact(readiness_smoke);
+    const run_release_readiness = b.addRunArtifact(readiness_smoke);
+    run_release_readiness.addArg("--require-all-platforms");
+    const readiness_smoke_step = b.step("readiness-smoke", "Run the shared per-host readiness summary used by zig build test");
+    const readiness_release_step = b.step("readiness-release", "Optionally require both Windows and Linux evidence in one readiness summary");
 
-    const test_step = b.step("test", "Run all tests");
+    const test_step = b.step("test", "Run all tests, including the per-host readiness round-trip and hardening summary");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     run_readiness_smoke.step.dependOn(b.getInstallStep());
+    run_release_readiness.step.dependOn(b.getInstallStep());
+    readiness_smoke_step.dependOn(&run_readiness_smoke.step);
+    readiness_release_step.dependOn(&run_release_readiness.step);
     test_step.dependOn(&run_readiness_smoke.step);
 
     const test_http3_step = b.step("test-http3", "Run the full test suite including the default HTTP/3 coverage");
     test_http3_step.dependOn(&run_lib_tests.step);
     test_http3_step.dependOn(&run_cli_tests.step);
+    test_http3_step.dependOn(&run_readiness_smoke.step);
 }

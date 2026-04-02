@@ -99,6 +99,12 @@ pub const Readiness = struct {
     pub const ScenarioId = InteropHarness.ReadinessScenarioId;
     /// Release-readiness scenario definition.
     pub const Scenario = InteropHarness.ReadinessScenario;
+    /// Evidence status used by the bounded release gates.
+    pub const EvidenceStatus = InteropHarness.ReleaseEvidenceStatus;
+    /// Platform-scoped readiness evidence bundle.
+    pub const PlatformEvidence = InteropHarness.PlatformReadinessEvidence;
+    /// Protocol-scoped capability-floor evidence bundle.
+    pub const ProtocolEvidence = InteropHarness.ProtocolCapabilityEvidence;
 
     /// Returns the readiness scenarios exposed by the shared harness.
     pub fn defaultScenarios() []const Scenario {
@@ -108,6 +114,26 @@ pub const Readiness = struct {
     /// Returns one readiness scenario by identifier.
     pub fn scenarioForId(id: ScenarioId) ?Scenario {
         return InteropHarness.readinessScenarioForId(id);
+    }
+
+    /// Returns one readiness scenario by blocking platform.
+    pub fn scenarioForPlatform(platform: InteropHarness.ReadinessPlatform) ?Scenario {
+        return InteropHarness.readinessScenarioForPlatform(platform);
+    }
+
+    /// Returns the blocking release platforms for the bounded decision path.
+    pub fn blockingPlatforms() []const InteropHarness.ReadinessPlatform {
+        return InteropHarness.blockingReadinessPlatforms();
+    }
+
+    /// Returns the blocking capability floor for the bounded decision path.
+    pub fn blockingCapabilityFloor() []const InteropHarness.CapabilityFeatureId {
+        return InteropHarness.blockingCapabilityFeatures();
+    }
+
+    /// Returns the protocol-scoped release evidence for the capability floor.
+    pub fn protocolEvidenceFor(protocol: types.NegotiatedProtocol) ProtocolEvidence {
+        return InteropHarness.protocolCapabilityEvidenceFor(protocol);
     }
 
     /// Returns the smoke scenarios relevant to readiness orchestration.
@@ -166,4 +192,14 @@ test "readiness entrypoint exposes the windows loopback scenario" {
     try @import("std").testing.expectEqualStrings("windows-cli-loopback-roundtrip", readiness.name);
     try @import("std").testing.expectEqualStrings("request", readiness.request_command.name);
     try @import("std").testing.expect(Readiness.smokeScenarios().len >= 4);
+}
+
+test "readiness entrypoint exposes blocking platforms and protocol evidence" {
+    const linux = Readiness.scenarioForPlatform(.linux).?;
+    const h3 = Readiness.protocolEvidenceFor(.h3);
+
+    try @import("std").testing.expectEqualStrings("linux-cli-loopback-roundtrip", linux.name);
+    try @import("std").testing.expectEqual(@as(usize, 2), Readiness.blockingPlatforms().len);
+    try @import("std").testing.expectEqual(@as(usize, 11), Readiness.blockingCapabilityFloor().len);
+    try @import("std").testing.expectEqual(.verified, h3.overallStatus());
 }

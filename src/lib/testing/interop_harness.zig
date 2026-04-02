@@ -568,10 +568,52 @@ pub const ReadinessPlatform = enum {
     macos,
 };
 
+/// Execution environment used to collect one platform evidence bundle.
+pub const ReadinessEnvironment = enum {
+    /// Direct execution on a Windows host.
+    native_windows,
+    /// Maintainer-controlled local Linux environment.
+    local_linux,
+    /// Host does not match one of the blocking release platforms.
+    unsupported_host,
+};
+
+/// Evidence status used by the bounded release-readiness gates.
+pub const ReleaseEvidenceStatus = enum {
+    /// Local evidence was captured and satisfies the gate contract.
+    verified,
+    /// Local evidence exists, but the gate still remains blocked.
+    partial,
+    /// Local evidence was not captured for the gate.
+    missing,
+};
+
+/// Stable identifier for one blocking release gate.
+pub const ReleaseGateId = enum {
+    /// Windows and Linux local readiness evidence.
+    platform_readiness,
+    /// Higher-level capability floor across HTTP/1.1, HTTP/2, and HTTP/3.
+    protocol_capability_floor,
+    /// Public README, CLI, and release-note alignment.
+    public_story_alignment,
+    /// Version, changelog, and tag-plan completeness.
+    release_artifact_completeness,
+};
+
+/// Result classification for one blocking release gate.
+pub const ReleaseGateStatus = enum {
+    /// The gate satisfies the required evidence contract.
+    passed,
+    /// The gate remains blocked by partial or missing evidence.
+    blocked,
+};
+
 /// Stable identifier for a release-readiness scenario.
 pub const ReadinessScenarioId = enum {
     /// Windows loopback `server` + `request` reproduction path.
     windows_loopback_cli_roundtrip,
+    /// Linux loopback `server` + `request` reproduction path.
+    linux_loopback_cli_roundtrip,
 };
 
 /// Shell command attached to a readiness scenario.
@@ -592,10 +634,16 @@ pub const ReadinessScenario = struct {
     summary: []const u8,
     /// Platforms targeted by the scenario.
     platforms: []const ReadinessPlatform,
+    /// Execution environment represented by the scenario.
+    environment: ReadinessEnvironment,
     /// Harness route validated by the scenario.
     route: RouteId,
     /// Endpoint expected by the documented workflow.
     endpoint: Endpoint,
+    /// Workspace cache root required by the documented release flow.
+    workspace_cache_root: []const u8,
+    /// Global cache root required by the documented release flow.
+    global_cache_root: []const u8,
     /// Long-running server command started before the probe.
     server_command: ReadinessCommand,
     /// Probe command executed against the loopback server.
@@ -620,11 +668,56 @@ pub const ReadinessScenario = struct {
     }
 };
 
+/// Platform-scoped evidence summary for the blocking readiness gate.
+pub const PlatformReadinessEvidence = struct {
+    /// Scenario that defines the platform evidence bundle.
+    scenario: ReadinessScenario,
+    /// Aggregate status for the platform bundle.
+    status: ReleaseEvidenceStatus,
+    /// Status specific to the CLI round-trip probe.
+    cli_roundtrip_status: ReleaseEvidenceStatus,
+    /// Short maintainer-facing summary for the bundle.
+    summary: []const u8,
+    /// Known failure signature or captured blocking diagnostic, if any.
+    failure_signature: ?[]const u8,
+
+    /// Returns true when the platform bundle still blocks the release.
+    pub fn blocksRelease(self: PlatformReadinessEvidence) bool {
+        return self.scenario.blocking and self.status != .verified;
+    }
+};
+
+/// Protocol-scoped evidence summary for the blocking capability floor.
+pub const ProtocolCapabilityEvidence = struct {
+    /// Protocol represented by the evidence bundle.
+    protocol: types.NegotiatedProtocol,
+    /// Blocking higher-level features expected for the protocol.
+    required_features: []const CapabilityFeatureId,
+    /// Number of blocking features still classified as supported.
+    satisfied_feature_count: usize,
+    /// Status of the higher-level capability mapping.
+    capability_status: ReleaseEvidenceStatus,
+    /// Status of the real-runtime coverage requirement.
+    runtime_status: ReleaseEvidenceStatus,
+
+    /// Returns the overall status for the protocol bundle.
+    pub fn overallStatus(self: ProtocolCapabilityEvidence) ReleaseEvidenceStatus {
+        if (self.capability_status != .verified) {
+            return self.capability_status;
+        }
+        if (self.protocol == .h3) {
+            return self.runtime_status;
+        }
+        return .verified;
+    }
+};
+
 const route_protocols = [_]types.NegotiatedProtocol{ .http_1_1, .h2, .h3 };
 const alpn_dual_protocols = [_]types.NegotiatedProtocol{ .h2, .http_1_1 };
 const alpn_http1_only_protocols = [_]types.NegotiatedProtocol{.http_1_1};
 const alpn_no_protocols = [_]types.NegotiatedProtocol{};
 const windows_only_platforms = [_]ReadinessPlatform{.windows};
+const linux_only_platforms = [_]ReadinessPlatform{.linux};
 const no_backpressure_scopes = [_]BackpressureScope{};
 const stream_and_connection_backpressure_scopes = [_]BackpressureScope{ .stream, .connection };
 const http3_critical_streams = [_]Http3CriticalStreamKind{ .control, .qpack_encoder, .qpack_decoder };
@@ -638,6 +731,22 @@ const goaway_routes = [_]RouteId{ .health, .echo_get };
 const default_peer_fixture_ids = [_]fixture_loader.InteropPeerFixtureId{ .server_app, .h2_peer, .h3_peer };
 /// Default protocol-profile identifiers used by the hardening matrix.
 const default_protocol_profile_ids = [_]fixture_loader.InteropProtocolProfileId{ .http1_baseline, .h2_multiplexed, .h3_quic };
+/// Platforms that must each produce their own blocking evidence bundle.
+pub const blocking_readiness_platforms = [_]ReadinessPlatform{ .windows, .linux };
+/// Higher-level features that make up the blocking `1.0.0` capability floor.
+pub const blocking_capability_features = [_]CapabilityFeatureId{
+    .server_routing,
+    .server_middleware,
+    .server_static_files,
+    .server_compression,
+    .server_websocket,
+    .client_decompression,
+    .client_multipart,
+    .client_retry,
+    .client_cache,
+    .client_websocket,
+    .hardening_matrix,
+};
 
 /// JSON shape for one peer startup command fixture.
 const JsonStartupCommand = struct {
@@ -728,6 +837,8 @@ const windows_loopback_request_command = [_][]const u8{
     "request",
     "http://127.0.0.1:18080/health",
 };
+const linux_loopback_server_command = windows_loopback_server_command;
+const linux_loopback_request_command = windows_loopback_request_command;
 
 const default_alpn_peer_profiles = [_]AlpnPeerProfile{
     .{
@@ -877,6 +988,7 @@ const default_readiness_scenarios = [_]ReadinessScenario{
         .name = "windows-cli-loopback-roundtrip",
         .summary = "Verify the documented Windows loopback /health round-trip through `zttp server` and `zttp request`.",
         .platforms = &windows_only_platforms,
+        .environment = .native_windows,
         .route = .health,
         .endpoint = .{
             .host = "127.0.0.1",
@@ -884,6 +996,8 @@ const default_readiness_scenarios = [_]ReadinessScenario{
             .transport = .tcp,
             .protocol = .http_1_1,
         },
+        .workspace_cache_root = ".tmp\\zig-cache-win",
+        .global_cache_root = ".tmp\\zig-global-win",
         .server_command = .{
             .name = "server",
             .argv = &windows_loopback_server_command,
@@ -896,6 +1010,34 @@ const default_readiness_scenarios = [_]ReadinessScenario{
         .expected_body_substring = "\"status\":\"ok\",\"protocol\":\"http/1.1\"",
         .blocking = true,
         .known_failure_signature = "GetLastError(87) surfaced from std.net.Stream.read",
+    },
+    .{
+        .id = .linux_loopback_cli_roundtrip,
+        .name = "linux-cli-loopback-roundtrip",
+        .summary = "Verify the documented Linux loopback /health round-trip through `zttp server` and `zttp request`.",
+        .platforms = &linux_only_platforms,
+        .environment = .local_linux,
+        .route = .health,
+        .endpoint = .{
+            .host = "127.0.0.1",
+            .port = types.Port.init(18080),
+            .transport = .tcp,
+            .protocol = .http_1_1,
+        },
+        .workspace_cache_root = ".tmp/zig-cache-linux",
+        .global_cache_root = ".tmp/zig-global-linux",
+        .server_command = .{
+            .name = "server",
+            .argv = &linux_loopback_server_command,
+        },
+        .request_command = .{
+            .name = "request",
+            .argv = &linux_loopback_request_command,
+        },
+        .expected_status = .ok,
+        .expected_body_substring = "\"status\":\"ok\",\"protocol\":\"http/1.1\"",
+        .blocking = true,
+        .known_failure_signature = null,
     },
 };
 
@@ -1241,6 +1383,16 @@ pub fn defaultReadinessScenarios() []const ReadinessScenario {
     return &default_readiness_scenarios;
 }
 
+/// Returns the blocking release-readiness platforms.
+pub fn blockingReadinessPlatforms() []const ReadinessPlatform {
+    return &blocking_readiness_platforms;
+}
+
+/// Returns the blocking higher-level capability floor for the release decision.
+pub fn blockingCapabilityFeatures() []const CapabilityFeatureId {
+    return &blocking_capability_features;
+}
+
 /// Returns the typed higher-level capability matrix for local planning and tests.
 pub fn defaultCapabilityMatrix() []const CapabilityMatrixEntry {
     return &default_capability_matrix;
@@ -1259,6 +1411,16 @@ pub fn capabilityFor(
     return null;
 }
 
+/// Returns the readiness scenario for the provided blocking platform, if any.
+pub fn readinessScenarioForPlatform(platform: ReadinessPlatform) ?ReadinessScenario {
+    for (default_readiness_scenarios) |scenario| {
+        if (scenario.supportsPlatform(platform)) {
+            return scenario;
+        }
+    }
+    return null;
+}
+
 /// Returns the default HTTP/2 multiplexing validation scenarios.
 pub fn defaultMultiplexingScenarios() []const MultiplexingScenario {
     return &default_multiplexing_scenarios;
@@ -1272,6 +1434,38 @@ pub fn readinessScenarioForId(id: ReadinessScenarioId) ?ReadinessScenario {
         }
     }
     return null;
+}
+
+/// Returns true when the catalog still exposes the required HTTP/3 runtime routes.
+pub fn hasBlockingHttp3RuntimeCoverage() bool {
+    return http3DatagramScenarioForRoute(.health) != null and
+        http3DatagramScenarioForRoute(.echo_get) != null and
+        http3DatagramScenarioForRoute(.echo_post) != null and
+        http3DatagramScenarioForRoute(.stream_large) != null;
+}
+
+/// Captures the blocking capability-floor evidence for one protocol.
+pub fn protocolCapabilityEvidenceFor(
+    protocol: types.NegotiatedProtocol,
+) ProtocolCapabilityEvidence {
+    var satisfied_feature_count: usize = 0;
+    for (blocking_capability_features) |feature| {
+        const capability = capabilityFor(feature, protocol) orelse continue;
+        if (capability.support == .supported) {
+            satisfied_feature_count += 1;
+        }
+    }
+
+    return .{
+        .protocol = protocol,
+        .required_features = &blocking_capability_features,
+        .satisfied_feature_count = satisfied_feature_count,
+        .capability_status = if (satisfied_feature_count == blocking_capability_features.len) .verified else .partial,
+        .runtime_status = switch (protocol) {
+            .h3 => if (hasBlockingHttp3RuntimeCoverage()) .verified else .missing,
+            else => .verified,
+        },
+    };
 }
 
 /// Returns the HTTP/2 multiplexing validation scenario for the provided identifier, if any.
@@ -1681,8 +1875,23 @@ test "readiness catalog includes the dedicated windows loopback scenario" {
     try std.testing.expectEqualStrings("server", readiness.server_command.name);
     try std.testing.expectEqualStrings("request", readiness.request_command.name);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080/health", readiness.request_command.argv[5]);
+    try std.testing.expectEqual(ReadinessEnvironment.native_windows, readiness.environment);
+    try std.testing.expectEqualStrings(".tmp\\zig-cache-win", readiness.workspace_cache_root);
+    try std.testing.expectEqualStrings(".tmp\\zig-global-win", readiness.global_cache_root);
     try std.testing.expect(std.mem.containsAtLeast(u8, readiness.expected_body_substring, 1, "\"protocol\":\"http/1.1\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, readiness.known_failure_signature.?, 1, "GetLastError(87)"));
+}
+
+test "readiness catalog includes the dedicated linux loopback scenario" {
+    const readiness = readinessScenarioForId(.linux_loopback_cli_roundtrip).?;
+
+    try std.testing.expectEqual(RouteId.health, readiness.route);
+    try std.testing.expect(readiness.supportsPlatform(.linux));
+    try std.testing.expect(!readiness.supportsPlatform(.windows));
+    try std.testing.expectEqual(ReadinessEnvironment.local_linux, readiness.environment);
+    try std.testing.expectEqualStrings(".tmp/zig-cache-linux", readiness.workspace_cache_root);
+    try std.testing.expectEqualStrings(".tmp/zig-global-linux", readiness.global_cache_root);
+    try std.testing.expectEqual(@as(?[]const u8, null), readiness.known_failure_signature);
 }
 
 test "multiplexing catalog captures shared-connection and scope diagnostics" {
@@ -1731,6 +1940,17 @@ test "capability matrix classifies higher-level features across all targeted pro
     const protocol_capability = hardening_h1.asProtocolCapability();
     try std.testing.expectEqual(types.FeatureSurface.hardening, protocol_capability.surface);
     try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, protocol_capability.protocol);
+}
+
+test "protocol capability evidence keeps the blocking release floor explicit" {
+    const h1 = protocolCapabilityEvidenceFor(.http_1_1);
+    const h3 = protocolCapabilityEvidenceFor(.h3);
+
+    try std.testing.expectEqual(@as(usize, blocking_capability_features.len), h1.required_features.len);
+    try std.testing.expectEqual(@as(usize, blocking_capability_features.len), h1.satisfied_feature_count);
+    try std.testing.expectEqual(ReleaseEvidenceStatus.verified, h1.overallStatus());
+    try std.testing.expectEqual(ReleaseEvidenceStatus.verified, h3.runtime_status);
+    try std.testing.expect(hasBlockingHttp3RuntimeCoverage());
 }
 
 test "hardening peer fixtures load typed loopback and multiprocess descriptors" {

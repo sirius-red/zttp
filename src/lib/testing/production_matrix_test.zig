@@ -9,6 +9,8 @@ const types = @import("../types.zig");
 
 /// Expected protocol coverage for the client retry and cache matrix.
 const matrix_protocols = [_]types.NegotiatedProtocol{ .http_1_1, .h2, .h3 };
+/// Blocking higher-level features required by the `1.0.0` capability floor.
+const blocking_features = interop_harness.blocking_capability_features;
 
 /// Explicit retry failure classes declared by the shared local contract.
 const RetryFailureClass = enum {
@@ -90,6 +92,28 @@ test "production matrix capability coverage classifies retry and cache across ht
             "replay safety",
         ));
     }
+}
+
+test "production matrix blocking capability floor stays supported across http1 h2 and h3" {
+    for (matrix_protocols) |protocol| {
+        const evidence = interop_harness.protocolCapabilityEvidenceFor(protocol);
+        try std.testing.expectEqual(@as(usize, blocking_features.len), evidence.required_features.len);
+        try std.testing.expectEqual(@as(usize, blocking_features.len), evidence.satisfied_feature_count);
+        try std.testing.expectEqual(.verified, evidence.capability_status);
+        try std.testing.expectEqual(.verified, evidence.overallStatus());
+
+        for (blocking_features) |feature| {
+            const capability = try expectSupportedCapability(feature, protocol);
+            try std.testing.expectEqual(protocol, capability.protocol);
+        }
+    }
+}
+
+test "production matrix blocking capability floor keeps http3 runtime coverage verified" {
+    const h3 = interop_harness.protocolCapabilityEvidenceFor(.h3);
+
+    try std.testing.expectEqual(.verified, h3.runtime_status);
+    try std.testing.expect(interop_harness.hasBlockingHttp3RuntimeCoverage());
 }
 
 test "production matrix retry coverage keeps replay safety explicit for unstable health" {
@@ -205,4 +229,11 @@ test "production matrix hardening metrics capture exceeds one thousand eligible 
     try std.testing.expectEqual(@as(usize, 9), metrics.failure_count);
     try std.testing.expect(metrics.successRatio() > 0.99);
     try std.testing.expect(metrics.passesReliabilityThreshold());
+}
+
+test "production matrix hardening summary keeps the blocking release gate explicit" {
+    const metrics = try interop_harness.captureHardeningMetrics(std.testing.allocator, fixture_loader.Loader.init());
+    const summary = @import("smoke_runner.zig").summarizeHardening(metrics);
+
+    try std.testing.expect(summary.passes_reliability_threshold);
 }
