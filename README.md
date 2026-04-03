@@ -126,10 +126,10 @@ Longer-term goals:
 
 ## Build and Test
 
-`zig build test` is the canonical verification command. It already runs the
-shared readiness smoke path, including the per-host CLI round-trip and the
-hardening summary, so release-readiness testing does not require a separate
-`zig build readiness-smoke` step.
+`zig build test` is the canonical verification command. It is responsible for
+running the full library and CLI test suites from the build graph. Internally,
+the library suite is split into dedicated unit and integration roots so local
+logic checks do not share the same entrypoint as loopback/runtime coverage.
 
 ```shell
 zig build test

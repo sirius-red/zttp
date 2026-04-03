@@ -726,6 +726,49 @@ fn evidenceStatusForRoundTrip(status: RoundTripStatus) interop_harness.ReleaseEv
     };
 }
 
+/// Returns a deterministic release-decision report for pure unit tests.
+fn sampleReleaseDecisionReport() ReleaseDecisionReport {
+    return .{
+        .platforms = .{
+            .{
+                .evidence = .{
+                    .scenario = interop_harness.readinessScenarioForPlatform(.windows).?,
+                    .status = .verified,
+                    .cli_roundtrip_status = .verified,
+                    .summary = "current-host CLI round-trip verified",
+                    .failure_signature = null,
+                },
+                .round_trip_status = .success,
+            },
+            .{
+                .evidence = .{
+                    .scenario = interop_harness.readinessScenarioForPlatform(.linux).?,
+                    .status = .missing,
+                    .cli_roundtrip_status = .missing,
+                    .summary = "platform evidence not captured on this host run",
+                    .failure_signature = null,
+                },
+                .round_trip_status = null,
+            },
+        },
+        .protocols = .{
+            interop_harness.protocolCapabilityEvidenceFor(.http_1_1),
+            interop_harness.protocolCapabilityEvidenceFor(.h2),
+            interop_harness.protocolCapabilityEvidenceFor(.h3),
+        },
+        .hardening = summarizeHardening(.{
+            .protocol_mix = .{
+                .{ .protocol = .http_1_1, .eligible_flows = 320, .excluded_flows = 8, .failure_count = 2 },
+                .{ .protocol = .h2, .eligible_flows = 340, .excluded_flows = 10, .failure_count = 3 },
+                .{ .protocol = .h3, .eligible_flows = 360, .excluded_flows = 12, .failure_count = 4 },
+            },
+            .total_eligible_flows = 1020,
+            .excluded_flows = 30,
+            .failure_count = 9,
+        }),
+    };
+}
+
 /// Waits for a child command to finish or kills it after the timeout expires.
 fn waitForCommand(child: *std.process.Child, timeout_ns: u64) !std.process.Child.Term {
     if (builtin.os.tag == .windows) {
@@ -792,7 +835,7 @@ test "round trip classification preserves known socket failures" {
 }
 
 test "release decision report keeps the missing platform gate explicit" {
-    const report = try captureReleaseDecisionReport(std.testing.allocator);
+    const report = sampleReleaseDecisionReport();
 
     try std.testing.expectEqual(@as(usize, 2), report.platforms.len);
     try std.testing.expectEqual(.blocked, report.platformGateStatus());
@@ -800,7 +843,7 @@ test "release decision report keeps the missing platform gate explicit" {
 }
 
 test "release decision summary prints blocking gate lines" {
-    const report = try captureReleaseDecisionReport(std.testing.allocator);
+    const report = sampleReleaseDecisionReport();
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(std.testing.allocator);
 

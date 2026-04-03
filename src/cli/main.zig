@@ -3,6 +3,19 @@
 const std = @import("std");
 const zttp = @import("zttp");
 
+/// Default TCP port used by the CLI server when `--port` is omitted.
+const default_server_port: u16 = 8080;
+/// Internal sentinel error returned after the CLI already emitted a user-facing diagnostic.
+const CliHandledError = error{
+    /// The CLI already printed the relevant diagnostic.
+    AlreadyReported,
+};
+/// Stable CLI server startup error used for user-facing bind diagnostics.
+const CliServerError = error{
+    /// The requested listen port is already unavailable on the target host.
+    PortInUse,
+};
+
 /// General help text for the CLI.
 const help_text =
     \\zttp - Zig HTTP client/server
@@ -58,7 +71,7 @@ const server_help =
     \\
     \\Options:
     \\      --listen <addr>     Bind host or IPv4 literal (default: 127.0.0.1)
-    \\      --port <number>     Bind TCP port (default: 8080)
+    \\      --port <number>     Bind TCP port (default: 8080; falls back to a free port only when omitted)
     \\      --tls-cert <path>   Certificate chain for TLS listener mode
     \\      --tls-key <path>    Private key for TLS listener mode
     \\      --http2             Enable minimal HTTP/2 negotiation planning
@@ -306,8 +319,16 @@ const Cli = struct {
             return error.InvalidArguments;
         };
 
-        const config = try buildServerConfig(server_args);
-        var server = try zttp.ServerRuntime.init(self.allocator, config);
+        var server = self.initServerRuntime(server_args) catch |err| {
+            if (err == CliServerError.PortInUse and server_args.port_explicit) {
+                try self.printErr(
+                    "zttp server: port {d} is already in use on {s}\n",
+                    .{ server_args.port, server_args.listen },
+                );
+                return CliHandledError.AlreadyReported;
+            }
+            return err;
+        };
         defer server.deinit();
 
         if (server_args.http3) {
@@ -322,6 +343,30 @@ const Cli = struct {
             });
         }
         try server.serve();
+    }
+
+    /// Initializes the CLI server runtime, retrying with an ephemeral port when the default port is busy.
+    fn initServerRuntime(self: *Cli, server_args: ServerArgs) !zttp.ServerRuntime {
+        var config = try buildServerConfig(server_args);
+        return zttp.ServerRuntime.init(self.allocator, config) catch |err| {
+            if (!isPortUnavailable(err)) {
+                return err;
+            }
+            if (server_args.port_explicit) {
+                return CliServerError.PortInUse;
+            }
+
+            config.port = zttp.Port.init(0);
+            if (config.http3) |*http3| {
+                http3.port = zttp.Port.init(0);
+            }
+            return try zttp.ServerRuntime.init(self.allocator, config);
+        };
+    }
+
+    /// Returns true when the listener failed because the target port was already unavailable.
+    fn isPortUnavailable(err: anyerror) bool {
+        return err == error.AddressInUse or err == error.AccessDenied;
     }
 
     /// Builds the loopback runtime configuration used by the server command.
@@ -621,6 +666,8 @@ const Cli = struct {
         listen: []const u8,
         /// Bind TCP port.
         port: u16,
+        /// Whether the port was explicitly provided on the command line.
+        port_explicit: bool,
         /// Optional TLS certificate chain.
         tls_cert: ?[]const u8,
         /// Optional TLS private key.
@@ -829,7 +876,8 @@ const Cli = struct {
 
         return .{
             .listen = listen orelse "127.0.0.1",
-            .port = port orelse 8080,
+            .port = port orelse default_server_port,
+            .port_explicit = port != null,
             .tls_cert = tls_cert,
             .tls_key = tls_key,
             .http2 = http2,
@@ -1048,15 +1096,33 @@ test "server args parser accepts bind and tls flags" {
 
     try std.testing.expectEqualStrings("127.0.0.1", args.listen);
     try std.testing.expectEqual(@as(u16, 9090), args.port);
+    try std.testing.expect(args.port_explicit);
     try std.testing.expectEqualStrings("server.pem", args.tls_cert.?);
     try std.testing.expectEqualStrings("server.key", args.tls_key.?);
     try std.testing.expect(args.http2);
+}
+
+test "server args parser keeps the default port implicit when omitted" {
+    var cli = Cli{
+        .allocator = std.testing.allocator,
+        .out = std.fs.File.stdout(),
+        .err = std.fs.File.stderr(),
+    };
+
+    const args = try cli.parseServerArgs(&.{
+        "--listen",
+        "127.0.0.1",
+    });
+
+    try std.testing.expectEqual(@as(u16, default_server_port), args.port);
+    try std.testing.expect(!args.port_explicit);
 }
 
 test "server command builds the interop-harness runtime config" {
     const config = try Cli.buildServerConfig(.{
         .listen = "127.0.0.1",
         .port = 9090,
+        .port_explicit = true,
         .tls_cert = "server.pem",
         .tls_key = "server.key",
         .http2 = true,
@@ -1075,6 +1141,7 @@ test "server command configures the shared server application" {
     const config = try Cli.buildServerConfig(.{
         .listen = "127.0.0.1",
         .port = 18080,
+        .port_explicit = true,
         .tls_cert = null,
         .tls_key = null,
         .http2 = false,
@@ -1149,6 +1216,56 @@ test "server args parser accepts http3" {
     });
 
     try std.testing.expect(args.http3);
+    try std.testing.expect(args.port_explicit);
+}
+
+test "server command falls back to an ephemeral port when the default port is busy" {
+    const default_listener = std.net.Address.parseIp("127.0.0.1", default_server_port) catch unreachable;
+    var maybe_busy_listener = std.net.Address.listen(default_listener, .{}) catch |err| switch (err) {
+        error.AddressInUse => null,
+        else => return err,
+    };
+    defer if (maybe_busy_listener) |*listener| listener.deinit();
+
+    var cli = Cli{
+        .allocator = std.testing.allocator,
+        .out = std.fs.File.stdout(),
+        .err = std.fs.File.stderr(),
+    };
+
+    var server = try cli.initServerRuntime(.{
+        .listen = "127.0.0.1",
+        .port = default_server_port,
+        .port_explicit = false,
+        .tls_cert = null,
+        .tls_key = null,
+        .http2 = false,
+        .http3 = false,
+    });
+    defer server.deinit();
+
+    try std.testing.expect(server.port() != default_server_port);
+}
+
+test "server command rejects an explicit busy port" {
+    var occupied = try std.net.Address.listen(try std.net.Address.parseIp("127.0.0.1", 0), .{});
+    defer occupied.deinit();
+
+    var cli = Cli{
+        .allocator = std.testing.allocator,
+        .out = std.fs.File.stdout(),
+        .err = std.fs.File.stderr(),
+    };
+
+    try std.testing.expectError(CliServerError.PortInUse, cli.initServerRuntime(.{
+        .listen = "127.0.0.1",
+        .port = occupied.listen_address.getPort(),
+        .port_explicit = true,
+        .tls_cert = null,
+        .tls_key = null,
+        .http2 = false,
+        .http3 = false,
+    }));
 }
 
 pub fn main() void {
@@ -1169,6 +1286,9 @@ pub fn main() void {
     };
 
     cli.run(args) catch |err| {
+        if (err == CliHandledError.AlreadyReported) {
+            return;
+        }
         cli.printErr("zttp: {s}\n", .{@errorName(err)}) catch {};
         if (err == error.InvalidArguments) {
             cli.printHelp() catch {};

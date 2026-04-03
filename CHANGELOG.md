@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1] - 2026-04-03
+
+### Fixed
+
+- Taught `zttp server` to fall back to an ephemeral port when the default
+  `127.0.0.1:8080` bind is unavailable, while still surfacing explicit
+  `--port` conflicts as a clear user-facing error.
+
+### Changed
+
+- Split the library verification graph into dedicated unit and integration test
+  roots and removed the standalone readiness-smoke executable from the build
+  graph, keeping `zig build` as a build-only check and `zig build test`
+  focused on the library and CLI suites.
+
 ## [0.11.0] - 2026-03-31
 
 ### Changed

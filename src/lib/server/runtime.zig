@@ -56,9 +56,10 @@ pub const Server = struct {
             null;
 
         const listen_address = try std.net.Address.parseIp(config.listen_host, config.port.toInt());
-        const listener = try std.net.Address.listen(listen_address, .{
+        var listener = try std.net.Address.listen(listen_address, .{
             .reuse_address = true,
         });
+        errdefer listener.deinit();
 
         return .{
             .allocator = allocator,

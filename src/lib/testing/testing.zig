@@ -150,7 +150,6 @@ test {
     _ = Http3Runtime;
     _ = Readiness;
     _ = @import("malformed_input_test.zig");
-    _ = @import("http3_interop_test.zig");
 }
 
 test "http3 runtime helpers expose shared loopback defaults" {

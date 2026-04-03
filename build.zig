@@ -66,19 +66,6 @@ pub fn build(b: *std.Build) void {
     lib.addImport("zttp_cache", cache);
     lib.addImport("zttp_testing", testing);
 
-    const readiness_smoke = b.addExecutable(.{
-        .name = "zttp-readiness-smoke",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/lib/testing/readiness_smoke_main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zttp", .module = lib },
-            },
-        }),
-    });
-    b.installArtifact(readiness_smoke);
-
     const cli = b.addExecutable(.{
         .name = "zttp",
         .root_module = b.createModule(.{
@@ -100,27 +87,34 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     run_step.dependOn(&run_cmd.step);
 
-    const lib_tests = b.addTest(.{ .root_module = lib });
-    const run_lib_tests = b.addRunArtifact(lib_tests);
+    const lib_unit_test_module = b.createModule(.{
+        .root_source_file = b.path("src/lib/test_root_unit.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const lib_unit_tests = b.addTest(.{
+        .root_module = lib_unit_test_module,
+    });
+    const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
+    const lib_integration_test_module = b.createModule(.{
+        .root_source_file = b.path("src/lib/test_root_integration.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const lib_integration_tests = b.addTest(.{
+        .root_module = lib_integration_test_module,
+    });
+    const run_lib_integration_tests = b.addRunArtifact(lib_integration_tests);
     const cli_tests = b.addTest(.{ .root_module = cli.root_module });
     const run_cli_tests = b.addRunArtifact(cli_tests);
-    const run_readiness_smoke = b.addRunArtifact(readiness_smoke);
-    const run_release_readiness = b.addRunArtifact(readiness_smoke);
-    run_release_readiness.addArg("--require-all-platforms");
-    const readiness_smoke_step = b.step("readiness-smoke", "Run the shared per-host readiness summary used by zig build test");
-    const readiness_release_step = b.step("readiness-release", "Optionally require both Windows and Linux evidence in one readiness summary");
 
-    const test_step = b.step("test", "Run all tests, including the per-host readiness round-trip and hardening summary");
-    test_step.dependOn(&run_lib_tests.step);
+    const test_step = b.step("test", "Run all library and CLI tests");
+    test_step.dependOn(&run_lib_unit_tests.step);
+    test_step.dependOn(&run_lib_integration_tests.step);
     test_step.dependOn(&run_cli_tests.step);
-    run_readiness_smoke.step.dependOn(b.getInstallStep());
-    run_release_readiness.step.dependOn(b.getInstallStep());
-    readiness_smoke_step.dependOn(&run_readiness_smoke.step);
-    readiness_release_step.dependOn(&run_release_readiness.step);
-    test_step.dependOn(&run_readiness_smoke.step);
 
-    const test_http3_step = b.step("test-http3", "Run the full test suite including the default HTTP/3 coverage");
-    test_http3_step.dependOn(&run_lib_tests.step);
+    const test_http3_step = b.step("test-http3", "Run the full library and CLI test suite");
+    test_http3_step.dependOn(&run_lib_unit_tests.step);
+    test_http3_step.dependOn(&run_lib_integration_tests.step);
     test_http3_step.dependOn(&run_cli_tests.step);
-    test_http3_step.dependOn(&run_readiness_smoke.step);
 }

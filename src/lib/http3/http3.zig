@@ -175,9 +175,6 @@ test {
     _ = ValidationOutcome;
     _ = Quic;
     _ = Qpack;
-    _ = Client;
-    _ = Server;
-    _ = @import("quic_test.zig");
 }
 
 test "http3 validation outcome retains route diagnostics" {
