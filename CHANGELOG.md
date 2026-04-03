@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   roots and removed the standalone readiness-smoke executable from the build
   graph, keeping `zig build` as a build-only check and `zig build test`
   focused on the library and CLI suites.
+- Documented the `1.0.0` stability story so the public release surfaces all
+  say that HTTP/1.1, HTTP/2, and HTTP/3 share the same default stable promise
+  for the verified routing, middleware, static-file, compression, WebSocket,
+  decompression, multipart, retry, cache, and hardening surfaces, while
+  broader parity remains follow-up scope.
 
 ## [0.11.0] - 2026-03-31
 

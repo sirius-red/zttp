@@ -57,8 +57,9 @@ const request_help =
 
 /// Extra help text for HTTP/3-enabled request builds.
 const request_help_http3 =
-    \\  Experimental:
-    \\      --http3             Use the local UDP-backed HTTP/3 runtime path
+    \\  Stable in 1.0.0:
+    \\      --http3             Use the stable UDP-backed HTTP/3 runtime path
+    \\                        on the same default surface as HTTP/1.1 and HTTP/2
     \\
 ;
 
@@ -74,7 +75,7 @@ const server_help =
     \\      --port <number>     Bind TCP port (default: 8080; falls back to a free port only when omitted)
     \\      --tls-cert <path>   Certificate chain for TLS listener mode
     \\      --tls-key <path>    Private key for TLS listener mode
-    \\      --http2             Enable minimal HTTP/2 negotiation planning
+    \\      --http2             Enable the stable HTTP/2 path on the library-owned server
     \\  -h, --help              Show help
     \\
     \\Serves:
@@ -88,8 +89,9 @@ const server_help =
 
 /// Extra help text for HTTP/3-enabled server builds.
 const server_help_http3 =
-    \\  Experimental:
-    \\      --http3             Enable the UDP-backed HTTP/3 runtime on the same library-owned server
+    \\  Stable in 1.0.0:
+    \\      --http3             Enable the stable UDP-backed HTTP/3 runtime on the same
+    \\                        library-owned server surface as HTTP/1.1 and HTTP/2
     \\
 ;
 
@@ -611,7 +613,7 @@ const Cli = struct {
         method: ?[]const u8,
         /// Request body data, if provided.
         data: ?[]const u8,
-        /// Enables the experimental local HTTP/3 harness flow.
+        /// Enables the stable UDP-backed HTTP/3 runtime path for the 1.0.0 surface.
         http3: bool,
         /// Disable TLS verification for local testing.
         tls_insecure: bool,
@@ -672,9 +674,9 @@ const Cli = struct {
         tls_cert: ?[]const u8,
         /// Optional TLS private key.
         tls_key: ?[]const u8,
-        /// Enables minimal HTTP/2 negotiation planning.
+        /// Enables the stable HTTP/2 path on the library-owned server surface.
         http2: bool,
-        /// Prints the experimental UDP HTTP/3 harness endpoint metadata.
+        /// Enables the stable UDP-backed HTTP/3 runtime on the library-owned server surface.
         http3: bool,
     };
 
@@ -1026,6 +1028,19 @@ test "cli help advertises request and server entrypoints" {
     try std.testing.expect(std.mem.containsAtLeast(u8, help_text, 1, "request"));
     try std.testing.expect(std.mem.containsAtLeast(u8, help_text, 1, "server"));
     try std.testing.expect(std.mem.containsAtLeast(u8, server_help, 1, "zttp server"));
+}
+
+test "cli help advertises the stable 1.0.0 multi-protocol surface" {
+    try std.testing.expect(std.mem.containsAtLeast(u8, request_help_http3, 1, "Stable in 1.0.0:"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, request_help_http3, 1, "stable UDP-backed HTTP/3 runtime path"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, request_help_http3, 1, "same default surface as HTTP/1.1 and HTTP/2"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, request_help_http3, 1, "Experimental:"));
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, server_help, 1, "Enable the stable HTTP/2 path on the library-owned server"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, server_help_http3, 1, "Stable in 1.0.0:"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, server_help_http3, 1, "stable UDP-backed HTTP/3 runtime"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, server_help_http3, 1, "server surface as HTTP/1.1 and HTTP/2"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, server_help_http3, 1, "Experimental:"));
 }
 
 test "smoke scenarios keep a runnable server command" {
