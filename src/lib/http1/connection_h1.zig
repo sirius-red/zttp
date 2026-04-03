@@ -306,7 +306,8 @@ const TransportReader = struct {
         if (self.connection.tls_stream) |tls_stream| {
             return tls_stream.reader().readSliceShort(dest);
         }
-        return socket_io.read(self.connection.stream.?, dest);
+        const stream = self.connection.stream orelse return error.SocketNotConnected;
+        return socket_io.read(stream, dest);
     }
 };
 
@@ -329,7 +330,8 @@ const TransportWriter = struct {
             try tls_stream.writer().writeAll(bytes);
             return;
         }
-        try self.connection.stream.?.writeAll(bytes);
+        const stream = self.connection.stream orelse return error.SocketNotConnected;
+        try stream.writeAll(bytes);
     }
 
     /// Writes a single byte to the active transport.
@@ -338,9 +340,9 @@ const TransportWriter = struct {
             try tls_stream.writer().writeByte(byte);
             return;
         }
-
+        const stream = self.connection.stream orelse return error.SocketNotConnected;
         var buf: [1]u8 = .{byte};
-        try self.connection.stream.?.writeAll(&buf);
+        try stream.writeAll(&buf);
     }
 };
 
@@ -493,6 +495,7 @@ pub const ConnectionH1 = struct {
                     self.closeStream();
                     return;
                 };
+                pipe.closeRuntimeHandle();
 
                 response.body = .{
                     .ctx = pipe,

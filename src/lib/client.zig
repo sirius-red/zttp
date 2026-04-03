@@ -1126,11 +1126,17 @@ const RequestState = struct {
         }
 
         if (!self.follow_redirects) {
-            const response = try self.waitForCurrentResponse(effective_deadline);
+            const response = self.waitForCurrentResponse(effective_deadline) catch |err| {
+                self.completed = true;
+                return err;
+            };
             return self.finalizeResponse(self.request.uri, response);
         }
 
-        return self.waitWithRedirects(effective_deadline);
+        return self.waitWithRedirects(effective_deadline) catch |err| {
+            self.completed = true;
+            return err;
+        };
     }
 
     /// Executes redirect handling while waiting for a final response.
@@ -3213,13 +3219,25 @@ test "client surfaces CONNECT failure" {
         return;
     }
 
-    const test_proxy = @import("proxy/test_proxy.zig");
+    const test_server = @import("http1/test_server.zig");
 
-    var proxy = try test_proxy.TestProxy.init(
-        std.testing.allocator,
-        .{ .reject = .{ .status = 502, .reason = "Bad Gateway" } },
-        test_proxy.Options.default(),
-    );
+    const scenarios = [_]test_server.Scenario{
+        .{
+            .steps = &.{
+                .{
+                    .payload = .{
+                        .response = .{
+                            .status = .bad_gateway,
+                            .reason = "Bad Gateway",
+                        },
+                    },
+                    .expect_request_contains = "CONNECT example.com:443 HTTP/1.1",
+                },
+            },
+        },
+    };
+
+    var proxy = try test_server.TestServer.init(&scenarios, test_server.Options.default());
     defer proxy.deinit();
     try proxy.start();
 
@@ -3331,18 +3349,30 @@ test "https connection options keep the compatibility path for omitted alpn peer
 }
 
 /// Returns the internal HTTP/2 runtime snapshot for the request origin.
-fn snapshotSharedH2Runtime(client: *Client, request_value: *const types.Request) !connection_h2.Snapshot {
-    const origin = try client.buildOriginKey(request_value, null, null);
-    const entry = client.pool.origins.getEntryContext(origin, OriginKeyContext{}) orelse return error.Transport;
-    try std.testing.expectEqual(@as(usize, 1), entry.value_ptr.idle.items.len);
-    return entry.value_ptr.idle.items[0].connection.http2_runtime.?.snapshot();
+fn snapshotSharedH2Runtime(
+    client: *Client,
+    request_value: *const types.Request,
+) (error{ Transport, NotReady })!connection_h2.Snapshot {
+    const origin = client.buildOriginKey(request_value, null, null) catch return error.Transport;
+    const entry = client.pool.origins.getEntryContext(origin, OriginKeyContext{}) orelse return error.NotReady;
+    if (entry.value_ptr.idle.items.len != 1) {
+        return error.NotReady;
+    }
+    const runtime = entry.value_ptr.idle.items[0].connection.http2_runtime orelse return error.NotReady;
+    return runtime.snapshot();
 }
 
 /// Polls until the shared HTTP/2 runtime reports stream-scoped backpressure.
 fn waitForSharedH2StreamBackpressure(client: *Client, request_value: *const types.Request) !connection_h2.Snapshot {
     var attempts: usize = 0;
-    while (attempts < 100) : (attempts += 1) {
-        const snapshot = try snapshotSharedH2Runtime(client, request_value);
+    while (attempts < 1000) : (attempts += 1) {
+        const snapshot = snapshotSharedH2Runtime(client, request_value) catch |err| switch (err) {
+            error.NotReady => {
+                std.Thread.sleep(std.time.ns_per_ms);
+                continue;
+            },
+            error.Transport => return error.Transport,
+        };
         if (snapshot.saw_stream_backpressure) {
             return snapshot;
         }
@@ -3354,8 +3384,14 @@ fn waitForSharedH2StreamBackpressure(client: *Client, request_value: *const type
 /// Polls until the shared HTTP/2 runtime reports connection-scoped backpressure.
 fn waitForSharedH2ConnectionBackpressure(client: *Client, request_value: *const types.Request) !connection_h2.Snapshot {
     var attempts: usize = 0;
-    while (attempts < 100) : (attempts += 1) {
-        const snapshot = try snapshotSharedH2Runtime(client, request_value);
+    while (attempts < 1000) : (attempts += 1) {
+        const snapshot = snapshotSharedH2Runtime(client, request_value) catch |err| switch (err) {
+            error.NotReady => {
+                std.Thread.sleep(std.time.ns_per_ms);
+                continue;
+            },
+            error.Transport => return error.Transport,
+        };
         if (snapshot.saw_connection_backpressure) {
             return snapshot;
         }
@@ -3367,8 +3403,14 @@ fn waitForSharedH2ConnectionBackpressure(client: *Client, request_value: *const 
 /// Polls until the shared HTTP/2 runtime enters the draining state.
 fn waitForSharedH2Draining(client: *Client, request_value: *const types.Request) !connection_h2.Snapshot {
     var attempts: usize = 0;
-    while (attempts < 100) : (attempts += 1) {
-        const snapshot = try snapshotSharedH2Runtime(client, request_value);
+    while (attempts < 1000) : (attempts += 1) {
+        const snapshot = snapshotSharedH2Runtime(client, request_value) catch |err| switch (err) {
+            error.NotReady => {
+                std.Thread.sleep(std.time.ns_per_ms);
+                continue;
+            },
+            error.Transport => return error.Transport,
+        };
         if (snapshot.state == http2_connection.ConnectionState.draining and !snapshot.reusable) {
             return snapshot;
         }
@@ -3380,8 +3422,14 @@ fn waitForSharedH2Draining(client: *Client, request_value: *const types.Request)
 /// Polls until the shared HTTP/2 runtime records the expected concurrent-request snapshot.
 fn waitForSharedH2Concurrency(client: *Client, request_value: *const types.Request) !connection_h2.Snapshot {
     var attempts: usize = 0;
-    while (attempts < 100) : (attempts += 1) {
-        const snapshot = try snapshotSharedH2Runtime(client, request_value);
+    while (attempts < 1000) : (attempts += 1) {
+        const snapshot = snapshotSharedH2Runtime(client, request_value) catch |err| switch (err) {
+            error.NotReady => {
+                std.Thread.sleep(std.time.ns_per_ms);
+                continue;
+            },
+            error.Transport => return error.Transport,
+        };
         if (snapshot.request_count >= 2 and snapshot.max_overlapping_streams >= 2 and snapshot.next_stream_id == 5) {
             return snapshot;
         }
@@ -3450,17 +3498,24 @@ test "client reuses one shared h2 runtime for concurrent requests" {
     var echo_handle = try client.request(&echo_request);
     defer echo_handle.deinit();
 
-    var health_response = try health_handle.wait();
-    defer health_response.deinit();
-    health_response.body = null;
-    var echo_response = try echo_handle.wait();
-    defer echo_response.deinit();
-    echo_response.body = null;
-
     const snapshot = try waitForSharedH2Concurrency(&client, &health_request);
     try std.testing.expectEqual(@as(usize, 2), snapshot.request_count);
     try std.testing.expect(snapshot.max_overlapping_streams >= 2);
     try std.testing.expectEqual(@as(u31, 5), snapshot.next_stream_id);
+
+    var health_response = try health_handle.wait();
+    defer health_response.deinit();
+    var echo_response = try echo_handle.wait();
+    defer echo_response.deinit();
+
+    if (health_response.body) |body| {
+        body.close();
+        health_response.body = null;
+    }
+    if (echo_response.body) |body| {
+        body.close();
+        echo_response.body = null;
+    }
 }
 
 test "client h2 runtime reports stream and connection backpressure under a held body reader" {
@@ -3545,7 +3600,7 @@ test "client isolates h2 rst_stream failures from healthy peers" {
 
     var rst_response = try rst_handle.wait();
     defer rst_response.deinit();
-    rst_response.body = null;
+    defer if (rst_response.body) |body| body.close();
 
     var health_response = try health_handle.wait();
     defer health_response.deinit();
@@ -4083,6 +4138,7 @@ test "client can cancel in-flight request" {
     try server.start();
 
     var options = Options.default();
+    options.timeouts.read = Duration.fromMillis(50);
     options.timeouts.request = Duration.fromSeconds(1);
 
     var client = Client.init(std.testing.allocator, options);
@@ -4096,6 +4152,9 @@ test "client can cancel in-flight request" {
     var handle = try client.request(&request);
     defer handle.deinit();
 
+    // Give the background client thread time to establish the loopback request
+    // so cancellation exercises an in-flight operation instead of a queued one.
+    std.Thread.sleep(20 * std.time.ns_per_ms);
     try std.testing.expect(handle.cancel());
     try std.testing.expectError(error.Canceled, handle.wait());
 }

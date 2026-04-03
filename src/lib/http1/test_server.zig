@@ -132,11 +132,11 @@ pub const TestServer = struct {
 
     /// Joins the background thread and closes the listening socket.
     pub fn deinit(self: *TestServer) void {
+        self.server.deinit();
         if (self.thread) |thread| {
             thread.join();
             self.thread = null;
         }
-        self.server.deinit();
     }
 
     /// Runs the accept loop for each configured scenario.

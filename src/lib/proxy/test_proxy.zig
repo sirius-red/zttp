@@ -128,11 +128,11 @@ pub const TestProxy = struct {
 
     /// Joins the background thread and closes the listening socket.
     pub fn deinit(self: *TestProxy) void {
+        self.server.deinit();
         if (self.thread) |thread| {
             thread.join();
             self.thread = null;
         }
-        self.server.deinit();
     }
 
     /// Runs the accept loop for incoming proxy connections.
@@ -158,6 +158,7 @@ pub const TestProxy = struct {
         switch (self.mode) {
             .reject => |response| {
                 try writeResponse(connection.stream, response.status, response.reason);
+                std.posix.shutdown(connection.stream.handle, .send) catch {};
                 return;
             },
             .tunnel => {},
@@ -277,7 +278,11 @@ pub const TestProxy = struct {
     /// Writes a simple HTTP response to the stream.
     fn writeResponse(stream: std.net.Stream, status: u16, reason: []const u8) !void {
         var line_buffer: [256]u8 = undefined;
-        const line = try std.fmt.bufPrint(&line_buffer, "HTTP/1.1 {d} {s}\r\n\r\n", .{ status, reason });
+        const line = try std.fmt.bufPrint(
+            &line_buffer,
+            "HTTP/1.1 {d} {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            .{ status, reason },
+        );
         try stream.writeAll(line);
     }
 

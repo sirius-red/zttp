@@ -27,7 +27,7 @@ pub const BodyPipe = struct {
     reader_closed: bool,
     /// Stored error to surface to the reader after draining.
     pending_error: ?anyerror,
-    /// Reference count for reader and writer lifetimes.
+    /// Reference count for runtime-slot, reader, and writer lifetimes.
     ref_count: std.atomic.Value(u8),
 
     /// Allocates a new pipe with the requested capacity in bytes.
@@ -50,7 +50,7 @@ pub const BodyPipe = struct {
             .writer_closed = false,
             .reader_closed = false,
             .pending_error = null,
-            .ref_count = std.atomic.Value(u8).init(2),
+            .ref_count = std.atomic.Value(u8).init(3),
         };
 
         return pipe;
@@ -136,6 +136,13 @@ pub const BodyPipe = struct {
         return self.buffer.len - self.len;
     }
 
+    /// Returns true when the reader side has already been closed.
+    pub fn isReaderClosed(self: *BodyPipe) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.reader_closed;
+    }
+
     /// Closes the writer side, optionally providing an error for the reader.
     pub fn closeWriter(self: *BodyPipe, err: ?anyerror) void {
         var release = false;
@@ -170,6 +177,11 @@ pub const BodyPipe = struct {
     /// Closes the reader side using a direct pointer.
     pub fn closeReaderHandle(self: *BodyPipe) void {
         self.closeReaderInternal();
+    }
+
+    /// Releases the runtime slot reference retained by stream bookkeeping.
+    pub fn closeRuntimeHandle(self: *BodyPipe) void {
+        self.releaseRef();
     }
 
     /// Reads buffered data, waiting for writer activity as needed.

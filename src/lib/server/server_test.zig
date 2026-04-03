@@ -560,6 +560,13 @@ test "server http3 runtime reuses one listener for repeated health requests" {
 
     if (server.http3_runtime) |*http3_runtime| {
         try std.testing.expectEqual(@as(usize, 1), http3_runtime.sessions.items.len);
+        var attempts: usize = 0;
+        while (attempts < 100) : (attempts += 1) {
+            if (http3_runtime.sessions.items[0].session.connection.activeStreamCount(.bidirectional) == 0) {
+                return;
+            }
+            std.Thread.sleep(std.time.ns_per_ms);
+        }
         try std.testing.expectEqual(@as(usize, 0), http3_runtime.sessions.items[0].session.connection.activeStreamCount(.bidirectional));
     } else {
         return error.TestUnexpectedResult;

@@ -154,6 +154,7 @@ const StreamSlot = struct {
         if (!self.writer_closed) {
             self.pipe.closeWriter(error.Canceled);
         }
+        self.pipe.closeRuntimeHandle();
         self.response.deinit();
         self.* = undefined;
     }
@@ -193,7 +194,6 @@ const RuntimeBody = struct {
         }
         self.closed = true;
         self.inner.close();
-        self.runtime.onReaderClosed(self.stream_id);
         self.allocator.destroy(self);
     }
 };
@@ -336,7 +336,12 @@ pub const ConnectionH2 = struct {
         self.mutex.unlock();
 
         while (true) {
-            if (self.hasSchedulableStreams()) {
+            if (!self.drainQueuedCommands()) {
+                break;
+            }
+            self.advanceStreams();
+
+            if (self.hasTrackedStreams()) {
                 const maybe_cmd: ?Command = self.mailbox.timedRecv(std.time.ns_per_ms) catch |err| switch (err) {
                     error.Timeout => null,
                     error.Closed => break,
@@ -358,19 +363,30 @@ pub const ConnectionH2 = struct {
             self.advanceStreams();
         }
 
+        self.advanceStreams();
         self.shutdownStreams();
+        self.advanceStreams();
     }
 
-    /// Returns true when at least one stream can still advance.
-    fn hasSchedulableStreams(self: *ConnectionH2) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        for (self.streams.items) |slot| {
-            if (!slot.writer_closed and !slot.reader_closed) {
-                return true;
+    /// Drains any already-queued commands before the scheduler advances streams.
+    fn drainQueuedCommands(self: *ConnectionH2) bool {
+        while (true) {
+            const cmd = self.mailbox.timedRecv(0) catch |err| switch (err) {
+                error.Timeout => return true,
+                error.Closed => return false,
+            };
+            switch (cmd) {
+                .request => |request_cmd| self.handleRequest(request_cmd),
+                .shutdown => return false,
             }
         }
-        return false;
+    }
+
+    /// Returns true when at least one stream remains tracked by the runtime.
+    fn hasTrackedStreams(self: *ConnectionH2) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.streams.items.len != 0;
     }
 
     /// Handles one submitted request command.
@@ -399,6 +415,7 @@ pub const ConnectionH2 = struct {
         };
         var pipe_owned = true;
         defer if (pipe_owned) {
+            pipe.closeRuntimeHandle();
             pipe.closeReaderHandle();
             pipe.closeWriter(error.Canceled);
         };
@@ -457,15 +474,6 @@ pub const ConnectionH2 = struct {
             .close_fn = RuntimeBody.close,
         };
 
-        var completion = cmd.completion;
-        if (!completion.finish(response)) {
-            response.body.?.close();
-            response.deinit();
-            self.finishRejectedStream(stream_id);
-            return;
-        }
-        response_owned = false;
-
         self.mutex.lock();
         self.streams.append(self.allocator, .{
             .stream_id = stream_id,
@@ -490,6 +498,15 @@ pub const ConnectionH2 = struct {
         self.executed_requests += 1;
         self.max_overlapping_streams = @max(self.max_overlapping_streams, self.connection.activeStreamCount());
         self.mutex.unlock();
+
+        var completion = cmd.completion;
+        if (!completion.finish(response)) {
+            response.body.?.close();
+            response.deinit();
+            self.cancelSubmittedStream(stream_id);
+            return;
+        }
+        response_owned = false;
     }
 
     /// Advances all active streams by one scheduler slice.
@@ -505,6 +522,9 @@ pub const ConnectionH2 = struct {
 
             const now = std.time.nanoTimestamp();
             const slot = &self.streams.items[index];
+            if (!slot.reader_closed and slot.pipe.isReaderClosed()) {
+                self.onReaderClosedLocked(slot);
+            }
             if (slot.writer_closed and slot.reader_closed) {
                 remove = true;
             } else if (!slot.writer_closed and now >= slot.next_ready_ns) {
@@ -614,6 +634,24 @@ pub const ConnectionH2 = struct {
         self.connection.finishStream(stream_id) catch self.connection.resetStream(stream_id) catch {};
     }
 
+    /// Cancels a stream that was admitted before the caller abandoned its future.
+    fn cancelSubmittedStream(self: *ConnectionH2, stream_id: u31) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.streams.items) |*slot| {
+            if (slot.stream_id != stream_id) {
+                continue;
+            }
+
+            self.onReaderClosedLocked(slot);
+            self.closeWriterLocked(slot, error.Canceled);
+            return;
+        }
+
+        self.connection.finishStream(stream_id) catch self.connection.resetStream(stream_id) catch {};
+    }
+
     /// Closes the writer for the provided stream and updates typed state.
     fn closeWriterLocked(self: *ConnectionH2, slot: *StreamSlot, err: ?anyerror) void {
         if (slot.writer_closed) {
@@ -666,20 +704,6 @@ pub const ConnectionH2 = struct {
         }
     }
 
-    /// Handles reader shutdown for the provided stream.
-    fn onReaderClosed(self: *ConnectionH2, stream_id: u31) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        for (self.streams.items) |*slot| {
-            if (slot.stream_id != stream_id) {
-                continue;
-            }
-            self.onReaderClosedLocked(slot);
-            return;
-        }
-    }
-
     /// Handles reader shutdown while the runtime mutex is already held.
     fn onReaderClosedLocked(self: *ConnectionH2, slot: *StreamSlot) void {
         if (slot.reader_closed) {
@@ -693,6 +717,7 @@ pub const ConnectionH2 = struct {
             self.connection.setBufferedBodyBytes(slot.stream_id, 0) catch unreachable;
         }
         self.connection.clearBlockedReason(slot.stream_id) catch {};
+        self.closeWriterLocked(slot, error.Canceled);
     }
 
     /// Shuts down any remaining streams during runtime teardown.
@@ -796,7 +821,7 @@ test "http2 runtime multiplexes concurrent requests on one connection" {
     try std.testing.expectEqual(types.Version.http_2, health_response.version);
     try std.testing.expectEqual(types.Version.http_2, echo_response.version);
 
-    const snap = runtime.snapshot();
+    const snap = try waitForConcurrency(&runtime);
     try std.testing.expectEqual(@as(usize, 2), snap.request_count);
     try std.testing.expect(snap.max_overlapping_streams >= 2);
     try std.testing.expectEqual(@as(u31, 5), snap.next_stream_id);
@@ -808,6 +833,19 @@ fn waitForStreamBackpressure(runtime: *ConnectionH2) !Snapshot {
     while (attempts < 100) : (attempts += 1) {
         const snapshot = runtime.snapshot();
         if (snapshot.saw_stream_backpressure) {
+            return snapshot;
+        }
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    return error.Timeout;
+}
+
+/// Polls until the runtime records the expected concurrent-request snapshot.
+fn waitForConcurrency(runtime: *ConnectionH2) !Snapshot {
+    var attempts: usize = 0;
+    while (attempts < 1000) : (attempts += 1) {
+        const snapshot = runtime.snapshot();
+        if (snapshot.request_count >= 2 and snapshot.max_overlapping_streams >= 2 and snapshot.next_stream_id == 5) {
             return snapshot;
         }
         std.Thread.sleep(std.time.ns_per_ms);
