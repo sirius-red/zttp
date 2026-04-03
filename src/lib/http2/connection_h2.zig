@@ -317,8 +317,8 @@ pub const ConnectionH2 = struct {
     pub fn deinit(self: *ConnectionH2) void {
         self.mailbox.close();
         if (self.thread) |thread| {
-            thread.join();
             self.thread = null;
+            thread.join();
         }
         self.mailbox.deinit();
 

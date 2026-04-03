@@ -543,6 +543,9 @@ pub fn ResponseParser(comptime ReaderType: type) type {
             if (mode == .none) {
                 return null;
             }
+            if (mode == .content_length and content_length != null and content_length.? == 0) {
+                return null;
+            }
 
             const state = try self.allocator.create(BodyState);
             state.* = BodyState{

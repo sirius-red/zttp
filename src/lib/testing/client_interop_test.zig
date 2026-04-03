@@ -1,7 +1,8 @@
 //! Client interop regression coverage tied to the shared harness contract.
 
 const std = @import("std");
-const client = @import("../client.zig");
+const compression_decoder = @import("../compression/decoder.zig");
+const compression_encoding = @import("../compression/encoding.zig");
 const fixture_loader = @import("fixture_loader.zig");
 const interop_harness = @import("interop_harness.zig");
 const multipart_form_data = @import("../multipart/form_data.zig");
@@ -38,7 +39,7 @@ const DecompressionAcceptanceExpectation = struct {
     /// Encoded content type served by the route.
     content_type: []const u8,
     /// Content encoding inspected by the first-party decoder.
-    content_encoding: client.ContentEncoding,
+    content_encoding: compression_encoding.ContentEncoding,
 };
 
 /// Shared multipart acceptance contract for `/upload`.
@@ -144,7 +145,7 @@ test "client interop aligns multipart upload coverage with the shared local cont
     const upload_bytes = try loader.loadHigherLevelAsset(std.testing.allocator, .upload_bin);
     defer std.testing.allocator.free(upload_bytes);
 
-    var form = client.FormData.init(
+    var form = multipart_form_data.FormData.init(
         std.testing.allocator,
         multipart_form_data.Boundary.init("upload-boundary-01"),
     );
@@ -198,13 +199,13 @@ test "client interop aligns automatic decompression coverage with the shared loc
     const encoded_payload = try loader.loadHigherLevelAsset(std.testing.allocator, .upload_bin);
     defer std.testing.allocator.free(encoded_payload);
 
-    const decoder = client.Decoder.init(decompression_acceptance.content_encoding);
+    const decoder = compression_decoder.Decoder.init(decompression_acceptance.content_encoding);
     var decoded = try decoder.decodeAlloc(std.testing.allocator, encoded_payload);
     defer decoded.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("/download/compressed", decompression_acceptance.path);
     try std.testing.expectEqualStrings("application/octet-stream", decompression_acceptance.content_type);
-    try std.testing.expectEqual(client.ContentEncoding.gzip, decoded.content_encoding);
+    try std.testing.expectEqual(compression_encoding.ContentEncoding.gzip, decoded.content_encoding);
     try std.testing.expect(decoded.transformed);
     try std.testing.expect(std.mem.eql(u8, encoded_payload, decoded.bytes));
 

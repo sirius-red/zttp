@@ -417,12 +417,12 @@ pub const ConnectionH1 = struct {
     /// Stops the connection thread and releases resources.
     pub fn deinit(self: *ConnectionH1) void {
         self.mailbox.close();
+        self.closeStream();
         if (self.thread) |thread| {
             thread.join();
             self.thread = null;
         }
         self.mailbox.deinit();
-        self.closeStream();
     }
 
     /// Runs the connection loop until the mailbox is closed.
@@ -1257,20 +1257,33 @@ pub const ConnectionH1 = struct {
     /// Closes the active stream if present.
     fn closeStream(self: *ConnectionH1) void {
         if (self.tls_stream) |tls_stream| {
-            tls_stream.deinit();
             self.tls_stream = null;
+            tls_stream.deinit();
         } else if (self.stream) |stream| {
-            stream.close();
             self.stream = null;
+            std.posix.shutdown(stream.handle, .both) catch {};
+            closeNetStream(stream);
         }
         if (self.http2_runtime) |runtime| {
+            self.http2_runtime = null;
             runtime.deinit();
             self.allocator.destroy(runtime);
-            self.http2_runtime = null;
         }
         self.secure_harness_profile = null;
         self.tunnel_established = false;
         self.negotiated_protocol = .http_1_1;
+    }
+
+    /// Closes one network stream while tolerating repeated Windows socket teardown.
+    fn closeNetStream(stream: std.net.Stream) void {
+        if (builtin.os.tag != .windows) {
+            stream.close();
+            return;
+        }
+
+        const windows = std.os.windows;
+        const rc = windows.ws2_32.closesocket(stream.handle);
+        if (rc == windows.ws2_32.SOCKET_ERROR) {}
     }
 
     /// Builds runtime options for the delegated HTTP/2 connection thread.

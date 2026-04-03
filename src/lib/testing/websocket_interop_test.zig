@@ -1,8 +1,8 @@
 //! Server-side WebSocket interop coverage tied to the shared local contract.
 
 const std = @import("std");
-const client = @import("../client.zig");
 const types = @import("../types.zig");
+const websocket_client = @import("../websocket/client.zig");
 const websocket = @import("../websocket/websocket.zig");
 const websocket_frame = @import("../websocket/frame.zig");
 const interop_harness = @import("interop_harness.zig");
@@ -107,29 +107,29 @@ test "client websocket interop capability matrix covers handshake modes for http
 }
 
 test "client websocket session model stays unified across http1 h2 and h3" {
-    const text_message = client.WebSocket.Message{
+    const text_message = websocket_client.Message{
         .kind = .text,
         .bytes = "hello-from-client",
     };
-    const binary_message = client.WebSocket.Message{
+    const binary_message = websocket_client.Message{
         .kind = .binary,
         .bytes = &.{ 0x0a, 0x0b, 0x0c },
     };
 
-    try std.testing.expectEqual(client.WebSocket.MessageKind.text, text_message.kind);
+    try std.testing.expectEqual(websocket_client.MessageKind.text, text_message.kind);
     try std.testing.expectEqualStrings("hello-from-client", text_message.bytes);
-    try std.testing.expectEqual(client.WebSocket.MessageKind.binary, binary_message.kind);
+    try std.testing.expectEqual(websocket_client.MessageKind.binary, binary_message.kind);
     try std.testing.expectEqual(@as(usize, 3), binary_message.bytes.len);
 
     for (websocket_protocols) |protocol| {
         try expectClientWebSocketCapability(protocol);
 
-        const metadata: client.WebSocketSessionMetadata = .{
+        const metadata: websocket_client.SessionMetadata = .{
             .protocol = protocol,
             .transport = expectedTransport(protocol),
             .support = .supported,
         };
-        var session = client.WebSocketSession.init(metadata);
+        var session = websocket_client.Session.init(metadata);
 
         try std.testing.expectEqual(websocket.SessionState.opening, session.state);
         try std.testing.expectEqual(expectedTransport(protocol), session.metadata.transport);

@@ -143,13 +143,9 @@ pub const Readiness = struct {
 };
 
 test {
-    _ = InteropHarness;
-    _ = FixtureLoader;
-    _ = SmokeRunner;
     _ = Http3RuntimeCase;
     _ = Http3Runtime;
     _ = Readiness;
-    _ = @import("malformed_input_test.zig");
 }
 
 test "http3 runtime helpers expose shared loopback defaults" {

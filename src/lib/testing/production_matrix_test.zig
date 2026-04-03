@@ -1,7 +1,7 @@
 //! Client-side production matrix coverage for retry and cache acceptance flows.
 
 const std = @import("std");
-const client = @import("../client.zig");
+const client_failure = @import("../client_failure.zig");
 const fixture_loader = @import("fixture_loader.zig");
 const http_cache = @import("../cache/http_cache.zig");
 const interop_harness = @import("interop_harness.zig");
@@ -137,7 +137,7 @@ test "production matrix cache coverage preserves freshness revalidation and inva
     const config_body = try loader.loadHigherLevelAsset(std.testing.allocator, .cached_config);
     defer std.testing.allocator.free(config_body);
 
-    var cache = client.HttpCache.init(std.testing.allocator);
+    var cache = http_cache.HttpCache.init(std.testing.allocator);
     defer cache.deinit();
 
     try cache.put(.{
@@ -199,7 +199,7 @@ test "production matrix hardening preserves concurrent isolation and negative-pa
 }
 
 test "production matrix client failure surfaces keep protocol and scope explicit" {
-    const h2_failure = client.classifyH2Snapshot(.{
+    const h2_failure = client_failure.classifyH2Snapshot(.{
         .request_count = 2,
         .max_overlapping_streams = 2,
         .next_stream_id = 5,
@@ -211,13 +211,13 @@ test "production matrix client failure surfaces keep protocol and scope explicit
         .last_failure_scope = .connection,
         .last_failure_note = "goaway drained the shared connection",
     }).?;
-    try std.testing.expectEqual(client.FailureIsolationScope.connection, h2_failure.scope);
-    try std.testing.expectEqual(client.ClientFailureCategory.connection, h2_failure.category);
+    try std.testing.expectEqual(client_failure.FailureIsolationScope.connection, h2_failure.scope);
+    try std.testing.expectEqual(client_failure.ClientFailureCategory.connection, h2_failure.category);
     try std.testing.expectEqual(types.NegotiatedProtocol.h2, h2_failure.protocol.?);
 
-    const h3_failure = client.classifyHttp3RuntimeError(error.InvalidStreamEnvelope);
-    try std.testing.expectEqual(client.FailureIsolationScope.stream, h3_failure.scope);
-    try std.testing.expectEqual(client.ClientFailureCategory.stream, h3_failure.category);
+    const h3_failure = client_failure.classifyHttp3RuntimeError(error.InvalidStreamEnvelope);
+    try std.testing.expectEqual(client_failure.FailureIsolationScope.stream, h3_failure.scope);
+    try std.testing.expectEqual(client_failure.ClientFailureCategory.stream, h3_failure.category);
     try std.testing.expectEqual(types.NegotiatedProtocol.h3, h3_failure.protocol.?);
 }
 
