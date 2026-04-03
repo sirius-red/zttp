@@ -608,6 +608,59 @@ pub const ReleaseGateStatus = enum {
     blocked,
 };
 
+/// Final status for one blocking release gate in the maintainer-facing record.
+pub const ReleaseGateDecision = struct {
+    /// Stable blocking gate identifier.
+    gate_id: ReleaseGateId,
+    /// Current pass-or-blocked result for the gate.
+    status: ReleaseGateStatus,
+    /// Stop condition that must be cleared before the gate can pass, if any.
+    stop_condition: ?[]const u8,
+
+    /// Returns true when this gate still blocks the release decision.
+    pub fn blocksRelease(self: ReleaseGateDecision) bool {
+        return self.status == .blocked;
+    }
+};
+
+/// Final maintainer-facing record for the bounded `1.0.0` release decision.
+pub const ReleaseDecisionRecord = struct {
+    /// Candidate version under review.
+    candidate_version: []const u8,
+    /// Ordered results for the four blocking release gates.
+    gate_results: [4]ReleaseGateDecision,
+
+    /// Returns the overall release-decision status implied by the gate results.
+    pub fn overallStatus(self: ReleaseDecisionRecord) ReleaseGateStatus {
+        return releaseDecisionStatusForGateResults(&self.gate_results);
+    }
+
+    /// Returns true when every blocking gate is satisfied.
+    pub fn approved(self: ReleaseDecisionRecord) bool {
+        return self.overallStatus() == .passed;
+    }
+
+    /// Returns the recorded gate result for the requested identifier, if any.
+    pub fn gateFor(self: ReleaseDecisionRecord, gate_id: ReleaseGateId) ?ReleaseGateDecision {
+        for (self.gate_results) |gate| {
+            if (gate.gate_id == gate_id) {
+                return gate;
+            }
+        }
+        return null;
+    }
+
+    /// Returns the first stop condition that still blocks the release, if any.
+    pub fn firstBlockingStopCondition(self: ReleaseDecisionRecord) ?[]const u8 {
+        for (self.gate_results) |gate| {
+            if (gate.blocksRelease()) {
+                return gate.stop_condition;
+            }
+        }
+        return null;
+    }
+};
+
 /// Stable identifier for a release-readiness scenario.
 pub const ReadinessScenarioId = enum {
     /// Windows loopback `server` + `request` reproduction path.
@@ -711,6 +764,23 @@ pub const ProtocolCapabilityEvidence = struct {
         return .verified;
     }
 };
+
+/// Returns the gate status implied by one release-evidence state.
+pub fn gateStatusForEvidence(status: ReleaseEvidenceStatus) ReleaseGateStatus {
+    return if (status == .verified) .passed else .blocked;
+}
+
+/// Returns the overall release-decision status implied by the gate results.
+pub fn releaseDecisionStatusForGateResults(
+    gate_results: []const ReleaseGateDecision,
+) ReleaseGateStatus {
+    for (gate_results) |gate| {
+        if (gate.blocksRelease()) {
+            return .blocked;
+        }
+    }
+    return .passed;
+}
 
 const route_protocols = [_]types.NegotiatedProtocol{ .http_1_1, .h2, .h3 };
 const alpn_dual_protocols = [_]types.NegotiatedProtocol{ .h2, .http_1_1 };
@@ -1951,6 +2021,51 @@ test "protocol capability evidence keeps the blocking release floor explicit" {
     try std.testing.expectEqual(ReleaseEvidenceStatus.verified, h1.overallStatus());
     try std.testing.expectEqual(ReleaseEvidenceStatus.verified, h3.runtime_status);
     try std.testing.expect(hasBlockingHttp3RuntimeCoverage());
+}
+
+test "release decision record rolls up blocking gates and stop conditions" {
+    const record = ReleaseDecisionRecord{
+        .candidate_version = "1.0.0",
+        .gate_results = .{
+            .{
+                .gate_id = .platform_readiness,
+                .status = .passed,
+                .stop_condition = null,
+            },
+            .{
+                .gate_id = .protocol_capability_floor,
+                .status = .blocked,
+                .stop_condition = "restore the blocking capability floor",
+            },
+            .{
+                .gate_id = .public_story_alignment,
+                .status = .blocked,
+                .stop_condition = "align the public stability story",
+            },
+            .{
+                .gate_id = .release_artifact_completeness,
+                .status = .passed,
+                .stop_condition = null,
+            },
+        },
+    };
+
+    try std.testing.expectEqual(ReleaseGateStatus.blocked, record.overallStatus());
+    try std.testing.expect(!record.approved());
+    try std.testing.expectEqual(
+        ReleaseGateStatus.blocked,
+        record.gateFor(.protocol_capability_floor).?.status,
+    );
+    try std.testing.expectEqualStrings(
+        "restore the blocking capability floor",
+        record.firstBlockingStopCondition().?,
+    );
+    try std.testing.expectEqual(
+        ReleaseGateStatus.blocked,
+        releaseDecisionStatusForGateResults(&record.gate_results),
+    );
+    try std.testing.expectEqual(ReleaseGateStatus.passed, gateStatusForEvidence(.verified));
+    try std.testing.expectEqual(ReleaseGateStatus.blocked, gateStatusForEvidence(.missing));
 }
 
 test "hardening peer fixtures load typed loopback and multiprocess descriptors" {
