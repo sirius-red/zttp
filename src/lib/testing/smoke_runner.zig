@@ -5,6 +5,28 @@ const std = @import("std");
 const fixture_loader = @import("fixture_loader.zig");
 const interop_harness = @import("interop_harness.zig");
 
+/// Maximum number of bytes read from one release-verification text file.
+const max_release_file_bytes: usize = 256 * 1024;
+/// Stable README wording that clears the public-story gate.
+const required_readme_story_phrase =
+    "HTTP/1.1, HTTP/2, and HTTP/3 are all part of the default stable promise";
+/// Stable CLI wording that clears the public-story gate.
+const required_cli_story_phrase = "Stable in 1.0.0:";
+/// Legacy wording that must not remain on stable public surfaces.
+const forbidden_cli_story_phrase = "Experimental:";
+/// Stable changelog heading that clears the release-artifact gate.
+const required_release_heading = "## [1.0.0]";
+/// Stable changelog wording that clears the public-story gate.
+const required_changelog_story_phrase =
+    "HTTP/1.1, HTTP/2, and HTTP/3 are all part of the default stable promise";
+/// Annotated tag creation command required by the release-artifact gate.
+const required_tag_create_command =
+    "git tag -a v1.0.0 <release-commit> -m \"zttp v1.0.0\"";
+/// Tag publication command required when the annotated tag is still local-only.
+const required_tag_publish_command = "git push origin v1.0.0";
+/// Version declaration required by the release-artifact gate.
+const required_release_version_line = ".version = \"1.0.0\",";
+
 /// Shell command definition for a smoke scenario.
 pub const SmokeCommand = struct {
     /// Argument vector used to invoke the command.
@@ -185,6 +207,48 @@ pub const HardeningSummary = struct {
     passes_reliability_threshold: bool,
 };
 
+/// Public-surface evidence used to clear the stable `1.0.0` story gate.
+pub const PublicStoryEvidence = struct {
+    /// README stability-story status.
+    readme_status: interop_harness.ReleaseEvidenceStatus,
+    /// CLI help stability-story status.
+    cli_help_status: interop_harness.ReleaseEvidenceStatus,
+    /// Changelog or release-notes stability-story status.
+    changelog_status: interop_harness.ReleaseEvidenceStatus,
+
+    /// Returns the aggregate status for the public-story gate.
+    pub fn overallStatus(self: PublicStoryEvidence) interop_harness.ReleaseEvidenceStatus {
+        if (self.readme_status != .verified) {
+            return self.readme_status;
+        }
+        if (self.cli_help_status != .verified) {
+            return self.cli_help_status;
+        }
+        return self.changelog_status;
+    }
+};
+
+/// Release-artifact evidence used to clear the final `1.0.0` cut gate.
+pub const ReleaseArtifactEvidence = struct {
+    /// Version-line status in `build.zig.zon`.
+    version_status: interop_harness.ReleaseEvidenceStatus,
+    /// Changelog section status for the release.
+    changelog_status: interop_harness.ReleaseEvidenceStatus,
+    /// Annotated tag-plan status, including publication guidance.
+    tag_plan_status: interop_harness.ReleaseEvidenceStatus,
+
+    /// Returns the aggregate status for the release-artifact gate.
+    pub fn overallStatus(self: ReleaseArtifactEvidence) interop_harness.ReleaseEvidenceStatus {
+        if (self.version_status != .verified) {
+            return self.version_status;
+        }
+        if (self.changelog_status != .verified) {
+            return self.changelog_status;
+        }
+        return self.tag_plan_status;
+    }
+};
+
 /// Platform-scoped readiness evidence emitted by the smoke runner.
 pub const PlatformEvidenceReport = struct {
     /// Platform evidence bundle attached to the blocking readiness gate.
@@ -201,6 +265,10 @@ pub const ReleaseDecisionReport = struct {
     protocols: [3]interop_harness.ProtocolCapabilityEvidence,
     /// Dynamic hardening summary that contributes to the capability floor gate.
     hardening: HardeningSummary,
+    /// Public-surface evidence for the stable `1.0.0` promise.
+    public_story: PublicStoryEvidence,
+    /// Release-artifact evidence for the `1.0.0` cut.
+    release_artifacts: ReleaseArtifactEvidence,
 
     /// Returns the blocking-gate status for platform readiness.
     pub fn platformGateStatus(self: ReleaseDecisionReport) interop_harness.ReleaseGateStatus {
@@ -226,13 +294,13 @@ pub const ReleaseDecisionReport = struct {
     }
 
     /// Returns the current status for the public-story gate.
-    pub fn publicStoryGateStatus(_: ReleaseDecisionReport) interop_harness.ReleaseGateStatus {
-        return .blocked;
+    pub fn publicStoryGateStatus(self: ReleaseDecisionReport) interop_harness.ReleaseGateStatus {
+        return interop_harness.gateStatusForEvidence(self.public_story.overallStatus());
     }
 
     /// Returns the current status for the release-artifact gate.
-    pub fn releaseArtifactGateStatus(_: ReleaseDecisionReport) interop_harness.ReleaseGateStatus {
-        return .blocked;
+    pub fn releaseArtifactGateStatus(self: ReleaseDecisionReport) interop_harness.ReleaseGateStatus {
+        return interop_harness.gateStatusForEvidence(self.release_artifacts.overallStatus());
     }
 
     /// Returns the overall release-decision status emitted by the smoke runner.
@@ -288,7 +356,7 @@ pub const ReleaseDecisionReport = struct {
                 .gate_id = .public_story_alignment,
                 .status = self.publicStoryGateStatus(),
                 .stop_condition = if (self.publicStoryGateStatus() == .blocked)
-                    "align README.md, CLI help, CHANGELOG.md, and the readiness summary on the stable 1.0.0 promise"
+                    publicStoryStopCondition(self)
                 else
                     null,
             },
@@ -296,7 +364,7 @@ pub const ReleaseDecisionReport = struct {
                 .gate_id = .release_artifact_completeness,
                 .status = self.releaseArtifactGateStatus(),
                 .stop_condition = if (self.releaseArtifactGateStatus() == .blocked)
-                    "update build.zig.zon, CHANGELOG.md, and the v1.0.0 annotated tag plan in the same verified diff"
+                    releaseArtifactStopCondition(self)
                 else
                     null,
             },
@@ -682,6 +750,8 @@ pub fn captureReleaseDecisionReport(
         allocator,
         fixture_loader.Loader.init(),
     );
+    const public_story = try capturePublicStoryEvidence(allocator);
+    const release_artifacts = try captureReleaseArtifactEvidence(allocator);
 
     return .{
         .platforms = platform_reports,
@@ -691,6 +761,8 @@ pub fn captureReleaseDecisionReport(
             interop_harness.protocolCapabilityEvidenceFor(.h3),
         },
         .hardening = summarizeHardening(metrics),
+        .public_story = public_story,
+        .release_artifacts = release_artifacts,
     };
 }
 
@@ -731,6 +803,22 @@ pub fn writeReleaseDecisionSummary(
             },
         );
     }
+    try writer.print(
+        "public_story: readme={s} cli={s} changelog={s}\n",
+        .{
+            @tagName(report.public_story.readme_status),
+            @tagName(report.public_story.cli_help_status),
+            @tagName(report.public_story.changelog_status),
+        },
+    );
+    try writer.print(
+        "release_artifacts: version={s} changelog={s} tag_plan={s}\n",
+        .{
+            @tagName(report.release_artifacts.version_status),
+            @tagName(report.release_artifacts.changelog_status),
+            @tagName(report.release_artifacts.tag_plan_status),
+        },
+    );
     try writer.print("gate[platform_readiness]: {s}\n", .{@tagName(report.platformGateStatus())});
     try writer.print("gate[protocol_capability_floor]: {s}\n", .{@tagName(report.protocolGateStatus())});
     try writer.print("gate[public_story_alignment]: {s}\n", .{@tagName(report.publicStoryGateStatus())});
@@ -863,6 +951,108 @@ fn protocolStopCondition(report: ReleaseDecisionReport) []const u8 {
     return "restore verified blocking capability-floor evidence across HTTP/1.1, HTTP/2, and HTTP/3";
 }
 
+/// Returns the current stop condition for the public-story gate.
+fn publicStoryStopCondition(report: ReleaseDecisionReport) []const u8 {
+    if (report.public_story.readme_status != .verified) {
+        return "align README.md on the stable 1.0.0 promise for HTTP/1.1, HTTP/2, and HTTP/3";
+    }
+    if (report.public_story.cli_help_status != .verified) {
+        return "align CLI help text on the stable 1.0.0 promise and remove experimental wording";
+    }
+    return "align CHANGELOG.md or the release notes on the stable 1.0.0 promise";
+}
+
+/// Returns the current stop condition for the release-artifact gate.
+fn releaseArtifactStopCondition(report: ReleaseDecisionReport) []const u8 {
+    if (report.release_artifacts.version_status != .verified) {
+        return "update build.zig.zon to declare version 1.0.0";
+    }
+    if (report.release_artifacts.changelog_status != .verified) {
+        return "add the matching 1.0.0 changelog or release-notes section";
+    }
+    return "record the annotated v1.0.0 tag plan and publication command in CHANGELOG.md";
+}
+
+/// Captures the aggregate public-story evidence from repository sources.
+fn capturePublicStoryEvidence(
+    allocator: std.mem.Allocator,
+) !PublicStoryEvidence {
+    const readme = try readRepoFileAlloc(allocator, "README.md");
+    defer allocator.free(readme);
+    const cli_source = try readRepoFileAlloc(allocator, "src/cli/main.zig");
+    defer allocator.free(cli_source);
+    const changelog = try readRepoFileAlloc(allocator, "CHANGELOG.md");
+    defer allocator.free(changelog);
+
+    return publicStoryEvidenceFromSources(readme, cli_source, changelog);
+}
+
+/// Captures the aggregate release-artifact evidence from repository sources.
+fn captureReleaseArtifactEvidence(
+    allocator: std.mem.Allocator,
+) !ReleaseArtifactEvidence {
+    const build_zon = try readRepoFileAlloc(allocator, "build.zig.zon");
+    defer allocator.free(build_zon);
+    const changelog = try readRepoFileAlloc(allocator, "CHANGELOG.md");
+    defer allocator.free(changelog);
+
+    return releaseArtifactEvidenceFromSources(build_zon, changelog);
+}
+
+/// Reads one repository text file with the standard release-verification limit.
+fn readRepoFileAlloc(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) ![]u8 {
+    return try std.fs.cwd().readFileAlloc(allocator, path, max_release_file_bytes);
+}
+
+/// Classifies the public-story gate from explicit repository source strings.
+fn publicStoryEvidenceFromSources(
+    readme: []const u8,
+    cli_source: []const u8,
+    changelog: []const u8,
+) PublicStoryEvidence {
+    return .{
+        .readme_status = if (std.mem.containsAtLeast(u8, readme, 1, required_readme_story_phrase))
+            .verified
+        else
+            .partial,
+        .cli_help_status = if (std.mem.containsAtLeast(u8, cli_source, 2, required_cli_story_phrase) and
+            !std.mem.containsAtLeast(u8, cli_source, 1, forbidden_cli_story_phrase))
+            .verified
+        else
+            .partial,
+        .changelog_status = if (std.mem.containsAtLeast(u8, changelog, 1, required_release_heading) and
+            std.mem.containsAtLeast(u8, changelog, 1, required_changelog_story_phrase))
+            .verified
+        else
+            .partial,
+    };
+}
+
+/// Classifies the release-artifact gate from explicit repository source strings.
+fn releaseArtifactEvidenceFromSources(
+    build_zon: []const u8,
+    changelog: []const u8,
+) ReleaseArtifactEvidence {
+    return .{
+        .version_status = if (std.mem.containsAtLeast(u8, build_zon, 1, required_release_version_line))
+            .verified
+        else
+            .partial,
+        .changelog_status = if (std.mem.containsAtLeast(u8, changelog, 1, required_release_heading))
+            .verified
+        else
+            .partial,
+        .tag_plan_status = if (std.mem.containsAtLeast(u8, changelog, 1, required_tag_create_command) and
+            std.mem.containsAtLeast(u8, changelog, 1, required_tag_publish_command))
+            .verified
+        else
+            .partial,
+    };
+}
+
 /// Returns a deterministic release-decision report for pure unit tests.
 fn sampleReleaseDecisionReport() ReleaseDecisionReport {
     return .{
@@ -903,6 +1093,16 @@ fn sampleReleaseDecisionReport() ReleaseDecisionReport {
             .excluded_flows = 30,
             .failure_count = 9,
         }),
+        .public_story = .{
+            .readme_status = .verified,
+            .cli_help_status = .verified,
+            .changelog_status = .verified,
+        },
+        .release_artifacts = .{
+            .version_status = .verified,
+            .changelog_status = .verified,
+            .tag_plan_status = .verified,
+        },
     };
 }
 
@@ -1012,6 +1212,8 @@ test "release decision summary prints blocking gate lines" {
     try writeReleaseDecisionSummary(bytes.writer(std.testing.allocator), report);
     try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "gate[platform_readiness]:"));
     try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "platform[linux]: gate=blocked evidence=missing cli=missing bundle=missing"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "public_story: readme=verified cli=verified changelog=verified"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "release_artifacts: version=verified changelog=verified tag_plan=verified"));
     try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "gate_stop_condition[platform_readiness]: capture this platform evidence bundle"));
     try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "release_decision_stop_condition: capture this platform evidence bundle"));
     try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "release_decision:"));
@@ -1058,4 +1260,69 @@ test "round trip evidence status preserves verified and partial classifications"
     try std.testing.expectEqual(.verified, evidenceStatusForRoundTrip(.success));
     try std.testing.expectEqual(.partial, evidenceStatusForRoundTrip(.known_socket_failure));
     try std.testing.expectEqual(.partial, evidenceStatusForRoundTrip(.unexpected_failure));
+}
+
+test "public story evidence requires stable multi-protocol wording across release surfaces" {
+    const evidence = publicStoryEvidenceFromSources(
+        "HTTP/1.1, HTTP/2, and HTTP/3 are all part of the default stable promise",
+        "Stable in 1.0.0:\nStable in 1.0.0:\n",
+        "## [1.0.0]\nHTTP/1.1, HTTP/2, and HTTP/3 are all part of the default stable promise\n",
+    );
+
+    try std.testing.expectEqual(.verified, evidence.readme_status);
+    try std.testing.expectEqual(.verified, evidence.cli_help_status);
+    try std.testing.expectEqual(.verified, evidence.changelog_status);
+    try std.testing.expectEqual(.verified, evidence.overallStatus());
+
+    const blocked = publicStoryEvidenceFromSources(
+        "HTTP/1.1, HTTP/2, and HTTP/3 are all part of the default stable promise",
+        "Stable in 1.0.0:\nExperimental:\n",
+        "## [1.0.0]\nHTTP/1.1, HTTP/2, and HTTP/3 are all part of the default stable promise\n",
+    );
+    try std.testing.expectEqual(.partial, blocked.cli_help_status);
+    try std.testing.expectEqual(.partial, blocked.overallStatus());
+}
+
+test "release artifact evidence requires version line changelog section and tag plan" {
+    const evidence = releaseArtifactEvidenceFromSources(
+        ".version = \"1.0.0\",\n",
+        "## [1.0.0]\n" ++ required_tag_create_command ++ "\n" ++ required_tag_publish_command ++ "\n",
+    );
+
+    try std.testing.expectEqual(.verified, evidence.version_status);
+    try std.testing.expectEqual(.verified, evidence.changelog_status);
+    try std.testing.expectEqual(.verified, evidence.tag_plan_status);
+    try std.testing.expectEqual(.verified, evidence.overallStatus());
+
+    const blocked = releaseArtifactEvidenceFromSources(
+        ".version = \"0.11.1\",\n",
+        "## [0.11.1]\n",
+    );
+    try std.testing.expectEqual(.partial, blocked.version_status);
+    try std.testing.expectEqual(.partial, blocked.changelog_status);
+    try std.testing.expectEqual(.partial, blocked.tag_plan_status);
+    try std.testing.expectEqual(.partial, blocked.overallStatus());
+}
+
+test "release decision report clears the platform gate only when Windows and Linux both verify" {
+    var report = sampleReleaseDecisionReport();
+    report.platforms[1] = .{
+        .evidence = .{
+            .scenario = interop_harness.readinessScenarioForPlatform(.linux).?,
+            .status = .verified,
+            .cli_roundtrip_status = .verified,
+            .summary = "current-host CLI round-trip verified",
+            .failure_signature = null,
+        },
+        .round_trip_status = .success,
+    };
+
+    try std.testing.expectEqual(.passed, report.platformGateStatus());
+    try std.testing.expect(!report.hasIncompletePlatformEvidence());
+
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(std.testing.allocator);
+    try writeReleaseDecisionSummary(bytes.writer(std.testing.allocator), report);
+    try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "platform[windows]: gate=passed evidence=verified cli=verified bundle=verified"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, bytes.items, 1, "platform[linux]: gate=passed evidence=verified cli=verified bundle=verified"));
 }

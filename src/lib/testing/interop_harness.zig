@@ -818,6 +818,25 @@ pub const blocking_capability_features = [_]CapabilityFeatureId{
     .hardening_matrix,
 };
 
+/// Returns the owning feature surface for one blocking capability-floor entry.
+fn expectedSurfaceForCapabilityFeature(feature: CapabilityFeatureId) types.FeatureSurface {
+    return switch (feature) {
+        .server_routing,
+        .server_middleware,
+        .server_static_files,
+        .server_compression,
+        .server_websocket,
+        => .server,
+        .client_decompression,
+        .client_multipart,
+        .client_retry,
+        .client_cache,
+        .client_websocket,
+        => .client,
+        .hardening_matrix => .hardening,
+    };
+}
+
 /// JSON shape for one peer startup command fixture.
 const JsonStartupCommand = struct {
     cwd: []const u8,
@@ -2021,6 +2040,20 @@ test "protocol capability evidence keeps the blocking release floor explicit" {
     try std.testing.expectEqual(ReleaseEvidenceStatus.verified, h1.overallStatus());
     try std.testing.expectEqual(ReleaseEvidenceStatus.verified, h3.runtime_status);
     try std.testing.expect(hasBlockingHttp3RuntimeCoverage());
+}
+
+test "blocking capability floor stays supported across all release protocols" {
+    const release_protocols = [_]types.NegotiatedProtocol{ .http_1_1, .h2, .h3 };
+
+    for (blocking_capability_features) |feature| {
+        for (release_protocols) |protocol| {
+            const capability = capabilityFor(feature, protocol).?;
+            try std.testing.expectEqual(feature, capability.feature);
+            try std.testing.expectEqual(expectedSurfaceForCapabilityFeature(feature), capability.surface);
+            try std.testing.expectEqual(protocol, capability.protocol);
+            try std.testing.expectEqual(types.FeatureSupportLevel.supported, capability.support);
+        }
+    }
 }
 
 test "release decision record rolls up blocking gates and stop conditions" {

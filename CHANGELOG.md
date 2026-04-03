@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-04-03
+
+### Changed
+
+- Finalized the bounded `1.0.0` release-verification flow so native Windows
+  and local Linux each produce separate blocking readiness evidence, while the
+  same readiness summary keeps the protocol capability floor explicit across
+  HTTP/1.1, HTTP/2, and HTTP/3.
+- Declared that HTTP/1.1, HTTP/2, and HTTP/3 are all part of the default
+  stable promise for the verified routing, middleware, static-file,
+  compression, WebSocket, decompression, multipart, retry, cache, and
+  hardening capability floor.
+
+### Release Verification
+
+- Required gates: platform readiness, protocol capability floor, public-story
+  alignment, and release artifact completeness.
+- Required release-artifact plan:
+  `git tag -a v1.0.0 <release-commit> -m "zttp v1.0.0"`
+- If the annotated tag exists only locally after the release commit is ready,
+  publish it with:
+  `git push origin v1.0.0`
+
 ## [0.11.1] - 2026-04-03
 
 ### Fixed
