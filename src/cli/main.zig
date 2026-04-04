@@ -52,6 +52,8 @@ const request_help =
     \\Notes:
     \\  http:// and https:// URLs are accepted.
     \\  Supported encoded responses are decoded through the library-owned client surface.
+    \\  Clean-checkout TLS validation uses generated credentials under `.tmp/local-certs`.
+    \\  Example: zttp request --tls-ca .tmp/local-certs/roots.pem https://127.0.0.1:4433/health
     \\
 ;
 
@@ -84,6 +86,13 @@ const server_help =
     \\  POST /echo
     \\  GET  /assets/site.css
     \\  GET  /ws/chat
+    \\
+    \\Clean-checkout TLS validation:
+    \\  Generate credentials first with one of:
+    \\    scripts\powershell\generate-local-test-certs.ps1 -OutDir .tmp\local-certs
+    \\    scripts/bash/generate-local-test-certs.sh .tmp/local-certs
+    \\  Example:
+    \\    zttp server --listen 127.0.0.1 --port 4433 --tls-cert .tmp/local-certs/loopback-server.pem --tls-key .tmp/local-certs/loopback-server.key --http2
     \\
 ;
 
@@ -1036,7 +1045,12 @@ test "cli help advertises the stable 1.0.0 multi-protocol surface" {
     try std.testing.expect(std.mem.containsAtLeast(u8, request_help_http3, 1, "same default surface as HTTP/1.1 and HTTP/2"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, request_help_http3, 1, "Experimental:"));
 
+    try std.testing.expect(std.mem.containsAtLeast(u8, request_help, 1, ".tmp/local-certs/roots.pem"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, request_help, 1, "https://127.0.0.1:4433/health"));
     try std.testing.expect(std.mem.containsAtLeast(u8, server_help, 1, "Enable the stable HTTP/2 path on the library-owned server"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, server_help, 1, "scripts\\powershell\\generate-local-test-certs.ps1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, server_help, 1, "scripts/bash/generate-local-test-certs.sh"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, server_help, 1, ".tmp/local-certs/loopback-server.pem"));
     try std.testing.expect(std.mem.containsAtLeast(u8, server_help_http3, 1, "Stable in 1.0.0:"));
     try std.testing.expect(std.mem.containsAtLeast(u8, server_help_http3, 1, "stable UDP-backed HTTP/3 runtime"));
     try std.testing.expect(std.mem.containsAtLeast(u8, server_help_http3, 1, "server surface as HTTP/1.1 and HTTP/2"));

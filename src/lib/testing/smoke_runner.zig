@@ -62,19 +62,24 @@ pub const SecureReadinessPlan = struct {
     generated: testing_support.SecureValidation.GeneratedCredentialSet,
     /// Platform-specific credential-generation command metadata.
     generator: GeneratedCredentialCommand,
-    /// Formatted secure request URL.
-    request_url: []u8,
+    /// Formatted secure `/health` request URL.
+    health_request_url: []u8,
+    /// Formatted secure `/echo` request URL.
+    echo_request_url: []u8,
     /// Formatted listener port argument.
     port_arg: []u8,
     /// Server CLI arguments following the binary path.
     server_args: [10][]const u8,
-    /// Request CLI arguments following the binary path.
-    request_args: [4][]const u8,
+    /// `/health` request CLI arguments following the binary path.
+    health_request_args: [4][]const u8,
+    /// `/echo` request CLI arguments following the binary path.
+    echo_request_args: [4][]const u8,
 
     /// Releases the owned secure readiness plan buffers.
     pub fn deinit(self: *SecureReadinessPlan, allocator: std.mem.Allocator) void {
         self.generated.deinit(allocator);
-        allocator.free(self.request_url);
+        allocator.free(self.health_request_url);
+        allocator.free(self.echo_request_url);
         allocator.free(self.port_arg);
         self.* = undefined;
     }
@@ -84,9 +89,14 @@ pub const SecureReadinessPlan = struct {
         return self.server_args[0..];
     }
 
-    /// Returns the request CLI arguments following the binary path.
+    /// Returns the `/health` request CLI arguments following the binary path.
     pub fn requestArgv(self: *const SecureReadinessPlan) []const []const u8 {
-        return self.request_args[0..];
+        return self.health_request_args[0..];
+    }
+
+    /// Returns the `/echo` request CLI arguments following the binary path.
+    pub fn echoRequestArgv(self: *const SecureReadinessPlan) []const []const u8 {
+        return self.echo_request_args[0..];
     }
 };
 
@@ -681,7 +691,7 @@ pub fn secureReadinessPlan(allocator: std.mem.Allocator) !SecureReadinessPlan {
     var generated = try testing_support.SecureValidation.generatedCredentialSet(allocator);
     errdefer generated.deinit(allocator);
 
-    const request_url = try std.fmt.allocPrint(
+    const health_request_url = try std.fmt.allocPrint(
         allocator,
         "https://{s}:{d}{s}",
         .{
@@ -690,14 +700,24 @@ pub fn secureReadinessPlan(allocator: std.mem.Allocator) !SecureReadinessPlan {
             generated.endpoint.path,
         },
     );
-    errdefer allocator.free(request_url);
+    errdefer allocator.free(health_request_url);
+    const echo_request_url = try std.fmt.allocPrint(
+        allocator,
+        "https://{s}:{d}/echo",
+        .{
+            generated.endpoint.host,
+            generated.endpoint.port.toInt(),
+        },
+    );
+    errdefer allocator.free(echo_request_url);
     const port_arg = try std.fmt.allocPrint(allocator, "{d}", .{generated.listener.endpoint.port.toInt()});
     errdefer allocator.free(port_arg);
 
     return .{
         .generated = generated,
         .generator = generatedCredentialCommandForCurrentPlatform(),
-        .request_url = request_url,
+        .health_request_url = health_request_url,
+        .echo_request_url = echo_request_url,
         .port_arg = port_arg,
         .server_args = .{
             "server",
@@ -711,11 +731,17 @@ pub fn secureReadinessPlan(allocator: std.mem.Allocator) !SecureReadinessPlan {
             generated.paths.private_key_path,
             "--http2",
         },
-        .request_args = .{
+        .health_request_args = .{
             "request",
             "--tls-ca",
             generated.paths.roots_path,
-            request_url,
+            health_request_url,
+        },
+        .echo_request_args = .{
+            "request",
+            "--tls-ca",
+            generated.paths.roots_path,
+            echo_request_url,
         },
     };
 }
@@ -1230,7 +1256,7 @@ test "default smoke scenarios cover quickstart commands" {
     try std.testing.expectEqualStrings("request-https", request_https.name);
 }
 
-test "secure readiness plan uses generated local credentials" {
+test "secure readiness plan uses generated local credentials for health and echo probes" {
     var plan = try secureReadinessPlan(std.testing.allocator);
     defer plan.deinit(std.testing.allocator);
 
@@ -1239,6 +1265,9 @@ test "secure readiness plan uses generated local credentials" {
     try std.testing.expectEqualStrings("--tls-ca", plan.requestArgv()[1]);
     try std.testing.expect(std.mem.endsWith(u8, plan.requestArgv()[2], "roots.pem"));
     try std.testing.expectEqualStrings("https://127.0.0.1:4433/health", plan.requestArgv()[3]);
+    try std.testing.expectEqualStrings("--tls-ca", plan.echoRequestArgv()[1]);
+    try std.testing.expect(std.mem.endsWith(u8, plan.echoRequestArgv()[2], "roots.pem"));
+    try std.testing.expectEqualStrings("https://127.0.0.1:4433/echo", plan.echoRequestArgv()[3]);
 }
 
 test "generated credential command matches the current platform" {

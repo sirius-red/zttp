@@ -97,6 +97,82 @@ pick `h2` or `http/1.1` per request.
   `src/lib/testing/interop_harness.zig`, including the CLI-oriented readiness
   round-trip coverage.
 
+## Secure Validation Workflow
+
+Use the repository-owned credential generators to validate the secure listener
+from a clean checkout without committing local secrets.
+
+Prepare `.tmp/` cache roots before running the local suite:
+
+```powershell
+New-Item -ItemType Directory -Force .tmp, .tmp\zig-cache-win, .tmp\zig-global-win | Out-Null
+```
+
+```sh
+mkdir -p .tmp .tmp/zig-cache-linux .tmp/zig-global-linux
+```
+
+Generate local credentials under `.tmp/local-certs`:
+
+```powershell
+scripts\powershell\generate-local-test-certs.ps1 -OutDir .tmp\local-certs
+```
+
+```sh
+scripts/bash/generate-local-test-certs.sh .tmp/local-certs
+```
+
+Run the canonical local verification suite with `.tmp/` cache paths:
+
+```powershell
+zig build test --cache-dir .tmp\zig-cache-win --global-cache-dir .tmp\zig-global-win
+```
+
+```sh
+zig build test --cache-dir .tmp/zig-cache-linux --global-cache-dir .tmp/zig-global-linux
+```
+
+Start one secure listener on the library-owned server surface:
+
+```powershell
+zig build run -- server --listen 127.0.0.1 --port 4433 --tls-cert .tmp/local-certs/loopback-server.pem --tls-key .tmp/local-certs/loopback-server.key --http2
+```
+
+Probe the same endpoint with the generated trust bundle:
+
+```powershell
+zig build run -- request --tls-ca .tmp/local-certs/roots.pem https://127.0.0.1:4433/health
+zig build run -- request --tls-ca .tmp/local-certs/roots.pem https://127.0.0.1:4433/echo
+```
+
+## Secure Capability Status
+
+Supported behavior:
+
+- Secure requests depend on the peer's live TLS and ALPN result, not on a
+  predefined endpoint catalog.
+- The default secure listener advertises `h2` and `http/1.1` on one endpoint
+  when both protocols are enabled.
+- Invalid or unsupported negotiated protocol tokens fail explicitly before a
+  success response is reported.
+
+Compatibility fallback behavior:
+
+- Peers that support only `http/1.1`, or omit ALPN entirely, stay on the
+  HTTP/1.1 compatibility path.
+- Additional trust roots remain opt-in through `--tls-ca` or the typed
+  `TlsConfig` fields; untrusted secure peers fail by default.
+
+Known limitations:
+
+- The clean-checkout secure flow is for local validation only and expects the
+  generated artifacts under `.tmp/local-certs`.
+- The published secure CLI walkthrough validates `/health` and `/echo` on the
+  shared listener; broader route coverage remains anchored in the interop and
+  loopback harness tests.
+- Broader interoperability hardening beyond the current local verification
+  matrix remains follow-up work after the `1.0.0` capability floor.
+
 ## Roadmap
 
 ZTTP is progressing toward a `1.0.0` release with one public stability story:
@@ -135,6 +211,8 @@ Longer-term follow-up after `1.0.0`:
 running the full library and CLI test suites from the build graph. Internally,
 the library suite is split into dedicated unit and integration roots so local
 logic checks do not share the same entrypoint as loopback/runtime coverage.
+Within this repository, keep Zig cache directories under `.tmp/` when running
+the local suite.
 
 ```shell
 zig build test

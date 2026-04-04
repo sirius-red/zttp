@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-04-04
+
+### Changed
+
+- Published the clean-checkout secure validation workflow around generated local
+  credentials in `.tmp/local-certs`, including the canonical server/request
+  commands and `.tmp/` cache-root guidance for local verification.
+- Split the audited secure-flow guidance into supported behavior,
+  compatibility fallback behavior, and known limitations across the README,
+  quickstart, fixture documentation, and CLI help text.
+
 ## [1.0.1] - 2026-04-04
 
 ### Fixed
@@ -15,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preserved the listener-advertised ALPN metadata across secure HTTP/1.1,
   HTTP/2, and HTTP/3 requests so handlers and interop coverage observe the
   same negotiated-session view.
+
+### Changed
 
 ## [1.0.0] - 2026-04-03
 

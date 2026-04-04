@@ -1,6 +1,6 @@
 .{
     .name = .zttp,
-    .version = "1.0.1",
+    .version = "1.0.2",
     .fingerprint = 0x6d6892a642d9a113,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{},

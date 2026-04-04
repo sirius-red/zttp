@@ -768,3 +768,54 @@ test "command capture matches caller-provided socket signature" {
     try std.testing.expectEqual(SocketFailureKind.known_signature, failure.kind);
     try std.testing.expectEqualStrings("std.net.Stream.read", failure.signature);
 }
+
+test "generated secure-validation artifacts stay in first-party repository paths" {
+    try std.fs.cwd().access("scripts/powershell/generate-local-test-certs.ps1", .{});
+    try std.fs.cwd().access("scripts/bash/generate-local-test-certs.sh", .{});
+    try std.fs.cwd().access("src/lib/testing/fixtures/README.md", .{});
+    try std.fs.cwd().access(".specify/specs/fix/audit-gap-remediation/contracts/secure-runtime.openapi.yaml", .{});
+    try std.fs.cwd().access(".specify/specs/fix/audit-gap-remediation/quickstart.md", .{});
+}
+
+test "fixture documentation and secure contract reference generated local credentials" {
+    const fixture_readme = try std.fs.cwd().readFileAlloc(
+        std.testing.allocator,
+        "src/lib/testing/fixtures/README.md",
+        128 * 1024,
+    );
+    defer std.testing.allocator.free(fixture_readme);
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        fixture_readme,
+        1,
+        "scripts/powershell/generate-local-test-certs.ps1",
+    ));
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        fixture_readme,
+        1,
+        ".tmp/local-certs/loopback-server.pem",
+    ));
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        fixture_readme,
+        1,
+        ".tmp/local-certs/roots.pem",
+    ));
+
+    const contract = try std.fs.cwd().readFileAlloc(
+        std.testing.allocator,
+        ".specify/specs/fix/audit-gap-remediation/contracts/secure-runtime.openapi.yaml",
+        128 * 1024,
+    );
+    defer std.testing.allocator.free(contract);
+    try std.testing.expect(std.mem.containsAtLeast(u8, contract, 1, "/health"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contract, 1, "/echo"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contract, 1, ".tmp/local-certs/roots.pem"));
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        contract,
+        1,
+        "scripts/bash/generate-local-test-certs.sh",
+    ));
+}

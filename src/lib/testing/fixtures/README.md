@@ -25,6 +25,26 @@ tests.
 These personas must stay aligned with the typed metadata in
 `src/lib/testing/interop_harness.zig`.
 
+## Generated local credentials
+
+Clean-checkout secure validation does not rely on committed secret material.
+Generate the local credential set under `.tmp/local-certs` with one of the
+first-party commands below before running the published secure server/request
+ walkthrough:
+
+- `scripts/powershell/generate-local-test-certs.ps1 -OutDir .tmp/local-certs`
+- `scripts/bash/generate-local-test-certs.sh .tmp/local-certs`
+
+Expected generated outputs:
+
+- `.tmp/local-certs/loopback-server.pem`
+- `.tmp/local-certs/loopback-server.key`
+- `.tmp/local-certs/roots.pem`
+
+The published secure CLI walkthrough uses the generated trust bundle for
+`/health` and `/echo`, while the broader validation contract lives in
+`.specify/specs/fix/audit-gap-remediation/contracts/secure-runtime.openapi.yaml`.
+
 ## Intended layout
 
 - `certs/`: loopback certificates, keys, and trust roots for TLS and ALPN tests
@@ -68,3 +88,5 @@ These personas must stay aligned with the typed metadata in
   test
 - Keep unsupported-protocol fixtures limited to local negative testing; they
   must never become fallback candidates
+- Keep generated local credentials ephemeral under `.tmp/local-certs`; do not
+  replace the committed fixture inventory with local-only artifacts
