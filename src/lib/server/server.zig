@@ -27,12 +27,18 @@ pub const Compression = compression;
 pub const WebSocketServer = websocket_server;
 /// Public server configuration alias.
 pub const ServerConfig = Types.ServerConfig;
+/// Public secure-listener plan alias.
+pub const SecureListenerPlan = Types.SecureListenerPlan;
+/// Public secure-listener metadata alias.
+pub const SecureListenerMetadata = Types.SecureListenerMetadata;
 /// Public server request alias.
 pub const ServerRequest = Types.ServerRequest;
 /// Public response writer alias.
 pub const ServerResponseWriter = Types.ServerResponseWriter;
 /// Public negotiated session metadata alias.
 pub const NegotiatedSession = Types.NegotiatedSession;
+/// Public secure-listener negotiation failure alias.
+pub const NegotiationFailureCategory = Types.NegotiationFailureCategory;
 /// Public route definition alias.
 pub const Route = Types.Route;
 /// Public shared request behavior alias.

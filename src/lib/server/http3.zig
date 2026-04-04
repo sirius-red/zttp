@@ -473,6 +473,7 @@ pub const Runtime = struct {
             .session = .{
                 .peer = peer,
                 .identity_token = identity_token,
+                .advertised_protocols = &.{.h3},
                 .negotiated_protocol = .h3,
                 .request_version = .http_3,
                 .secure = true,

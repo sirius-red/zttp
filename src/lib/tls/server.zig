@@ -12,6 +12,8 @@ pub const Error = config.ValidationError || error{
     MissingPrivateKey,
     /// No shared ALPN protocol could be selected for the peer.
     NoSharedProtocol,
+    /// The peer selected an invalid or unsupported protocol token.
+    UnsupportedNegotiatedProtocol,
     /// The listener certificate chain could not be opened or read.
     InvalidCertificateChain,
     /// The listener private key could not be opened or read.
@@ -59,9 +61,9 @@ pub const LoadedIdentity = struct {
 
 /// Builds a listener plan from the shared TLS configuration.
 pub fn buildListenerPlan(tls: core.TlsConfig) Error!ListenerPlan {
-    try config.validate(tls);
     const certificate_chain_path = tls.certificate_chain_path orelse return error.MissingCertificateChain;
     const private_key_path = tls.private_key_path orelse return error.MissingPrivateKey;
+    try config.validate(tls);
 
     return .{
         .certificate_chain_path = certificate_chain_path,
@@ -104,15 +106,38 @@ pub fn negotiateProtocol(
             }
         }
     }
+    return error.NoSharedProtocol;
+}
 
-    if (containsProtocol(plan.alpn_protocols, .http_1_1)) {
+/// Resolves the final negotiated protocol from the live listener outcome.
+pub fn resolveNegotiatedProtocol(
+    plan: ListenerPlan,
+    advertised_protocols: []const core.NegotiatedProtocol,
+    selected_protocol_token: ?[]const u8,
+    omits_alpn: bool,
+) Error!NegotiationResult {
+    if (selected_protocol_token) |token| {
+        const protocol = parseNegotiatedProtocolToken(token) catch return error.UnsupportedNegotiatedProtocol;
+        if (!containsProtocol(plan.alpn_protocols, protocol)) {
+            return error.NoSharedProtocol;
+        }
+        return .{
+            .protocol = protocol,
+            .identity_token = plan.identity_token,
+        };
+    }
+
+    if (omits_alpn) {
+        if (!containsProtocol(plan.alpn_protocols, .http_1_1)) {
+            return error.NoSharedProtocol;
+        }
         return .{
             .protocol = .http_1_1,
             .identity_token = plan.identity_token,
         };
     }
 
-    return error.NoSharedProtocol;
+    return negotiateProtocol(plan, advertised_protocols);
 }
 
 /// Returns true when the protocol appears in the list.
@@ -123,6 +148,17 @@ fn containsProtocol(protocols: []const core.NegotiatedProtocol, expected: core.N
         }
     }
     return false;
+}
+
+/// Parses a negotiated ALPN token into the shared protocol enum.
+fn parseNegotiatedProtocolToken(token: []const u8) error{UnsupportedToken}!core.NegotiatedProtocol {
+    if (std.mem.eql(u8, token, "h2")) {
+        return .h2;
+    }
+    if (std.mem.eql(u8, token, "http/1.1")) {
+        return .http_1_1;
+    }
+    return error.UnsupportedToken;
 }
 
 /// Loads one identity file and maps failures into the provided server-side error.
@@ -152,6 +188,14 @@ test "tls server planning requires certificate and key material" {
     try std.testing.expectError(error.MissingCertificateChain, buildListenerPlan(tls));
 }
 
+test "tls server planning rejects a missing private key explicitly" {
+    var tls = core.TlsConfig.default();
+    tls.verify = .insecure;
+    tls.certificate_chain_path = "server.pem";
+
+    try std.testing.expectError(error.MissingPrivateKey, buildListenerPlan(tls));
+}
+
 test "tls server negotiation honors advertised protocol order" {
     var tls = core.TlsConfig.default();
     tls.verify = .insecure;
@@ -163,6 +207,43 @@ test "tls server negotiation honors advertised protocol order" {
     const result = try negotiateProtocol(plan, &.{ .http_1_1, .h2 });
 
     try std.testing.expectEqual(core.NegotiatedProtocol.h2, result.protocol);
+}
+
+test "tls server negotiation falls back to http1 when alpn is omitted" {
+    var tls = core.TlsConfig.default();
+    tls.verify = .insecure;
+    tls.certificate_chain_path = "server.pem";
+    tls.private_key_path = "server.key";
+
+    const plan = try buildListenerPlan(tls);
+    const result = try resolveNegotiatedProtocol(plan, &.{}, null, true);
+
+    try std.testing.expectEqual(core.NegotiatedProtocol.http_1_1, result.protocol);
+}
+
+test "tls server negotiation rejects invalid selected protocol tokens explicitly" {
+    var tls = core.TlsConfig.default();
+    tls.verify = .insecure;
+    tls.certificate_chain_path = "server.pem";
+    tls.private_key_path = "server.key";
+
+    const plan = try buildListenerPlan(tls);
+
+    try std.testing.expectError(
+        error.UnsupportedNegotiatedProtocol,
+        resolveNegotiatedProtocol(plan, &.{ .h2, .http_1_1 }, "spdy/3", false),
+    );
+}
+
+test "tls server negotiation rejects unsupported peer offers without silent fallback" {
+    var tls = core.TlsConfig.default();
+    tls.verify = .insecure;
+    tls.certificate_chain_path = "server.pem";
+    tls.private_key_path = "server.key";
+
+    const plan = try buildListenerPlan(tls);
+
+    try std.testing.expectError(error.NoSharedProtocol, negotiateProtocol(plan, &.{.h3}));
 }
 
 test "tls server loads loopback identity fixtures from a listener plan" {

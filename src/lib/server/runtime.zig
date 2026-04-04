@@ -3,13 +3,24 @@
 const std = @import("std");
 const core = @import("../types.zig");
 const tls_server = @import("../tls/server.zig");
-const interop_harness = @import("../testing/interop_harness.zig");
 const server_types = @import("types.zig");
 const app = @import("app.zig");
 const http1 = @import("http1.zig");
 const http2 = @import("http2.zig");
 const http3 = @import("http3.zig");
 const socket_io = @import("../util/socket_io.zig");
+
+const http_request_methods = [_][]const u8{
+    "GET ",
+    "HEAD ",
+    "POST ",
+    "PUT ",
+    "DELETE ",
+    "CONNECT ",
+    "OPTIONS ",
+    "TRACE ",
+    "PATCH ",
+};
 
 /// Error set returned by server startup and serving operations.
 pub const Error = anyerror;
@@ -277,10 +288,11 @@ pub const Server = struct {
         prefix: []const u8,
     ) !server_types.NegotiatedSession {
         if (self.secure_listener_plan) |secure_listener_plan| {
-            const secure_protocol = try determineSecureProtocol(self.config, secure_listener_plan, prefix, self.port());
+            const secure_protocol = try determineSecureProtocol(secure_listener_plan, prefix);
             return .{
                 .peer = connection.address,
                 .identity_token = secure_listener_plan.identity_token,
+                .advertised_protocols = secure_listener_plan.alpn_protocols,
                 .negotiated_protocol = secure_protocol,
                 .request_version = secure_protocol.asVersion(),
                 .secure = true,
@@ -291,6 +303,7 @@ pub const Server = struct {
         return .{
             .peer = connection.address,
             .identity_token = null,
+            .advertised_protocols = &.{.http_1_1},
             .negotiated_protocol = .http_1_1,
             .request_version = .http_1_1,
             .secure = false,
@@ -322,30 +335,30 @@ fn buildSecureListenerPlan(
 
 /// Chooses the secure negotiated protocol for one accepted loopback connection.
 fn determineSecureProtocol(
-    config: server_types.ServerConfig,
     plan: server_types.SecureListenerPlan,
     prefix: []const u8,
-    bound_port: u16,
 ) !core.NegotiatedProtocol {
-    _ = plan;
-
-    if (interop_harness.alpnPeerProfileForEndpoint(config.listen_host, core.Port.init(bound_port))) |profile| {
-        switch (profile.expected_outcome) {
-            .h2 => {
-                if (config.http2_enabled and http2.startsWithClientPreface(prefix)) {
-                    return .h2;
-                }
-                return .http_1_1;
-            },
-            .http_1_1 => return .http_1_1,
-            .reject_before_http => return error.UnsupportedNegotiation,
-        }
+    if (http2.startsWithClientPreface(prefix)) {
+        const result = try tls_server.resolveNegotiatedProtocol(
+            plan,
+            &.{ .h2, .http_1_1 },
+            "h2",
+            false,
+        );
+        return result.protocol;
     }
 
-    if (config.http2_enabled and http2.startsWithClientPreface(prefix)) {
-        return .h2;
+    if (looksLikeHttp1Request(prefix)) {
+        const result = try tls_server.resolveNegotiatedProtocol(
+            plan,
+            &.{.http_1_1},
+            null,
+            true,
+        );
+        return result.protocol;
     }
-    return .http_1_1;
+
+    return error.UnsupportedNegotiation;
 }
 
 /// Reads enough bytes to distinguish the local secure loopback protocol path.
@@ -373,6 +386,24 @@ fn collectNegotiationPrefix(
     }
 
     return collected.toOwnedSlice(allocator);
+}
+
+/// Returns true when the buffered bytes look like an HTTP/1.x request line.
+fn looksLikeHttp1Request(prefix: []const u8) bool {
+    if (prefix.len == 0) {
+        return false;
+    }
+    const line_end = std.mem.indexOf(u8, prefix, "\r\n") orelse return false;
+    const request_line = prefix[0..line_end];
+    if (std.mem.indexOf(u8, request_line, " HTTP/1.") == null) {
+        return false;
+    }
+    for (http_request_methods) |method_prefix| {
+        if (std.mem.startsWith(u8, request_line, method_prefix)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// Returns the first exact route match for the provided method and path.
@@ -462,6 +493,72 @@ test "server runtime validates secure listener fixtures during init" {
     defer server.deinit();
 
     try std.testing.expect(server.secure_listener_plan != null);
+}
+
+test "secure server runtime rejects invalid negotiation bytes explicitly" {
+    const noop = struct {
+        fn handle(_: ?*anyopaque, _: *server_types.ServerRequest, _: *server_types.ServerResponseWriter) !void {}
+    };
+
+    var config = server_types.ServerConfig.init(noop.handle);
+    config.port = core.Port.init(0);
+    config.http2_enabled = true;
+    var tls = core.TlsConfig.default();
+    tls.verify = .insecure;
+    tls.certificate_chain_path = "src/lib/testing/fixtures/certs/loopback-server.pem";
+    tls.private_key_path = "src/lib/testing/fixtures/certs/loopback-server.key";
+    config.tls = tls;
+
+    var server = try Server.init(std.testing.allocator, config);
+    defer server.deinit();
+    try server.start();
+
+    const response = try runRawExchange(std.testing.allocator, server.port(), "BOGUS /health\r\n\r\n");
+    defer std.testing.allocator.free(response);
+
+    try std.testing.expectEqual(@as(usize, 0), response.len);
+    var attempts: usize = 0;
+    while (attempts < 100 and server.snapshot().connection_scoped_failures == 0) : (attempts += 1) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 1), server.snapshot().connection_scoped_failures);
+}
+
+test "secure server runtime rejects h2 traffic when the listener only advertises http1" {
+    const noop = struct {
+        fn handle(_: ?*anyopaque, _: *server_types.ServerRequest, _: *server_types.ServerResponseWriter) !void {}
+    };
+
+    var config = server_types.ServerConfig.init(noop.handle);
+    config.port = core.Port.init(0);
+    var tls = core.TlsConfig.default();
+    tls.verify = .insecure;
+    tls.certificate_chain_path = "src/lib/testing/fixtures/certs/loopback-server.pem";
+    tls.private_key_path = "src/lib/testing/fixtures/certs/loopback-server.key";
+    config.tls = tls;
+
+    var server = try Server.init(std.testing.allocator, config);
+    defer server.deinit();
+    try server.start();
+
+    const request_bytes = try http2.encodeClientRequest(
+        std.testing.allocator,
+        .get,
+        "/health",
+        "127.0.0.1",
+        "",
+    );
+    defer std.testing.allocator.free(request_bytes);
+
+    const response = try runRawExchange(std.testing.allocator, server.port(), request_bytes);
+    defer std.testing.allocator.free(response);
+
+    try std.testing.expectEqual(@as(usize, 0), response.len);
+    var attempts: usize = 0;
+    while (attempts < 100 and server.snapshot().connection_scoped_failures == 0) : (attempts += 1) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 1), server.snapshot().connection_scoped_failures);
 }
 
 test "server runtime scopes a handler failure to one accepted connection" {

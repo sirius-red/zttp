@@ -174,9 +174,69 @@ fn runRawExchange(
     return response.toOwnedSlice(allocator);
 }
 
+/// Formats the listener advertised-protocol list into a compact comma-separated string.
+fn formatAdvertisedProtocols(
+    buffer: []u8,
+    protocols: []const types.NegotiatedProtocol,
+) ![]const u8 {
+    var stream = std.io.fixedBufferStream(buffer);
+    const writer = stream.writer();
+    for (protocols, 0..) |protocol, index| {
+        if (index != 0) {
+            try writer.writeAll(",");
+        }
+        try writer.writeAll(protocol.asAlpnBytes());
+    }
+    return stream.getWritten();
+}
+
 /// Builds the secure interop server used by the loopback HTTPS and HTTP/2 tests.
 fn initSecureInteropServer() !server.Server {
     var config = server.ServerConfig.init(interop_harness.handleServerRequest);
+    config.listen_host = "127.0.0.1";
+    config.port = types.Port.init(0);
+    config.http2_enabled = true;
+
+    var tls = types.TlsConfig.default();
+    tls.verify = .insecure;
+    tls.certificate_chain_path = "src/lib/testing/fixtures/certs/loopback-server.pem";
+    tls.private_key_path = "src/lib/testing/fixtures/certs/loopback-server.key";
+    config.tls = tls;
+
+    return server.Server.init(std.testing.allocator, config);
+}
+
+/// Handler that echoes the negotiated secure-session metadata for both protocols.
+const SessionMetadataHandler = struct {
+    /// Writes one JSON payload describing the negotiated secure session.
+    fn handle(
+        _: ?*anyopaque,
+        request: *server.ServerRequest,
+        writer: *server.ServerResponseWriter,
+    ) !void {
+        var advertised_buffer: [32]u8 = undefined;
+        const advertised = try formatAdvertisedProtocols(&advertised_buffer, request.session.advertised_protocols);
+
+        var body_buffer: [192]u8 = undefined;
+        const body = try std.fmt.bufPrint(
+            &body_buffer,
+            "{{\"request_protocol\":\"{s}\",\"session_protocol\":\"{s}\",\"secure\":{s},\"advertised\":\"{s}\"}}",
+            .{
+                request.negotiated_protocol.asAlpnBytes(),
+                request.session.negotiated_protocol.asAlpnBytes(),
+                if (request.session.secure) "true" else "false",
+                advertised,
+            },
+        );
+
+        try writer.appendHeader("Content-Type", "application/json");
+        try writer.writeAll(body);
+    }
+};
+
+/// Initializes a secure loopback server that exposes negotiated session metadata.
+fn initSecureSessionServer() !server.Server {
+    var config = server.ServerConfig.init(SessionMetadataHandler.handle);
     config.listen_host = "127.0.0.1";
     config.port = types.Port.init(0);
     config.http2_enabled = true;
@@ -274,6 +334,46 @@ test "server interop secure listener serves the shared health route over h2" {
 
     try std.testing.expectEqual(types.Status.ok, response.status);
     try std.testing.expect(std.mem.containsAtLeast(u8, response.body, 1, "\"protocol\":\"h2\""));
+}
+
+test "server interop serves http1 and h2 on one secure endpoint with shared session metadata" {
+    var runtime = try initSecureSessionServer();
+    defer runtime.deinit();
+    try runtime.start();
+
+    const http1_response = try runRawExchange(
+        std.testing.allocator,
+        runtime.port(),
+        "GET /session HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+    );
+    defer std.testing.allocator.free(http1_response);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, http1_response, 1, "HTTP/1.1 200 OK"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, http1_response, 1, "\"request_protocol\":\"http/1.1\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, http1_response, 1, "\"session_protocol\":\"http/1.1\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, http1_response, 1, "\"secure\":true"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, http1_response, 1, "\"advertised\":\"h2,http/1.1\""));
+
+    const request_bytes = try server_http2.encodeClientRequest(
+        std.testing.allocator,
+        .get,
+        "/session",
+        "127.0.0.1",
+        "",
+    );
+    defer std.testing.allocator.free(request_bytes);
+
+    const http2_response_bytes = try runRawExchange(std.testing.allocator, runtime.port(), request_bytes);
+    defer std.testing.allocator.free(http2_response_bytes);
+
+    var http2_response = try server_http2.decodeServerResponse(std.testing.allocator, http2_response_bytes);
+    defer http2_response.deinit();
+
+    try std.testing.expectEqual(types.Status.ok, http2_response.status);
+    try std.testing.expect(std.mem.containsAtLeast(u8, http2_response.body, 1, "\"request_protocol\":\"h2\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, http2_response.body, 1, "\"session_protocol\":\"h2\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, http2_response.body, 1, "\"secure\":true"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, http2_response.body, 1, "\"advertised\":\"h2,http/1.1\""));
 }
 
 test "server interop aligns health and static asset coverage with the shared local contract" {

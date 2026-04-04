@@ -414,6 +414,7 @@ fn readRequest(
         .session = .{
             .peer = session.peer,
             .identity_token = session.identity_token,
+            .advertised_protocols = session.advertised_protocols,
             .negotiated_protocol = .h2,
             .request_version = version,
             .secure = secure,

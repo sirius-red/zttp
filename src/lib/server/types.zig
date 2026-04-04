@@ -6,6 +6,7 @@ const tls_config = @import("../tls/config.zig");
 const tls_server = @import("../tls/server.zig");
 
 const default_alpn_protocols = [_]core.NegotiatedProtocol{ .h2, .http_1_1 };
+const http1_only_alpn_protocols = [_]core.NegotiatedProtocol{.http_1_1};
 
 /// Callback invoked for one accepted server request.
 pub const Handler = *const fn (
@@ -160,20 +161,28 @@ pub const SecureListenerMetadata = struct {
 
     /// Returns the listener TLS configuration derived from the shared metadata.
     pub fn tls(self: SecureListenerMetadata) core.TlsConfig {
+        const alpn_protocols = if (self.alpn_protocols.len == 0)
+            &default_alpn_protocols
+        else
+            self.alpn_protocols;
         return tls_config.withTrustMaterial(
-            core.TlsConfig.default().withAlpnProtocols(self.alpn_protocols),
+            core.TlsConfig.default().withAlpnProtocols(alpn_protocols),
             self.trust,
         );
     }
 
     /// Returns the public server configuration derived from the shared metadata.
     pub fn config(self: SecureListenerMetadata, handler: Handler) ServerConfig {
+        const alpn_protocols = if (self.alpn_protocols.len == 0)
+            &default_alpn_protocols
+        else
+            self.alpn_protocols;
         var server_config = ServerConfig.init(handler);
         server_config.listen_host = self.endpoint.host;
         server_config.port = self.endpoint.port;
         server_config.tls = self.tls();
-        server_config.alpn = self.alpn_protocols;
-        server_config.http2_enabled = supportsProtocol(self.alpn_protocols, .h2);
+        server_config.alpn = alpn_protocols;
+        server_config.http2_enabled = supportsProtocol(alpn_protocols, .h2);
         return server_config;
     }
 };
@@ -239,6 +248,8 @@ pub const NegotiatedSession = struct {
     peer: std.net.Address,
     /// Stable TLS identity token when secure listener mode is active.
     identity_token: ?core.TlsIdentityToken,
+    /// ALPN protocols advertised by the active listener for this session.
+    advertised_protocols: []const core.NegotiatedProtocol,
     /// Negotiated application protocol for the connection.
     negotiated_protocol: core.NegotiatedProtocol,
     /// Effective request version that will be surfaced to handlers.
@@ -432,10 +443,18 @@ pub const ServerConfig = struct {
         };
     }
 
+    /// Returns the effective ALPN list that the listener can safely advertise.
+    pub fn effectiveAlpnProtocols(self: ServerConfig) []const core.NegotiatedProtocol {
+        if (!self.http2_enabled) {
+            return &http1_only_alpn_protocols;
+        }
+        return if (self.alpn.len == 0) &default_alpn_protocols else self.alpn;
+    }
+
     /// Returns the authoritative TLS configuration with routed ALPN ordering applied.
     pub fn effectiveTlsConfig(self: ServerConfig) ?core.TlsConfig {
         if (self.tls) |tls| {
-            return tls.withAlpnProtocols(self.alpn);
+            return tls.withAlpnProtocols(self.effectiveAlpnProtocols());
         }
         return null;
     }
@@ -453,7 +472,8 @@ pub const ServerConfig = struct {
             if (self.tls == null) {
                 return error.InvalidHttp2Configuration;
             }
-            if (!supportsProtocol(self.alpn, .h2)) {
+            const alpn_protocols = self.effectiveAlpnProtocols();
+            if (!supportsProtocol(alpn_protocols, .h2) or !supportsProtocol(alpn_protocols, .http_1_1)) {
                 return error.InvalidHttp2Configuration;
             }
         }
@@ -695,6 +715,34 @@ test "server config rejects http2 without tls alpn" {
     try std.testing.expectError(error.InvalidHttp2Configuration, config.validate());
 }
 
+test "server config narrows secure alpn to http1 when http2 is disabled" {
+    const noop = struct {
+        fn handle(_: ?*anyopaque, _: *ServerRequest, _: *ServerResponseWriter) !void {}
+    };
+
+    var config = ServerConfig.init(noop.handle);
+    config.tls = core.TlsConfig.default();
+
+    const alpn_protocols = config.effectiveAlpnProtocols();
+    try std.testing.expectEqual(@as(usize, 1), alpn_protocols.len);
+    try std.testing.expectEqual(core.NegotiatedProtocol.http_1_1, alpn_protocols[0]);
+}
+
+test "server config requires secure http2 listeners to advertise h2 and http1" {
+    const noop = struct {
+        fn handle(_: ?*anyopaque, _: *ServerRequest, _: *ServerResponseWriter) !void {}
+    };
+
+    var config = ServerConfig.init(noop.handle);
+    config.http2_enabled = true;
+    config.tls = core.TlsConfig.default();
+    config.tls.?.certificate_chain_path = "server.pem";
+    config.tls.?.private_key_path = "server.key";
+    config.alpn = &.{.h2};
+
+    try std.testing.expectError(error.InvalidHttp2Configuration, config.validate());
+}
+
 test "secure listener metadata produces a typed server config" {
     const noop = struct {
         fn handle(_: ?*anyopaque, _: *ServerRequest, _: *ServerResponseWriter) !void {}
@@ -723,6 +771,9 @@ test "secure listener metadata produces a typed server config" {
     try std.testing.expectEqualStrings("server.key", config.tls.?.private_key_path.?);
     try std.testing.expectEqualStrings("roots.pem", config.tls.?.explicit_roots_path.?);
     try std.testing.expect(config.http2_enabled);
+    try std.testing.expectEqual(@as(usize, 2), config.effectiveAlpnProtocols().len);
+    try std.testing.expectEqual(core.NegotiatedProtocol.h2, config.effectiveAlpnProtocols()[0]);
+    try std.testing.expectEqual(core.NegotiatedProtocol.http_1_1, config.effectiveAlpnProtocols()[1]);
 }
 
 test "route catalog rejects duplicate exact identities by default" {

@@ -167,6 +167,7 @@ pub fn readRequestPrefixed(
         .session = .{
             .peer = peer,
             .identity_token = null,
+            .advertised_protocols = if (scheme == .https) &.{.http_1_1} else &.{.http_1_1},
             .negotiated_protocol = negotiated_protocol,
             .request_version = version,
             .secure = scheme == .https,
