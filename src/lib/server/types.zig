@@ -149,6 +149,35 @@ pub const ConfigError = tls_config.ValidationError || error{
 /// Re-exported TLS listener plan used by secure server configurations.
 pub const SecureListenerPlan = tls_server.ListenerPlan;
 
+/// Shared secure-listener metadata for smoke, readiness, and loopback helpers.
+pub const SecureListenerMetadata = struct {
+    /// Endpoint served by the listener.
+    endpoint: core.SecureEndpointMetadata,
+    /// Trust and identity material used by the listener.
+    trust: core.TlsTrustMaterial,
+    /// Ordered ALPN protocols advertised by the listener.
+    alpn_protocols: []const core.NegotiatedProtocol,
+
+    /// Returns the listener TLS configuration derived from the shared metadata.
+    pub fn tls(self: SecureListenerMetadata) core.TlsConfig {
+        return tls_config.withTrustMaterial(
+            core.TlsConfig.default().withAlpnProtocols(self.alpn_protocols),
+            self.trust,
+        );
+    }
+
+    /// Returns the public server configuration derived from the shared metadata.
+    pub fn config(self: SecureListenerMetadata, handler: Handler) ServerConfig {
+        var server_config = ServerConfig.init(handler);
+        server_config.listen_host = self.endpoint.host;
+        server_config.port = self.endpoint.port;
+        server_config.tls = self.tls();
+        server_config.alpn = self.alpn_protocols;
+        server_config.http2_enabled = supportsProtocol(self.alpn_protocols, .h2);
+        return server_config;
+    }
+};
+
 /// Explicit ALPN negotiation failure surfaced by the secure listener runtime.
 pub const NegotiationFailureCategory = enum {
     /// The peer selected or required an unsupported application protocol.
@@ -664,6 +693,36 @@ test "server config rejects http2 without tls alpn" {
     config.http2_enabled = true;
 
     try std.testing.expectError(error.InvalidHttp2Configuration, config.validate());
+}
+
+test "secure listener metadata produces a typed server config" {
+    const noop = struct {
+        fn handle(_: ?*anyopaque, _: *ServerRequest, _: *ServerResponseWriter) !void {}
+    };
+
+    const metadata = SecureListenerMetadata{
+        .endpoint = .{
+            .scheme = .https,
+            .host = "127.0.0.1",
+            .port = core.Port.init(4433),
+            .path = "/health",
+            .protocol = .http_1_1,
+        },
+        .trust = .{
+            .explicit_roots_path = "roots.pem",
+            .certificate_chain_path = "server.pem",
+            .private_key_path = "server.key",
+        },
+        .alpn_protocols = &.{ .h2, .http_1_1 },
+    };
+    const config = metadata.config(noop.handle);
+
+    try std.testing.expectEqualStrings("127.0.0.1", config.listen_host);
+    try std.testing.expectEqual(@as(u16, 4433), config.port.toInt());
+    try std.testing.expectEqualStrings("server.pem", config.tls.?.certificate_chain_path.?);
+    try std.testing.expectEqualStrings("server.key", config.tls.?.private_key_path.?);
+    try std.testing.expectEqualStrings("roots.pem", config.tls.?.explicit_roots_path.?);
+    try std.testing.expect(config.http2_enabled);
 }
 
 test "route catalog rejects duplicate exact identities by default" {

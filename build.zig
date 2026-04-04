@@ -79,13 +79,30 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(cli);
 
+    const readiness = b.addExecutable(.{
+        .name = "zttp-readiness",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lib/testing_readiness.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(readiness);
+
     const run_cmd = b.addRunArtifact(cli);
     const run_step = b.step("run", "Run the zttp cli with args passed after --");
+    const run_readiness = b.addRunArtifact(readiness);
+    const readiness_step = b.step(
+        "readiness",
+        "Run the readiness smoke runner and release-decision summary",
+    );
 
     if (b.args) |args| run_cmd.addArgs(args);
 
     run_cmd.step.dependOn(b.getInstallStep());
     run_step.dependOn(&run_cmd.step);
+    run_readiness.step.dependOn(b.getInstallStep());
+    readiness_step.dependOn(&run_readiness.step);
 
     const lib_unit_core_test_module = b.createModule(.{
         .root_source_file = b.path("src/lib/test_root_unit_core.zig"),

@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const fixture_loader = @import("fixture_loader.zig");
 const interop_harness = @import("interop_harness.zig");
+const testing_support = @import("testing.zig");
 
 /// Maximum number of bytes read from one release-verification text file.
 const max_release_file_bytes: usize = 256 * 1024;
@@ -35,6 +36,14 @@ pub const SmokeCommand = struct {
     cwd: []const u8 = ".",
 };
 
+/// Repository-owned generated-credential command for the current host platform.
+pub const GeneratedCredentialCommand = struct {
+    /// Repository-relative script path used to generate local credentials.
+    script_path: []const u8,
+    /// Output directory passed to the generator script.
+    out_dir: []const u8,
+};
+
 /// One smoke-test scenario in the local validation flow.
 pub const Scenario = struct {
     /// Stable name for reporting.
@@ -45,6 +54,40 @@ pub const Scenario = struct {
     command: SmokeCommand,
     /// Optional interop route tied to the scenario.
     route: ?interop_harness.RouteId = null,
+};
+
+/// Owned secure smoke/readiness command plan derived from generated credentials.
+pub const SecureReadinessPlan = struct {
+    /// Generated credential metadata shared by the secure flow.
+    generated: testing_support.SecureValidation.GeneratedCredentialSet,
+    /// Platform-specific credential-generation command metadata.
+    generator: GeneratedCredentialCommand,
+    /// Formatted secure request URL.
+    request_url: []u8,
+    /// Formatted listener port argument.
+    port_arg: []u8,
+    /// Server CLI arguments following the binary path.
+    server_args: [10][]const u8,
+    /// Request CLI arguments following the binary path.
+    request_args: [4][]const u8,
+
+    /// Releases the owned secure readiness plan buffers.
+    pub fn deinit(self: *SecureReadinessPlan, allocator: std.mem.Allocator) void {
+        self.generated.deinit(allocator);
+        allocator.free(self.request_url);
+        allocator.free(self.port_arg);
+        self.* = undefined;
+    }
+
+    /// Returns the server CLI arguments following the binary path.
+    pub fn serverArgv(self: *const SecureReadinessPlan) []const []const u8 {
+        return self.server_args[0..];
+    }
+
+    /// Returns the request CLI arguments following the binary path.
+    pub fn requestArgv(self: *const SecureReadinessPlan) []const []const u8 {
+        return self.request_args[0..];
+    }
 };
 
 /// Error returned when the runner is missing an executor.
@@ -619,6 +662,64 @@ pub fn defaultScenarios() []const Scenario {
     return &default_scenarios;
 }
 
+/// Returns the generated-credential command metadata for the current platform.
+pub fn generatedCredentialCommandForCurrentPlatform() GeneratedCredentialCommand {
+    return switch (builtin.os.tag) {
+        .windows => .{
+            .script_path = "scripts\\powershell\\generate-local-test-certs.ps1",
+            .out_dir = ".tmp\\local-certs",
+        },
+        else => .{
+            .script_path = "scripts/bash/generate-local-test-certs.sh",
+            .out_dir = ".tmp/local-certs",
+        },
+    };
+}
+
+/// Returns the secure smoke/readiness CLI plan derived from generated credentials.
+pub fn secureReadinessPlan(allocator: std.mem.Allocator) !SecureReadinessPlan {
+    var generated = try testing_support.SecureValidation.generatedCredentialSet(allocator);
+    errdefer generated.deinit(allocator);
+
+    const request_url = try std.fmt.allocPrint(
+        allocator,
+        "https://{s}:{d}{s}",
+        .{
+            generated.endpoint.host,
+            generated.endpoint.port.toInt(),
+            generated.endpoint.path,
+        },
+    );
+    errdefer allocator.free(request_url);
+    const port_arg = try std.fmt.allocPrint(allocator, "{d}", .{generated.listener.endpoint.port.toInt()});
+    errdefer allocator.free(port_arg);
+
+    return .{
+        .generated = generated,
+        .generator = generatedCredentialCommandForCurrentPlatform(),
+        .request_url = request_url,
+        .port_arg = port_arg,
+        .server_args = .{
+            "server",
+            "--listen",
+            generated.listener.endpoint.host,
+            "--port",
+            port_arg,
+            "--tls-cert",
+            generated.paths.certificate_chain_path,
+            "--tls-key",
+            generated.paths.private_key_path,
+            "--http2",
+        },
+        .request_args = .{
+            "request",
+            "--tls-ca",
+            generated.paths.roots_path,
+            request_url,
+        },
+    };
+}
+
 /// Returns the first default scenario that targets the provided route, if any.
 pub fn scenarioForRoute(route: interop_harness.RouteId) ?Scenario {
     for (default_scenarios) |scenario| {
@@ -1127,6 +1228,32 @@ test "default smoke scenarios cover quickstart commands" {
     try std.testing.expect(defaultScenarios().len >= 4);
     const request_https = scenarioForRoute(.health).?;
     try std.testing.expectEqualStrings("request-https", request_https.name);
+}
+
+test "secure readiness plan uses generated local credentials" {
+    var plan = try secureReadinessPlan(std.testing.allocator);
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("--tls-cert", plan.serverArgv()[5]);
+    try std.testing.expectEqualStrings("--tls-key", plan.serverArgv()[7]);
+    try std.testing.expectEqualStrings("--tls-ca", plan.requestArgv()[1]);
+    try std.testing.expect(std.mem.endsWith(u8, plan.requestArgv()[2], "roots.pem"));
+    try std.testing.expectEqualStrings("https://127.0.0.1:4433/health", plan.requestArgv()[3]);
+}
+
+test "generated credential command matches the current platform" {
+    const command = generatedCredentialCommandForCurrentPlatform();
+
+    switch (builtin.os.tag) {
+        .windows => {
+            try std.testing.expectEqualStrings("scripts\\powershell\\generate-local-test-certs.ps1", command.script_path);
+            try std.testing.expectEqualStrings(".tmp\\local-certs", command.out_dir);
+        },
+        else => {
+            try std.testing.expectEqualStrings("scripts/bash/generate-local-test-certs.sh", command.script_path);
+            try std.testing.expectEqualStrings(".tmp/local-certs", command.out_dir);
+        },
+    }
 }
 
 test "runner dispatches scenarios through callback" {

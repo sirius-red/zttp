@@ -43,6 +43,21 @@ pub fn supportsProtocol(config: types.TlsConfig, protocol: types.NegotiatedProto
     return config.supportsProtocol(protocol);
 }
 
+/// Applies shared trust and identity metadata to a TLS configuration copy.
+pub fn withTrustMaterial(
+    config: types.TlsConfig,
+    trust: types.TlsTrustMaterial,
+) types.TlsConfig {
+    var copy = config;
+    copy.explicit_roots_path = trust.explicit_roots_path;
+    copy.certificate_chain_path = trust.certificate_chain_path;
+    copy.private_key_path = trust.private_key_path;
+    if (trust.hasExplicitRoots()) {
+        copy.root_store_mode = .explicit;
+    }
+    return copy;
+}
+
 test "tls config validation requires explicit roots when requested" {
     var config = types.TlsConfig.default();
     config.root_store_mode = .explicit;
@@ -55,4 +70,18 @@ test "tls config preferred protocol follows alpn order" {
     config.alpn_protocols = &.{ .http_1_1, .h2 };
 
     try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, try preferredProtocol(config));
+}
+
+test "tls config applies trust material metadata" {
+    const trust = types.TlsTrustMaterial{
+        .explicit_roots_path = "roots.pem",
+        .certificate_chain_path = "server.pem",
+        .private_key_path = "server.key",
+    };
+    const config = withTrustMaterial(types.TlsConfig.default(), trust);
+
+    try std.testing.expectEqual(types.TlsRootStoreMode.explicit, config.root_store_mode);
+    try std.testing.expectEqualStrings("roots.pem", config.explicit_roots_path.?);
+    try std.testing.expectEqualStrings("server.pem", config.certificate_chain_path.?);
+    try std.testing.expectEqualStrings("server.key", config.private_key_path.?);
 }

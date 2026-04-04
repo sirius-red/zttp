@@ -363,6 +363,40 @@ pub const TunnelTarget = struct {
     port: Port,
 };
 
+/// Shared secure-endpoint metadata for local validation and runtime helpers.
+pub const SecureEndpointMetadata = struct {
+    /// URI scheme used by the endpoint.
+    scheme: Scheme,
+    /// Hostname or IP literal used by the endpoint.
+    host: []const u8,
+    /// Port exposed by the endpoint.
+    port: Port,
+    /// Absolute request path used by validation probes.
+    path: []const u8,
+    /// Expected application protocol for the endpoint.
+    protocol: NegotiatedProtocol,
+};
+
+/// Shared TLS trust and identity material used by secure validation helpers.
+pub const TlsTrustMaterial = struct {
+    /// Optional path to an explicit trust bundle.
+    explicit_roots_path: ?[]const u8,
+    /// Optional path to the server or mutual-TLS certificate chain.
+    certificate_chain_path: ?[]const u8,
+    /// Optional path to the matching private key.
+    private_key_path: ?[]const u8,
+
+    /// Returns true when an explicit trust bundle is configured.
+    pub fn hasExplicitRoots(self: TlsTrustMaterial) bool {
+        return self.explicit_roots_path != null;
+    }
+
+    /// Returns true when both server-identity paths are configured.
+    pub fn hasIdentity(self: TlsTrustMaterial) bool {
+        return self.certificate_chain_path != null and self.private_key_path != null;
+    }
+};
+
 const default_alpn_protocols = [_]NegotiatedProtocol{ .h2, .http_1_1 };
 
 /// Shared TLS configuration for client and server flows.
@@ -710,6 +744,17 @@ test "tls config default identity is stable" {
     try std.testing.expect(config.supportsProtocol(.h2));
     try std.testing.expect(config.supportsProtocol(.http_1_1));
     try std.testing.expectEqual(config.identity().toInt(), TlsConfig.default().identity().toInt());
+}
+
+test "tls trust material reports configured roots and identity" {
+    const trust = TlsTrustMaterial{
+        .explicit_roots_path = "roots.pem",
+        .certificate_chain_path = "server.pem",
+        .private_key_path = "server.key",
+    };
+
+    try std.testing.expect(trust.hasExplicitRoots());
+    try std.testing.expect(trust.hasIdentity());
 }
 
 test "protocol plan narrows routed tls identity to the offered alpn set" {

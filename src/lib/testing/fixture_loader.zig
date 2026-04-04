@@ -214,6 +214,42 @@ pub const LoopbackIdentity = struct {
     }
 };
 
+/// Owned generated local credential paths for clean-checkout secure validation.
+pub const GeneratedLocalCredentialPaths = struct {
+    /// Path to the generated certificate chain.
+    certificate_chain_path: []u8,
+    /// Path to the generated private key.
+    private_key_path: []u8,
+    /// Path to the generated trust bundle.
+    roots_path: []u8,
+
+    /// Releases the owned generated-credential paths.
+    pub fn deinit(self: *GeneratedLocalCredentialPaths, allocator: std.mem.Allocator) void {
+        allocator.free(self.certificate_chain_path);
+        allocator.free(self.private_key_path);
+        allocator.free(self.roots_path);
+        self.* = undefined;
+    }
+};
+
+/// Owned generated local credential contents for clean-checkout secure validation.
+pub const GeneratedLocalCredentials = struct {
+    /// Generated certificate chain bytes.
+    certificate_chain: []u8,
+    /// Generated private key bytes.
+    private_key: []u8,
+    /// Generated trust bundle bytes.
+    roots: []u8,
+
+    /// Releases the owned generated credential contents.
+    pub fn deinit(self: *GeneratedLocalCredentials, allocator: std.mem.Allocator) void {
+        allocator.free(self.certificate_chain);
+        allocator.free(self.private_key);
+        allocator.free(self.roots);
+        self.* = undefined;
+    }
+};
+
 /// Stable QUIC fixture identifier used by local HTTP/3 runtime scenarios.
 pub const QuicRuntimeFixtureId = enum {
     /// Client-side Initial packet fixture for loopback session setup.
@@ -460,6 +496,34 @@ pub const Loader = struct {
         };
     }
 
+    /// Returns the generated local credential paths under `.tmp/local-certs`.
+    pub fn generatedLocalCredentialPaths(
+        self: Loader,
+        allocator: std.mem.Allocator,
+    ) LoadError!GeneratedLocalCredentialPaths {
+        _ = self;
+        return .{
+            .certificate_chain_path = try std.fs.path.join(allocator, &.{ ".tmp", "local-certs", "loopback-server.pem" }),
+            .private_key_path = try std.fs.path.join(allocator, &.{ ".tmp", "local-certs", "loopback-server.key" }),
+            .roots_path = try std.fs.path.join(allocator, &.{ ".tmp", "local-certs", "roots.pem" }),
+        };
+    }
+
+    /// Loads the generated local credentials from `.tmp/local-certs`.
+    pub fn loadGeneratedLocalCredentials(
+        self: Loader,
+        allocator: std.mem.Allocator,
+    ) LoadError!GeneratedLocalCredentials {
+        var paths = try self.generatedLocalCredentialPaths(allocator);
+        defer paths.deinit(allocator);
+
+        return .{
+            .certificate_chain = try std.fs.cwd().readFileAlloc(allocator, paths.certificate_chain_path, std.math.maxInt(usize)),
+            .private_key = try std.fs.cwd().readFileAlloc(allocator, paths.private_key_path, std.math.maxInt(usize)),
+            .roots = try std.fs.cwd().readFileAlloc(allocator, paths.roots_path, std.math.maxInt(usize)),
+        };
+    }
+
     /// Builds an absolute or repository-relative path to a fixture.
     pub fn pathFor(self: Loader, allocator: std.mem.Allocator, relative_path: []const u8) LoadError![]u8 {
         try validateRelativePath(relative_path);
@@ -574,6 +638,28 @@ test "fixture loader resolves loopback identity fixture paths" {
     try std.testing.expect(
         std.mem.endsWith(u8, paths.private_key_path, "certs/loopback-server.key") or
             std.mem.endsWith(u8, paths.private_key_path, "certs\\loopback-server.key"),
+    );
+}
+
+test "fixture loader resolves generated local credential paths" {
+    const loader = Loader.init();
+    var paths = try loader.generatedLocalCredentialPaths(std.testing.allocator);
+    defer paths.deinit(std.testing.allocator);
+
+    try std.testing.expect(
+        std.mem.endsWith(u8, paths.certificate_chain_path, ".tmp/local-certs/loopback-server.pem") or
+            std.mem.endsWith(u8, paths.certificate_chain_path, ".tmp\\local-certs\\loopback-server.pem") or
+            std.mem.endsWith(u8, paths.certificate_chain_path, ".tmp\\local-certs/loopback-server.pem"),
+    );
+    try std.testing.expect(
+        std.mem.endsWith(u8, paths.private_key_path, ".tmp/local-certs/loopback-server.key") or
+            std.mem.endsWith(u8, paths.private_key_path, ".tmp\\local-certs\\loopback-server.key") or
+            std.mem.endsWith(u8, paths.private_key_path, ".tmp\\local-certs/loopback-server.key"),
+    );
+    try std.testing.expect(
+        std.mem.endsWith(u8, paths.roots_path, ".tmp/local-certs/roots.pem") or
+            std.mem.endsWith(u8, paths.roots_path, ".tmp\\local-certs\\roots.pem") or
+            std.mem.endsWith(u8, paths.roots_path, ".tmp\\local-certs/roots.pem"),
     );
 }
 

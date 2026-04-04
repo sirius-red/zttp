@@ -17,6 +17,7 @@ const default_http3_runtime_routes = [_]InteropHarness.RouteId{
     .echo_post,
     .stream_large,
 };
+const default_secure_validation_alpn = [_]types.NegotiatedProtocol{ .h2, .http_1_1 };
 
 /// Combined HTTP/3 runtime case derived from the shared route and datagram catalogs.
 pub const Http3RuntimeCase = struct {
@@ -142,10 +143,64 @@ pub const Readiness = struct {
     }
 };
 
+/// Shared generated-credential metadata for secure smoke and readiness helpers.
+pub const SecureValidation = struct {
+    /// Owned generated local credential metadata plus typed listener helpers.
+    pub const GeneratedCredentialSet = struct {
+        /// Owned generated credential paths under `.tmp/local-certs`.
+        paths: FixtureLoader.GeneratedLocalCredentialPaths,
+        /// Canonical secure endpoint used by the shared validation flow.
+        endpoint: types.SecureEndpointMetadata,
+        /// Shared trust and identity metadata derived from the generated paths.
+        trust: types.TlsTrustMaterial,
+        /// Listener metadata derived from the generated paths.
+        listener: server_types.SecureListenerMetadata,
+
+        /// Releases the owned generated credential paths.
+        pub fn deinit(self: *GeneratedCredentialSet, allocator: std.mem.Allocator) void {
+            self.paths.deinit(allocator);
+            self.* = undefined;
+        }
+    };
+
+    /// Returns the default generated-credential metadata for secure validation.
+    pub fn generatedCredentialSet(
+        allocator: std.mem.Allocator,
+    ) FixtureLoader.LoadError!GeneratedCredentialSet {
+        var paths = try FixtureLoader.Loader.init().generatedLocalCredentialPaths(allocator);
+        errdefer paths.deinit(allocator);
+
+        const endpoint = types.SecureEndpointMetadata{
+            .scheme = .https,
+            .host = "127.0.0.1",
+            .port = types.Port.init(4433),
+            .path = "/health",
+            .protocol = .http_1_1,
+        };
+        const trust = types.TlsTrustMaterial{
+            .explicit_roots_path = paths.roots_path,
+            .certificate_chain_path = paths.certificate_chain_path,
+            .private_key_path = paths.private_key_path,
+        };
+
+        return .{
+            .paths = paths,
+            .endpoint = endpoint,
+            .trust = trust,
+            .listener = .{
+                .endpoint = endpoint,
+                .trust = trust,
+                .alpn_protocols = &default_secure_validation_alpn,
+            },
+        };
+    }
+};
+
 test {
     _ = Http3RuntimeCase;
     _ = Http3Runtime;
     _ = Readiness;
+    _ = SecureValidation;
 }
 
 test "http3 runtime helpers expose shared loopback defaults" {
@@ -198,3 +253,22 @@ test "readiness entrypoint exposes blocking platforms and protocol evidence" {
     try @import("std").testing.expectEqual(@as(usize, 11), Readiness.blockingCapabilityFloor().len);
     try @import("std").testing.expectEqual(.verified, h3.overallStatus());
 }
+
+test "secure validation exposes generated local credential metadata" {
+    var generated = try SecureValidation.generatedCredentialSet(@import("std").testing.allocator);
+    defer generated.deinit(@import("std").testing.allocator);
+
+    const config = generated.listener.config(noopHandler);
+
+    try @import("std").testing.expectEqual(types.Scheme.https, generated.endpoint.scheme);
+    try @import("std").testing.expectEqual(@as(u16, 4433), generated.endpoint.port.toInt());
+    try @import("std").testing.expectEqualStrings("/health", generated.endpoint.path);
+    try @import("std").testing.expectEqualStrings("127.0.0.1", config.listen_host);
+    try @import("std").testing.expectEqualStrings(
+        generated.paths.roots_path,
+        config.tls.?.explicit_roots_path.?,
+    );
+}
+
+/// No-op handler used by shared validation tests.
+fn noopHandler(_: ?*anyopaque, _: *server_types.ServerRequest, _: *server_types.ServerResponseWriter) !void {}
