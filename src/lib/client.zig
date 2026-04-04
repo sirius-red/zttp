@@ -9,6 +9,7 @@ const connection_h1 = @import("http1/connection_h1.zig");
 const http2_connection = @import("http2/connection.zig");
 const connection_h2 = @import("http2/connection_h2.zig");
 const tls_config = @import("tls/config.zig");
+const tls_client = @import("tls/client.zig");
 const request_encoder = @import("http1/request_encoder.zig");
 const redirects = @import("redirects/redirects.zig");
 const cookies = @import("cookies/cookie_jar.zig");
@@ -2472,9 +2473,32 @@ fn redirectRequiresRepeatableBody(rewrite: redirects.MethodRewrite, body_present
 
 /// Builds the currently routable transport and ALPN offer plan for a request.
 fn buildProtocolPlanForRequest(self: *const Client, request_value: *const types.Request) types.ProtocolPlan {
-    if (request_value.uri.scheme == .https and isHttp2TransportRoutable(self, request_value)) {
+    if (request_value.uri.scheme == .https and request_value.version != .http_3) {
+        const default_plan = types.ProtocolPlan{
+            .expected_protocol = .http_1_1,
+            .offered_protocols = &http_2_preferred_protocols,
+        };
+        const profile = interop_harness.liveAlpnPeerProfileForEndpoint(
+            request_value.uri.host,
+            request_value.uri.effectivePort(),
+        ) orelse return default_plan;
+        const routed_tls = default_plan.routedTlsConfig(self.options.tls);
+
+        tls_client.validateHarnessTrust(routed_tls, profile.requires_explicit_trust) catch {
+            return default_plan;
+        };
+
+        const negotiation = tls_client.resolveNegotiatedProtocol(
+            routed_tls,
+            profile.advertised_protocols,
+            profile.selected_protocol_token,
+            profile.omits_alpn,
+        ) catch {
+            return default_plan;
+        };
+
         return .{
-            .expected_protocol = .h2,
+            .expected_protocol = negotiation.protocol,
             .offered_protocols = &http_2_preferred_protocols,
         };
     }
@@ -2715,21 +2739,6 @@ fn parseMaxAge(value: ?[]const u8) ?Duration {
         return Duration.fromSeconds(seconds);
     }
     return null;
-}
-
-/// Returns true when the client can route the request through the HTTP/2 transport path.
-fn isHttp2TransportRoutable(self: *const Client, request_value: *const types.Request) bool {
-    _ = self;
-    if (request_value.uri.scheme != .https or request_value.version == .http_3) {
-        return false;
-    }
-
-    const profile = interop_harness.alpnPeerProfileForEndpoint(
-        request_value.uri.host,
-        request_value.uri.effectivePort(),
-    ) orelse return false;
-
-    return profile.tls_supported and profile.expected_outcome == .h2;
 }
 
 /// Builds a request copy with optional Cookie and Proxy-Authorization headers.
@@ -3293,12 +3302,13 @@ test "https connection options pin http/1.1 alpn for the http1 transport path" {
 
     const connection_options = client.buildConnectionOptions(&request);
     try std.testing.expect(connection_options.tls_config != null);
-    try std.testing.expectEqual(@as(usize, 1), connection_options.tls_config.?.alpn_protocols.len);
-    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, connection_options.tls_config.?.alpn_protocols[0]);
+    try std.testing.expectEqual(@as(usize, 2), connection_options.tls_config.?.alpn_protocols.len);
+    try std.testing.expectEqual(types.NegotiatedProtocol.h2, connection_options.tls_config.?.alpn_protocols[0]);
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, connection_options.tls_config.?.alpn_protocols[1]);
     try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, connection_options.expected_protocol);
 }
 
-test "https protocol planning narrows offers until the http2 route is available" {
+test "https protocol planning keeps both alpn offers available for arbitrary secure endpoints" {
     var client = Client.init(std.testing.allocator, Options.default());
     defer client.deinit();
 
@@ -3309,8 +3319,9 @@ test "https protocol planning narrows offers until the http2 route is available"
 
     const plan = buildProtocolPlanForRequest(&client, &request);
     try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, plan.expected_protocol);
-    try std.testing.expectEqual(@as(usize, 1), plan.offered_protocols.len);
-    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, plan.offered_protocols[0]);
+    try std.testing.expectEqual(@as(usize, 2), plan.offered_protocols.len);
+    try std.testing.expectEqual(types.NegotiatedProtocol.h2, plan.offered_protocols[0]);
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, plan.offered_protocols[1]);
 }
 
 test "https connection options prefer h2 for the dual-alpn loopback peer" {
@@ -3331,7 +3342,7 @@ test "https connection options prefer h2 for the dual-alpn loopback peer" {
     try std.testing.expectEqual(types.NegotiatedProtocol.h2, connection_options.expected_protocol);
 }
 
-test "https connection options keep the compatibility path for omitted alpn peers" {
+test "https connection options keep both offers for omitted alpn peers and defer fallback to negotiation" {
     var client = Client.init(std.testing.allocator, Options.default());
     defer client.deinit();
 
@@ -3343,8 +3354,9 @@ test "https connection options keep the compatibility path for omitted alpn peer
 
     const connection_options = client.buildConnectionOptions(&request);
     try std.testing.expect(connection_options.tls_config != null);
-    try std.testing.expectEqual(@as(usize, 1), connection_options.tls_config.?.alpn_protocols.len);
-    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, connection_options.tls_config.?.alpn_protocols[0]);
+    try std.testing.expectEqual(@as(usize, 2), connection_options.tls_config.?.alpn_protocols.len);
+    try std.testing.expectEqual(types.NegotiatedProtocol.h2, connection_options.tls_config.?.alpn_protocols[0]);
+    try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, connection_options.tls_config.?.alpn_protocols[1]);
     try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, connection_options.expected_protocol);
 }
 

@@ -1,12 +1,15 @@
 //! Client interop regression coverage tied to the shared harness contract.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const client = @import("../client.zig");
 const compression_decoder = @import("../compression/decoder.zig");
 const compression_encoding = @import("../compression/encoding.zig");
 const fixture_loader = @import("fixture_loader.zig");
 const interop_harness = @import("interop_harness.zig");
 const multipart_form_data = @import("../multipart/form_data.zig");
 const smoke_runner = @import("smoke_runner.zig");
+const shared_testing = @import("testing.zig");
 const types = @import("../types.zig");
 
 /// Expected protocol coverage for first-party client convenience flows.
@@ -212,4 +215,80 @@ test "client interop aligns automatic decompression coverage with the shared loc
     for (client_flow_protocols) |protocol| {
         try expectSupportedCapability(.client_decompression, protocol);
     }
+}
+
+test "client interop routes trusted https endpoints outside the predefined catalog" {
+    var generated = try shared_testing.SecureValidation.generatedCredentialSet(std.testing.allocator);
+    defer generated.deinit(std.testing.allocator);
+
+    var options = client.Options.default();
+    options.tls.root_store_mode = .explicit;
+    options.tls.explicit_roots_path = generated.paths.roots_path;
+
+    var http_client = client.Client.init(std.testing.allocator, options);
+    defer http_client.deinit();
+
+    const uri = types.Uri.init(.https, "127.0.0.1", types.Port.init(22443), "/health", null, null);
+    var request = types.Request.init(std.testing.allocator, .get, uri);
+    defer request.deinit();
+    try request.headers.append("Host", "127.0.0.1");
+
+    var handle = try http_client.request(&request);
+    defer handle.deinit();
+
+    var response = try handle.wait();
+    defer response.deinit();
+    defer if (response.body) |body| body.close();
+
+    try std.testing.expectEqual(types.Status.ok, response.status);
+    try std.testing.expectEqual(types.Version.http_2, response.version);
+}
+
+test "client interop reuses one negotiated h2 runtime for concurrent outside-catalog requests" {
+    if (builtin.os.tag == .windows) {
+        return;
+    }
+
+    var generated = try shared_testing.SecureValidation.generatedCredentialSet(std.testing.allocator);
+    defer generated.deinit(std.testing.allocator);
+
+    var options = client.Options.default();
+    options.pool.max_connections = client.ConnectionCount.init(1);
+    options.tls.root_store_mode = .explicit;
+    options.tls.explicit_roots_path = generated.paths.roots_path;
+
+    var http_client = client.Client.init(std.testing.allocator, options);
+    defer http_client.deinit();
+
+    var health_request = types.Request.init(
+        std.testing.allocator,
+        .get,
+        types.Uri.init(.https, "127.0.0.1", types.Port.init(22443), "/health", null, null),
+    );
+    defer health_request.deinit();
+    try health_request.headers.append("Host", "127.0.0.1");
+
+    var echo_request = types.Request.init(
+        std.testing.allocator,
+        .get,
+        types.Uri.init(.https, "127.0.0.1", types.Port.init(22443), "/echo", null, null),
+    );
+    defer echo_request.deinit();
+    try echo_request.headers.append("Host", "127.0.0.1");
+
+    var health_handle = try http_client.request(&health_request);
+    defer health_handle.deinit();
+    var echo_handle = try http_client.request(&echo_request);
+    defer echo_handle.deinit();
+
+    var health_response = try health_handle.wait();
+    defer health_response.deinit();
+    defer if (health_response.body) |body| body.close();
+
+    var echo_response = try echo_handle.wait();
+    defer echo_response.deinit();
+    defer if (echo_response.body) |body| body.close();
+
+    try std.testing.expectEqual(types.Version.http_2, health_response.version);
+    try std.testing.expectEqual(types.Version.http_2, echo_response.version);
 }

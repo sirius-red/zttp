@@ -4,6 +4,7 @@ const std = @import("std");
 const types = @import("../types.zig");
 const fixture_loader = @import("../testing/fixture_loader.zig");
 const interop_harness = @import("../testing/interop_harness.zig");
+const tls_client = @import("client.zig");
 
 /// Expected outcome for a planned TLS regression scenario.
 pub const HandshakeExpectation = union(enum) {
@@ -92,7 +93,7 @@ test "health route remains available for tls and alpn coverage" {
 test "dual-alpn peer profile prefers h2 during tls negotiation" {
     const peer = interop_harness.alpnPeerProfileForId(.dual_alpn).?;
 
-    const result = try @import("client.zig").negotiateProtocol(
+    const result = try tls_client.negotiateProtocol(
         types.TlsConfig.default(),
         peer.advertised_protocols,
     );
@@ -104,33 +105,66 @@ test "dual-alpn peer profile prefers h2 during tls negotiation" {
 test "http/1.1-only peer profile negotiates http/1.1 during tls negotiation" {
     const peer = interop_harness.alpnPeerProfileForId(.http1_only).?;
 
-    const result = try @import("client.zig").negotiateProtocol(
+    const result = try tls_client.resolveNegotiatedProtocol(
         types.TlsConfig.default(),
         peer.advertised_protocols,
+        peer.selected_protocol_token,
+        peer.omits_alpn,
     );
 
     try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, result.protocol);
+    try std.testing.expect(result.verified);
+}
+
+test "arbitrary secure loopback endpoints require explicit trust before h2 negotiation succeeds" {
+    const peer = interop_harness.liveAlpnPeerProfileForEndpoint("127.0.0.1", types.Port.init(22443)).?;
+    try std.testing.expect(peer.requires_explicit_trust);
+
+    try std.testing.expectError(
+        error.PeerVerificationFailed,
+        tls_client.validateHarnessTrust(types.TlsConfig.default(), peer.requires_explicit_trust),
+    );
+
+    var explicit_roots = types.TlsConfig.default();
+    explicit_roots.root_store_mode = .explicit;
+    explicit_roots.explicit_roots_path = ".tmp/local-certs/roots.pem";
+
+    try tls_client.validateHarnessTrust(explicit_roots, peer.requires_explicit_trust);
+    const result = try tls_client.resolveNegotiatedProtocol(
+        explicit_roots,
+        peer.advertised_protocols,
+        peer.selected_protocol_token,
+        peer.omits_alpn,
+    );
+
+    try std.testing.expectEqual(types.NegotiatedProtocol.h2, result.protocol);
     try std.testing.expect(result.verified);
 }
 
 test "omitted alpn peer profile falls back to http/1.1 during tls negotiation" {
     const peer = interop_harness.alpnPeerProfileForId(.omits_alpn).?;
 
-    const result = try @import("client.zig").negotiateProtocol(
+    const result = try tls_client.resolveNegotiatedProtocol(
         types.TlsConfig.default().withAlpnProtocols(&.{.http_1_1}),
         peer.advertised_protocols,
+        peer.selected_protocol_token,
+        peer.omits_alpn,
     );
 
     try std.testing.expectEqual(types.NegotiatedProtocol.http_1_1, result.protocol);
     try std.testing.expect(result.verified);
 }
 
-test "tls negotiation rejects unsupported peer-selected protocols" {
+test "tls negotiation rejects invalid peer-selected protocol tokens explicitly" {
+    const peer = interop_harness.alpnPeerProfileForId(.unsupported_protocol).?;
+
     try std.testing.expectError(
-        error.NoSharedProtocol,
-        @import("client.zig").negotiateProtocol(
+        error.UnsupportedNegotiatedProtocol,
+        tls_client.resolveNegotiatedProtocol(
             types.TlsConfig.default(),
-            &.{.h3},
+            peer.advertised_protocols,
+            peer.selected_protocol_token,
+            peer.omits_alpn,
         ),
     );
 }

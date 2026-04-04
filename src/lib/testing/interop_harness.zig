@@ -384,6 +384,8 @@ pub const AlpnPeerProfile = struct {
     expected_client_failure: AlpnClientFailure,
     /// Whether the persona is valid for TLS loopback verification.
     tls_supported: bool,
+    /// Whether the persona requires caller-supplied explicit trust material.
+    requires_explicit_trust: bool,
 };
 
 /// Expected local diagnostic emitted for a successful ALPN persona.
@@ -941,6 +943,7 @@ const default_alpn_peer_profiles = [_]AlpnPeerProfile{
         .expected_failure_phase = .none,
         .expected_client_failure = .none,
         .tls_supported = true,
+        .requires_explicit_trust = false,
     },
     .{
         .id = .http1_only,
@@ -953,6 +956,7 @@ const default_alpn_peer_profiles = [_]AlpnPeerProfile{
         .expected_failure_phase = .none,
         .expected_client_failure = .none,
         .tls_supported = true,
+        .requires_explicit_trust = false,
     },
     .{
         .id = .omits_alpn,
@@ -965,6 +969,7 @@ const default_alpn_peer_profiles = [_]AlpnPeerProfile{
         .expected_failure_phase = .none,
         .expected_client_failure = .none,
         .tls_supported = true,
+        .requires_explicit_trust = false,
     },
     .{
         .id = .unsupported_protocol,
@@ -977,6 +982,7 @@ const default_alpn_peer_profiles = [_]AlpnPeerProfile{
         .expected_failure_phase = .protocol_routing_before_http,
         .expected_client_failure = .negotiation_failed,
         .tls_supported = true,
+        .requires_explicit_trust = false,
     },
 };
 
@@ -1423,6 +1429,38 @@ pub fn alpnPeerProfileForEndpoint(host: []const u8, port: types.Port) ?AlpnPeerP
         }
     }
     return null;
+}
+
+/// Returns the ALPN peer profile for a live loopback endpoint, synthesizing a
+/// first-party profile when the endpoint is outside the predefined catalog.
+pub fn liveAlpnPeerProfileForEndpoint(host: []const u8, port: types.Port) ?AlpnPeerProfile {
+    if (alpnPeerProfileForEndpoint(host, port)) |profile| {
+        return profile;
+    }
+    if (!isLoopbackHost(host)) {
+        return null;
+    }
+    return .{
+        .id = .dual_alpn,
+        .host = host,
+        .port = port,
+        .advertised_protocols = &alpn_dual_protocols,
+        .omits_alpn = false,
+        .selected_protocol_token = "h2",
+        .expected_outcome = .h2,
+        .expected_failure_phase = .none,
+        .expected_client_failure = .none,
+        .tls_supported = true,
+        .requires_explicit_trust = true,
+    };
+}
+
+/// Returns true when the provided host represents a local loopback peer.
+fn isLoopbackHost(host: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(host, "127.0.0.1") or
+        std.ascii.eqlIgnoreCase(host, "::1") or
+        std.ascii.eqlIgnoreCase(host, "localhost") or
+        std.ascii.eqlIgnoreCase(host, "loopback.local");
 }
 
 /// Returns the expected successful protocol diagnostic for a peer profile, if any.

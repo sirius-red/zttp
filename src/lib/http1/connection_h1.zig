@@ -938,6 +938,7 @@ pub const ConnectionH1 = struct {
             error.RootStoreUnavailable,
             error.HostnameMismatch,
             error.PeerVerificationFailed,
+            error.UnsupportedNegotiatedProtocol,
             error.TlsHandshakeFailed,
             error.TransportFailure,
             => error.Transport,
@@ -954,16 +955,17 @@ pub const ConnectionH1 = struct {
             return null;
         }
         const uri = self.buildTlsUri();
-        return interop_harness.alpnPeerProfileForEndpoint(uri.host, uri.effectivePort());
+        return interop_harness.liveAlpnPeerProfileForEndpoint(uri.host, uri.effectivePort());
     }
 
     /// Establishes an in-memory secure harness connection for the provided ALPN persona.
     fn establishSecureHarness(self: *ConnectionH1, profile: interop_harness.AlpnPeerProfile) Error!void {
+        const tls_config = self.options.tls_config orelse return error.Protocol;
+        tls_client.validateHarnessTrust(tls_config, profile.requires_explicit_trust) catch |err| {
+            return mapTlsError(err);
+        };
         self.secure_harness_profile = profile;
         self.negotiated_protocol = try self.negotiateSecureHarnessProtocol(profile);
-        if (self.negotiated_protocol != self.options.expected_protocol) {
-            return error.NegotiationFailed;
-        }
 
         if (self.negotiated_protocol == .h2 and self.http2_runtime == null) {
             const runtime = self.allocator.create(connection_h2.ConnectionH2) catch {
@@ -992,36 +994,15 @@ pub const ConnectionH1 = struct {
     ) Error!types.NegotiatedProtocol {
         const tls_config = self.options.tls_config orelse return error.Protocol;
 
-        if (profile.selected_protocol_token) |token| {
-            const protocol = parseProtocolToken(token) catch return error.NegotiationFailed;
-            if (!tls_config.supportsProtocol(protocol)) {
-                return error.NegotiationFailed;
-            }
-            return protocol;
-        }
-
-        if (profile.omits_alpn) {
-            if (!tls_config.supportsProtocol(.http_1_1)) {
-                return error.NegotiationFailed;
-            }
-            return .http_1_1;
-        }
-
-        const negotiation = tls_client.negotiateProtocol(tls_config, profile.advertised_protocols) catch {
+        const negotiation = tls_client.resolveNegotiatedProtocol(
+            tls_config,
+            profile.advertised_protocols,
+            profile.selected_protocol_token,
+            profile.omits_alpn,
+        ) catch {
             return error.NegotiationFailed;
         };
         return negotiation.protocol;
-    }
-
-    /// Parses a negotiated ALPN token into the supported protocol enum.
-    fn parseProtocolToken(token: []const u8) error{UnsupportedToken}!types.NegotiatedProtocol {
-        if (std.mem.eql(u8, token, "h2")) {
-            return .h2;
-        }
-        if (std.mem.eql(u8, token, "http/1.1")) {
-            return .http_1_1;
-        }
-        return error.UnsupportedToken;
     }
 
     /// Executes one request against the local secure harness instead of a socket transport.

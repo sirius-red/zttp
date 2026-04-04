@@ -12,6 +12,8 @@ pub const Error = config.ValidationError || error{
     MissingServerName,
     /// No shared ALPN protocol could be selected.
     NoSharedProtocol,
+    /// The peer selected an invalid or unsupported negotiated protocol token.
+    UnsupportedNegotiatedProtocol,
     /// The configured explicit trust store could not be opened or parsed.
     InvalidRootStore,
     /// The system trust store could not be loaded.
@@ -53,6 +55,55 @@ pub const NegotiationResult = struct {
     /// Whether peer verification is enabled for the session.
     verified: bool,
 };
+
+/// Resolves the effective negotiated protocol from the peer's live handshake
+/// outcome, including explicit token selections and omitted ALPN fallbacks.
+pub fn resolveNegotiatedProtocol(
+    tls_config: types.TlsConfig,
+    advertised_protocols: []const types.NegotiatedProtocol,
+    selected_protocol_token: ?[]const u8,
+    omits_alpn: bool,
+) Error!NegotiationResult {
+    try config.validate(tls_config);
+
+    if (selected_protocol_token) |token| {
+        const protocol = parseNegotiatedProtocolToken(token) catch return error.UnsupportedNegotiatedProtocol;
+        if (!tls_config.supportsProtocol(protocol)) {
+            return error.NoSharedProtocol;
+        }
+        return .{
+            .protocol = protocol,
+            .verified = tls_config.verify == .verify,
+        };
+    }
+
+    if (omits_alpn) {
+        if (!canFallbackToHttp1ForOmittedAlpn(tls_config, &.{})) {
+            return error.NoSharedProtocol;
+        }
+        return .{
+            .protocol = .http_1_1,
+            .verified = tls_config.verify == .verify,
+        };
+    }
+
+    return negotiateProtocol(tls_config, advertised_protocols);
+}
+
+/// Enforces explicit trust for harness-only loopback peers outside the
+/// predefined verification catalog.
+pub fn validateHarnessTrust(
+    tls_config: types.TlsConfig,
+    requires_explicit_trust: bool,
+) Error!void {
+    try config.validate(tls_config);
+    if (!requires_explicit_trust or tls_config.verify != .verify) {
+        return;
+    }
+    if (tls_config.root_store_mode != .explicit or tls_config.explicit_roots_path == null) {
+        return error.PeerVerificationFailed;
+    }
+}
 
 /// Prepared TLS state that can later attach to a connected stream.
 pub const PreparedHandshake = struct {
@@ -374,6 +425,17 @@ fn canFallbackToHttp1ForOmittedAlpn(
         return false;
     }
     return offered_protocols.len == 0 or containsProtocol(offered_protocols, .http_1_1);
+}
+
+/// Parses one negotiated ALPN token into the supported protocol enum.
+fn parseNegotiatedProtocolToken(token: []const u8) error{UnsupportedToken}!types.NegotiatedProtocol {
+    if (std.mem.eql(u8, token, "h2")) {
+        return .h2;
+    }
+    if (std.mem.eql(u8, token, "http/1.1")) {
+        return .http_1_1;
+    }
+    return error.UnsupportedToken;
 }
 
 /// Clones borrowed handshake-plan slices into allocator-owned storage.
